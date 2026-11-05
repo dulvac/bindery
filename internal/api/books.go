@@ -25,17 +25,19 @@ import (
 )
 
 type BookHandler struct {
-	books     *db.BookRepo
-	meta      *metadata.Aggregator
-	lookup    BookMetaLookup // used by Rebind; defaults to meta when non-nil
-	history   *db.HistoryRepo
-	searcher  BookSearcher
-	settings  *db.SettingsRepo
-	downloads *db.DownloadRepo
-	authors   *db.AuthorRepo
-	series    *db.SeriesRepo
-	editions  *db.EditionRepo
-	roots     *LibraryRoots // optional: library-root containment for delete
+	books                  *db.BookRepo
+	meta                   *metadata.Aggregator
+	lookup                 BookMetaLookup // used by Rebind; defaults to meta when non-nil
+	history                *db.HistoryRepo
+	searcher               BookSearcher
+	settings               *db.SettingsRepo
+	downloads              *db.DownloadRepo
+	authors                *db.AuthorRepo
+	series                 *db.SeriesRepo
+	editions               *db.EditionRepo
+	roots                  *LibraryRoots // optional: library-root containment for delete
+	variantRejections      *db.VariantRejectionRepo
+	rejectionDownloadRoots []string
 
 	coverStore *covers.Store // optional: enables POST /book/{id}/cover
 

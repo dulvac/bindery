@@ -672,6 +672,7 @@ func main() {
 	bookHandler := api.NewBookHandler(bookRepo, metaAgg, historyRepo, sched).
 		WithSettings(settingsRepo).
 		WithDownloads(downloadRepo).
+		WithVariantRejections(db.NewVariantRejectionRepo(database), cfg.DownloadDir, cfg.AudiobookDownloadDir).
 		WithAuthors(authorRepo).
 		WithSeries(seriesRepo).
 		WithEditionHydration(editionRepo).
@@ -1020,6 +1021,7 @@ func main() {
 		r.Get("/book/{id}/series-exclusions", bookHandler.SeriesExclusions)
 		r.Post("/book/{id}/rebind", bookHandler.Rebind)
 		r.Post("/book/{id}/enrich-audiobook", bookHandler.EnrichAudiobook)
+		api.RegisterVariantRejectionRoute(r, bookHandler)
 		registerBookCoverRoutes(r, bookHandler)
 		r.Post("/book/{id}/search", indexerHandler.SearchBook)
 		r.Get("/book/{id}/file", fileHandler.Download)
