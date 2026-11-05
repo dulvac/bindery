@@ -310,7 +310,7 @@ func TestVariantAssociationsRoundTripThroughFileAndDownloadRepos(t *testing.T) {
 	if err := files.Add(ctx, book.ID, "ebook", "/lib/romanian.epub"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.ExecContext(ctx, `UPDATE book_files SET variant_id = ?, language = 'rum', verification = 'verified' WHERE path = '/lib/romanian.epub'`, variantID); err != nil {
+	if err := files.SetVariant(ctx, "/lib/romanian.epub", &variantID, "rum", "verified"); err != nil {
 		t.Fatal(err)
 	}
 	checkFile := func(t *testing.T, f models.BookFile) {
@@ -395,7 +395,7 @@ func TestBookFileOwnershipChangeClearsVariant(t *testing.T) {
 			if err := files.Add(ctx, book.ID, "ebook", path); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := database.ExecContext(ctx, `UPDATE book_files SET variant_id = ?, language = 'rum', verification = 'verified' WHERE path = ?`, variants[0].ID, path); err != nil {
+			if err := files.SetVariant(ctx, path, &variants[0].ID, "rum", "verified"); err != nil {
 				t.Fatal(err)
 			}
 			switch mode {
@@ -455,5 +455,398 @@ func TestDownloadBookReassignmentClearsVariant(t *testing.T) {
 	got, err := repo.GetByID(ctx, d.ID)
 	if err != nil || got == nil || got.BookID == nil || *got.BookID != other.ID || got.VariantID != nil {
 		t.Fatalf("reassigned download = %#v, %v", got, err)
+	}
+}
+
+// A download must not claim a variant from another book, even when both
+// foreign keys independently resolve to existing rows.
+func TestDownloadRepoCreateRejectsVariantFromAnotherBook(t *testing.T) {
+	database, author, book := openTestDB(t)
+	ctx := context.Background()
+	other := &models.Book{ForeignID: "foreign-variant-book", AuthorID: author.ID, Title: "Other", SortTitle: "Other", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted}
+	if err := NewBookRepo(database).Create(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+	variants, err := NewBookVariantRepo(database).EnsureWanted(ctx, other.ID, "ebook", []string{"rum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := NewDownloadRepo(database)
+	for _, tc := range []struct {
+		name   string
+		bookID *int64
+	}{
+		{"wrong book", &book.ID},
+		{"no book", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &models.Download{GUID: "foreign-create-" + tc.name, BookID: tc.bookID, VariantID: &variants[0].ID, Title: "Wrong owner", Status: models.StateGrabbed, Protocol: "usenet"}
+			if err := repo.Create(ctx, d); err == nil {
+				t.Fatal("Create accepted a variant without its owning book")
+			}
+			stored, err := repo.GetByGUID(ctx, d.GUID)
+			if err != nil || stored != nil {
+				t.Fatalf("rejected download was persisted: %#v, %v", stored, err)
+			}
+		})
+	}
+}
+
+// A regrab overwrites both book_id and variant_id; it must leave the failed
+// row untouched when the new book does not own the proposed variant.
+func TestDownloadRepoRetryFailedRejectsVariantFromAnotherBook(t *testing.T) {
+	database, author, book := openTestDB(t)
+	ctx := context.Background()
+	other := &models.Book{ForeignID: "regrab-foreign-book", AuthorID: author.ID, Title: "Other", SortTitle: "Other", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted}
+	if err := NewBookRepo(database).Create(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+	variants, err := NewBookVariantRepo(database).EnsureWanted(ctx, book.ID, "ebook", []string{"rum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := NewDownloadRepo(database)
+	d := &models.Download{GUID: "foreign-regrab", BookID: &book.ID, VariantID: &variants[0].ID, Title: "Original", Status: models.StateFailed, Protocol: "usenet"}
+	if err := repo.Create(ctx, d); err != nil {
+		t.Fatal(err)
+	}
+	d.BookID = &other.ID
+	d.Title = "Regrab"
+	if claimed, err := repo.RetryFailed(ctx, d); err == nil || claimed {
+		t.Fatalf("RetryFailed claimed mismatched variant: claimed=%t, err=%v", claimed, err)
+	}
+	stored, err := repo.GetByID(ctx, d.ID)
+	if err != nil || stored == nil || stored.BookID == nil || *stored.BookID != book.ID || stored.VariantID == nil || *stored.VariantID != variants[0].ID || stored.Title != "Original" || stored.Status != models.StateFailed {
+		t.Fatalf("failed regrab changed original row: %#v, %v", stored, err)
+	}
+}
+
+// Attaching a language claim to a tracked file must match both its book and
+// its format. A rejected write leaves the file's metadata untouched.
+func TestBookFileRepoSetVariantRejectsWrongBookAndFormat(t *testing.T) {
+	database, author, book := openTestDB(t)
+	ctx := context.Background()
+	other := &models.Book{ForeignID: "file-foreign-variant", AuthorID: author.ID, Title: "Other", SortTitle: "Other", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted}
+	if err := NewBookRepo(database).Create(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+	variants := NewBookVariantRepo(database)
+	own, err := variants.EnsureWanted(ctx, book.ID, "ebook", []string{"rum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := variants.EnsureWanted(ctx, other.ID, "ebook", []string{"rum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongFormat, err := variants.EnsureWanted(ctx, book.ID, "audiobook", []string{"rum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := NewBookFileRepo(database)
+	const path = "/lib/variant-ownership.epub"
+	if err := files.Add(ctx, book.ID, "ebook", path); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		id   int64
+	}{
+		{"wrong book", foreign[0].ID},
+		{"wrong format", wrongFormat[0].ID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := files.SetVariant(ctx, path, &tc.id, "rum", "verified"); err == nil {
+				t.Fatal("SetVariant accepted a mismatched claim")
+			}
+			file, err := files.GetByPath(ctx, path)
+			if err != nil || file == nil || file.VariantID != nil || file.Language != "" || file.Verification != "unverified" {
+				t.Fatalf("rejected claim changed file: %#v, %v", file, err)
+			}
+		})
+	}
+	if err := files.SetVariant(ctx, path, &own[0].ID, "rum", "verified"); err != nil {
+		t.Fatalf("valid same-book ebook variant: %v", err)
+	}
+	file, err := files.GetByPath(ctx, path)
+	if err != nil || file == nil || file.VariantID == nil || *file.VariantID != own[0].ID || file.Language != "rum" || file.Verification != "verified" {
+		t.Fatalf("valid file association = %#v, %v", file, err)
+	}
+}
+
+// A move or orphan reclaim discards the old variant claim. Without another
+// usable file or active grab, an imported variant must become wanted again.
+func TestBookFileOwnershipChangeReopensUnclaimedVariant(t *testing.T) {
+	for _, mode := range []string{"move", "reclaim"} {
+		t.Run(mode, func(t *testing.T) {
+			database, author, book := openTestDB(t)
+			ctx := context.Background()
+			other := &models.Book{ForeignID: "reopen-file-" + mode, AuthorID: author.ID, Title: "Other", SortTitle: "Other", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted}
+			if err := NewBookRepo(database).Create(ctx, other); err != nil {
+				t.Fatal(err)
+			}
+			variants := NewBookVariantRepo(database)
+			rows, err := variants.EnsureWanted(ctx, book.ID, "ebook", []string{"rum"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := rows[0].ID
+			files := NewBookFileRepo(database)
+			path := "/lib/reopen-" + mode + ".epub"
+			if err := files.Add(ctx, book.ID, "ebook", path); err != nil {
+				t.Fatal(err)
+			}
+			if err := files.SetVariant(ctx, path, &id, "rum", "verified"); err != nil {
+				t.Fatal(err)
+			}
+			if err := variants.SetStatus(ctx, id, models.VariantImported); err != nil {
+				t.Fatal(err)
+			}
+			switch mode {
+			case "move":
+				if _, err := files.MoveToBook(ctx, other.ID, "ebook", path); err != nil {
+					t.Fatal(err)
+				}
+			case "reclaim":
+				if _, err := database.ExecContext(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := database.ExecContext(ctx, `UPDATE book_files SET book_id = 999999 WHERE path = ?`, path); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := database.ExecContext(ctx, `PRAGMA foreign_keys=ON`); err != nil {
+					t.Fatal(err)
+				}
+				result, err := files.Track(ctx, other.ID, "ebook", path)
+				if err != nil || result.Outcome != TrackReclaimedOrphan {
+					t.Fatalf("reclaim = %#v, %v", result, err)
+				}
+			}
+			got, err := variants.ListByBook(ctx, book.ID)
+			if err != nil || len(got) != 1 || got[0].Status != models.VariantWanted {
+				t.Fatalf("former variant after %s = %#v, %v; want wanted", mode, got, err)
+			}
+			wanted, err := variants.ListWanted(ctx)
+			if err != nil || len(wanted) != 1 || wanted[0].ID != id {
+				t.Fatalf("wanted after %s = %#v, %v", mode, wanted, err)
+			}
+		})
+	}
+}
+
+// Another verified file keeps the old variant imported. An active grab keeps
+// it in progress even when the moved file was the only imported copy.
+func TestBookFileOwnershipChangeKeepsOtherVariantClaims(t *testing.T) {
+	for _, remaining := range []string{"verified file", "active download"} {
+		t.Run(remaining, func(t *testing.T) {
+			database, author, book := openTestDB(t)
+			ctx := context.Background()
+			other := &models.Book{ForeignID: "keep-file-" + remaining, AuthorID: author.ID, Title: "Other", SortTitle: "Other", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted}
+			if err := NewBookRepo(database).Create(ctx, other); err != nil {
+				t.Fatal(err)
+			}
+			variants := NewBookVariantRepo(database)
+			rows, err := variants.EnsureWanted(ctx, book.ID, "ebook", []string{"rum"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := rows[0].ID
+			files := NewBookFileRepo(database)
+			const path = "/lib/keep-first.epub"
+			if err := files.Add(ctx, book.ID, "ebook", path); err != nil {
+				t.Fatal(err)
+			}
+			if err := files.SetVariant(ctx, path, &id, "rum", "verified"); err != nil {
+				t.Fatal(err)
+			}
+			wantStatus := models.VariantImported
+			switch remaining {
+			case "verified file":
+				if err := files.Add(ctx, book.ID, "ebook", "/lib/keep-second.epub"); err != nil {
+					t.Fatal(err)
+				}
+				if err := files.SetVariant(ctx, "/lib/keep-second.epub", &id, "rum", "verified"); err != nil {
+					t.Fatal(err)
+				}
+			case "active download":
+				d := &models.Download{GUID: "still-loading", BookID: &book.ID, VariantID: &id, Title: "Loading", Status: models.StateGrabbed, Protocol: "usenet"}
+				if err := NewDownloadRepo(database).Create(ctx, d); err != nil {
+					t.Fatal(err)
+				}
+				wantStatus = models.VariantDownloading
+			}
+			if err := variants.SetStatus(ctx, id, models.VariantImported); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := files.MoveToBook(ctx, other.ID, "ebook", path); err != nil {
+				t.Fatal(err)
+			}
+			got, err := variants.ListByBook(ctx, book.ID)
+			if err != nil || len(got) != 1 || got[0].Status != wantStatus {
+				t.Fatalf("variant with remaining %s = %#v, %v; want %s", remaining, got, err, wantStatus)
+			}
+		})
+	}
+}
+
+// A download moving to another book must not leave the former variant hidden
+// from the wanted sweep when it was the only live claim.
+func TestDownloadBookReassignmentReopensUnclaimedVariant(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		download models.DownloadState
+		variant  string
+	}{
+		{"active grab", models.StateGrabbed, models.VariantDownloading},
+		{"historical import", models.StateImported, models.VariantImported},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database, author, book := openTestDB(t)
+			ctx := context.Background()
+			other := &models.Book{ForeignID: "reopen-download-" + tc.name, AuthorID: author.ID, Title: "Other", SortTitle: "Other", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted}
+			if err := NewBookRepo(database).Create(ctx, other); err != nil {
+				t.Fatal(err)
+			}
+			variants := NewBookVariantRepo(database)
+			rows, err := variants.EnsureWanted(ctx, book.ID, "ebook", []string{"rum"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := rows[0].ID
+			downloads := NewDownloadRepo(database)
+			d := &models.Download{GUID: "reopen-download-" + tc.name, BookID: &book.ID, VariantID: &id, Title: "Previous", Status: tc.download, Protocol: "usenet"}
+			if err := downloads.Create(ctx, d); err != nil {
+				t.Fatal(err)
+			}
+			if err := variants.SetStatus(ctx, id, tc.variant); err != nil {
+				t.Fatal(err)
+			}
+			if err := downloads.SetBookID(ctx, d.ID, other.ID); err != nil {
+				t.Fatal(err)
+			}
+			got, err := variants.ListByBook(ctx, book.ID)
+			if err != nil || len(got) != 1 || got[0].Status != models.VariantWanted {
+				t.Fatalf("former variant after %s = %#v, %v; want wanted", tc.name, got, err)
+			}
+			wanted, err := variants.ListWanted(ctx)
+			if err != nil || len(wanted) != 1 || wanted[0].ID != id {
+				t.Fatalf("wanted after %s = %#v, %v", tc.name, wanted, err)
+			}
+		})
+	}
+}
+
+func TestDownloadBookReassignmentKeepsOtherVariantClaims(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		wantStatus string
+	}{
+		{"verified file", models.VariantImported},
+		{"active download", models.VariantDownloading},
+		{"failed download", models.VariantWanted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database, author, book := openTestDB(t)
+			ctx := context.Background()
+			other := &models.Book{ForeignID: "keep-download-" + tc.name, AuthorID: author.ID, Title: "Other", SortTitle: "Other", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted}
+			if err := NewBookRepo(database).Create(ctx, other); err != nil {
+				t.Fatal(err)
+			}
+			variants := NewBookVariantRepo(database)
+			rows, err := variants.EnsureWanted(ctx, book.ID, "ebook", []string{"rum"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := rows[0].ID
+			downloads := NewDownloadRepo(database)
+			d := &models.Download{GUID: "moving-" + tc.name, BookID: &book.ID, VariantID: &id, Title: "Moving", Status: models.StateGrabbed, Protocol: "usenet"}
+			if err := downloads.Create(ctx, d); err != nil {
+				t.Fatal(err)
+			}
+			switch tc.name {
+			case "verified file":
+				files := NewBookFileRepo(database)
+				if err := files.Add(ctx, book.ID, "ebook", "/lib/keep-download.epub"); err != nil {
+					t.Fatal(err)
+				}
+				if err := files.SetVariant(ctx, "/lib/keep-download.epub", &id, "rum", "verified"); err != nil {
+					t.Fatal(err)
+				}
+			case "active download", "failed download":
+				state := models.StateGrabbed
+				if tc.name == "failed download" {
+					state = models.StateFailed
+				}
+				second := &models.Download{GUID: "remaining-" + tc.name, BookID: &book.ID, VariantID: &id, Title: "Remaining", Status: state, Protocol: "usenet"}
+				if err := downloads.Create(ctx, second); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := variants.SetStatus(ctx, id, models.VariantDownloading); err != nil {
+				t.Fatal(err)
+			}
+			if err := downloads.SetBookID(ctx, d.ID, other.ID); err != nil {
+				t.Fatal(err)
+			}
+			got, err := variants.ListByBook(ctx, book.ID)
+			if err != nil || len(got) != 1 || got[0].Status != tc.wantStatus {
+				t.Fatalf("variant with remaining %s = %#v, %v; want %s", tc.name, got, err, tc.wantStatus)
+			}
+		})
+	}
+}
+
+func TestBookFileRepoSetVariantReopensReplacedClaim(t *testing.T) {
+	database, _, book := openTestDB(t)
+	ctx := context.Background()
+	variants := NewBookVariantRepo(database)
+	rows, err := variants.EnsureWanted(ctx, book.ID, "ebook", []string{"eng", "rum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := NewBookFileRepo(database)
+	const path = "/lib/changed-language.epub"
+	if err := files.Add(ctx, book.ID, "ebook", path); err != nil {
+		t.Fatal(err)
+	}
+	if err := files.SetVariant(ctx, path, &rows[0].ID, "eng", "verified"); err != nil {
+		t.Fatal(err)
+	}
+	if err := variants.SetStatus(ctx, rows[0].ID, models.VariantImported); err != nil {
+		t.Fatal(err)
+	}
+	if err := files.SetVariant(ctx, path, &rows[1].ID, "rum", "verified"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := variants.ListByBook(ctx, book.ID)
+	if err != nil || len(got) != 2 || got[0].Status != models.VariantWanted {
+		t.Fatalf("former file variant = %#v, %v; want English wanted", got, err)
+	}
+}
+
+func TestDownloadRegrabReopensPreviousVariant(t *testing.T) {
+	database, _, book := openTestDB(t)
+	ctx := context.Background()
+	variants := NewBookVariantRepo(database)
+	rows, err := variants.EnsureWanted(ctx, book.ID, "ebook", []string{"eng", "rum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	downloads := NewDownloadRepo(database)
+	d := &models.Download{GUID: "changed-regrab-language", BookID: &book.ID, VariantID: &rows[0].ID, Title: "Old", Status: models.StateFailed, Protocol: "usenet"}
+	if err := downloads.Create(ctx, d); err != nil {
+		t.Fatal(err)
+	}
+	if err := variants.SetStatus(ctx, rows[0].ID, models.VariantDownloading); err != nil {
+		t.Fatal(err)
+	}
+	d.VariantID = &rows[1].ID
+	claimed, err := downloads.RetryFailed(ctx, d)
+	if err != nil || !claimed {
+		t.Fatalf("RetryFailed = %t, %v", claimed, err)
+	}
+	got, err := variants.ListByBook(ctx, book.ID)
+	if err != nil || len(got) != 2 || got[0].Status != models.VariantWanted {
+		t.Fatalf("former download variant = %#v, %v; want English wanted", got, err)
 	}
 }

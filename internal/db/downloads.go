@@ -44,6 +44,23 @@ func NewDownloadRepo(db *sql.DB) *DownloadRepo {
 	return &DownloadRepo{db: db}
 }
 
+func checkDownloadVariantOwner(ctx context.Context, tx *sql.Tx, d *models.Download) error {
+	if d.VariantID == nil {
+		return nil
+	}
+	if d.BookID == nil {
+		return fmt.Errorf("download variant %d requires a book", *d.VariantID)
+	}
+	var owner int64
+	if err := tx.QueryRowContext(ctx, `SELECT book_id FROM book_variants WHERE id = ?`, *d.VariantID).Scan(&owner); err != nil {
+		return fmt.Errorf("look up download variant %d: %w", *d.VariantID, err)
+	}
+	if owner != *d.BookID {
+		return fmt.Errorf("download variant %d belongs to book %d, not %d", *d.VariantID, owner, *d.BookID)
+	}
+	return nil
+}
+
 func (r *DownloadRepo) List(ctx context.Context) ([]models.Download, error) {
 	return r.query(ctx, "SELECT "+downloadSelectColumns+" FROM downloads ORDER BY added_at DESC")
 }
@@ -302,8 +319,16 @@ func downloadOwnerArg(ownerUserID int64) any {
 }
 
 func (r *DownloadRepo) Create(ctx context.Context, d *models.Download) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("create download begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := checkDownloadVariantOwner(ctx, tx, d); err != nil {
+		return fmt.Errorf("create download: %w", err)
+	}
 	now := time.Now().UTC()
-	result, err := r.db.ExecContext(ctx, `
+	result, err := tx.ExecContext(ctx, `
 		INSERT INTO downloads (guid, book_id, variant_id, edition_id, indexer_id, download_client_id,
 		                       title, nzb_url, size, sabnzbd_nzo_id, torrent_id, status, protocol,
 		                       quality, indexer_flags, error_message, owner_user_id, added_at)
@@ -317,6 +342,9 @@ func (r *DownloadRepo) Create(ctx context.Context, d *models.Download) error {
 	id, err := result.LastInsertId()
 	if err != nil {
 		return fmt.Errorf("get download id: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("create download commit: %w", err)
 	}
 	d.ID = id
 	d.AddedAt = now
@@ -428,6 +456,20 @@ const regrabClaimSQL = `
 // claimForRegrab runs one of the regrabClaimSQL claims and, when it took the
 // row, mirrors the reset onto d.
 func (r *DownloadRepo) claimForRegrab(ctx context.Context, d *models.Download, query string, states ...any) (bool, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("retry failed download begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := checkDownloadVariantOwner(ctx, tx, d); err != nil {
+		return false, fmt.Errorf("retry failed download: %w", err)
+	}
+
+	var oldVariant sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT variant_id FROM downloads WHERE id = ?`, d.ID).Scan(&oldVariant)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("retry failed download lookup: %w", err)
+	}
 	now := time.Now().UTC()
 	args := []any{
 		d.BookID, d.VariantID, d.EditionID, d.IndexerID, d.DownloadClientID,
@@ -435,7 +477,7 @@ func (r *DownloadRepo) claimForRegrab(ctx context.Context, d *models.Download, q
 		d.Quality, d.IndexerFlags, downloadOwnerArg(d.OwnerUserID), now, d.ID,
 	}
 	args = append(args, states...)
-	result, err := r.db.ExecContext(ctx, query, args...)
+	result, err := tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return false, fmt.Errorf("retry failed download: %w", err)
 	}
@@ -445,6 +487,14 @@ func (r *DownloadRepo) claimForRegrab(ctx context.Context, d *models.Download, q
 	}
 	if affected == 0 {
 		return false, nil
+	}
+	if oldVariant.Valid && (d.VariantID == nil || oldVariant.Int64 != *d.VariantID) {
+		if err := reconcileVariantAfterDetach(ctx, tx, oldVariant); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("retry failed download commit: %w", err)
 	}
 	d.Status = models.StateGrabbed
 	d.SABnzbdNzoID = nil
@@ -628,10 +678,34 @@ func (r *DownloadRepo) SetTorrentID(ctx context.Context, id int64, torrentID str
 // clears any variant assigned to the former book; setting the same book again
 // keeps its association.
 func (r *DownloadRepo) SetBookID(ctx context.Context, id, bookID int64) error {
-	_, err := r.db.ExecContext(ctx,
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("reassign download begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var oldBookID, oldVariant sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT book_id, variant_id FROM downloads WHERE id = ?`, id).Scan(&oldBookID, &oldVariant)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reassign download lookup: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
 		"UPDATE downloads SET variant_id = CASE WHEN book_id = ? THEN variant_id ELSE NULL END, book_id = ? WHERE id = ?",
-		bookID, bookID, id)
-	return err
+		bookID, bookID, id); err != nil {
+		return fmt.Errorf("reassign download: %w", err)
+	}
+	if !oldBookID.Valid || oldBookID.Int64 != bookID {
+		if err := reconcileVariantAfterDetach(ctx, tx, oldVariant); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("reassign download commit: %w", err)
+	}
+	return nil
 }
 
 // SetImportPath records the on-disk location of a completed download's files so

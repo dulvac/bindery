@@ -151,9 +151,10 @@ func (r *BookFileRepo) Track(ctx context.Context, bookID int64, format, path str
 
 	var owner int64
 	var ownerTitle sql.NullString
+	var oldVariant sql.NullInt64
 	err = tx.QueryRowContext(ctx,
-		`SELECT bf.book_id, b.title FROM book_files bf LEFT JOIN books b ON b.id = bf.book_id
-		 WHERE bf.path = ?`, path).Scan(&owner, &ownerTitle)
+		`SELECT bf.book_id, b.title, bf.variant_id FROM book_files bf LEFT JOIN books b ON b.id = bf.book_id
+		 WHERE bf.path = ?`, path).Scan(&owner, &ownerTitle, &oldVariant)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TrackResult{}, fmt.Errorf("book_files add: insert of %s was ignored but no row holds the path", path)
 	}
@@ -167,6 +168,9 @@ func (r *BookFileRepo) Track(ctx context.Context, bookID int64, format, path str
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE book_files SET book_id = ?, format = ?, variant_id = NULL, language = '', verification = 'unverified' WHERE path = ?`, bookID, format, path); err != nil {
 			return TrackResult{}, fmt.Errorf("book_files reclaim orphaned row: %w", err)
+		}
+		if err := reconcileVariantAfterDetach(ctx, tx, oldVariant); err != nil {
+			return TrackResult{}, err
 		}
 		if err := tx.Commit(); err != nil {
 			return TrackResult{}, fmt.Errorf("book_files reclaim commit: %w", err)
@@ -183,6 +187,47 @@ func (r *BookFileRepo) Track(ctx context.Context, bookID int64, format, path str
 func (r *BookFileRepo) Add(ctx context.Context, bookID int64, format, path string) error {
 	_, err := r.Track(ctx, bookID, format, path)
 	return err
+}
+
+// SetVariant records a file's checked language claim. A non-nil variant must
+// belong to the file's current book and format; replacing a claim reconciles
+// the former variant in the same transaction.
+func (r *BookFileRepo) SetVariant(ctx context.Context, path string, variantID *int64, language, verification string) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("book_files set variant begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var oldVariant sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT variant_id FROM book_files WHERE path = ?`, path).Scan(&oldVariant); err != nil {
+		return fmt.Errorf("book_files set variant lookup: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE book_files
+		SET variant_id = ?, language = ?, verification = ?
+		WHERE path = ? AND (? IS NULL OR EXISTS (
+			SELECT 1 FROM book_variants v
+			WHERE v.id = ? AND v.book_id = book_files.book_id AND v.media_type = book_files.format
+		))`, variantID, language, verification, path, variantID, variantID)
+	if err != nil {
+		return fmt.Errorf("book_files set variant: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("book_files set variant rows: %w", err)
+	}
+	if count == 0 {
+		return fmt.Errorf("book_files set variant: path %q missing or variant does not match its book and format", path)
+	}
+	if oldVariant.Valid && (variantID == nil || oldVariant.Int64 != *variantID) {
+		if err := reconcileVariantAfterDetach(ctx, tx, oldVariant); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("book_files set variant commit: %w", err)
+	}
+	return nil
 }
 
 // AddIfMissing records a new on-disk file and reports whether this call is the
@@ -215,7 +260,8 @@ func (r *BookFileRepo) MoveToBook(ctx context.Context, bookID int64, format, pat
 	defer func() { _ = tx.Rollback() }()
 
 	var prev int64
-	err = tx.QueryRowContext(ctx, `SELECT book_id FROM book_files WHERE path = ?`, path).Scan(&prev)
+	var oldVariant sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT book_id, variant_id FROM book_files WHERE path = ?`, path).Scan(&prev, &oldVariant)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		if _, err := tx.ExecContext(ctx,
@@ -231,6 +277,9 @@ func (r *BookFileRepo) MoveToBook(ctx context.Context, bookID int64, format, pat
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE book_files SET book_id = ?, format = ?, variant_id = NULL, language = '', verification = 'unverified' WHERE path = ?`, bookID, format, path); err != nil {
 			return 0, fmt.Errorf("book_files move update: %w", err)
+		}
+		if err := reconcileVariantAfterDetach(ctx, tx, oldVariant); err != nil {
+			return 0, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
