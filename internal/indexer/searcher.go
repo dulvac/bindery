@@ -85,14 +85,15 @@ func NewSearcher() *Searcher {
 // language outside the set are dropped). Recorded here so search debug
 // output shows which set was in force.
 type MatchCriteria struct {
-	Title            string
-	Author           string
-	Year             int
-	ISBN             string
-	ASIN             string   // for audiobook ASIN anchoring
-	MediaType        string   // models.MediaTypeEbook or models.MediaTypeAudiobook
-	AllowedLanguages []string // from author's MetadataProfile; empty = no filter
-	AuthorAliases    []string // alternate names (e.g. latin-script romanisations for non-latin authors)
+	Title             string
+	Author            string
+	Year              int
+	ISBN              string
+	ASIN              string   // for audiobook ASIN anchoring
+	MediaType         string   // models.MediaTypeEbook or models.MediaTypeAudiobook
+	AllowedLanguages  []string // from author's MetadataProfile; empty = no filter
+	RequestedLanguage string   // format/language variant; empty keeps legacy search behavior
+	AuthorAliases     []string // alternate names (e.g. latin-script romanisations for non-latin authors)
 	// Profile is the author's quality profile. Its stored order ranks the
 	// results, top is best, per media type (see quality_order.go). nil, or a
 	// profile with no entry for the media type in question, ranks by
@@ -1488,6 +1489,12 @@ func scoreResult(r newznab.SearchResult, c MatchCriteria, ranks *profileRanks) f
 		score += 250
 	}
 
+	// Known matches get a modest preference within a comparable format;
+	// unknown releases remain eligible and a better format still wins.
+	if c.RequestedLanguage != "" && slices.Equal(ReleaseLanguages(r.Title), []string{models.NormalizeLanguageCode(c.RequestedLanguage)}) {
+		score += 25
+	}
+
 	// Indexer priority: each priority point adds directly to the score so a
 	// higher-priority indexer wins ties and can outweigh small quality gaps.
 	// Default priority is 0, so deployments that never configure it are unaffected.
@@ -1935,9 +1942,8 @@ func SplitByAllowedLanguages(results []newznab.SearchResult, allowed []string) (
 
 	filtered := make([]newznab.SearchResult, 0, len(results))
 	for _, r := range results {
-		norm := NormalizeRelease(r.Title)
 		ok := true
-		for _, code := range append(append(releaseLanguageCodes(norm), sceneLanguageCodes(r.Title)...), gluedLanguageCodes(r.Title)...) {
+		for _, code := range ReleaseLanguages(r.Title) {
 			if !set[code] {
 				ok = false
 				break

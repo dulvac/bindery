@@ -653,6 +653,55 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	variants, err := h.books.VariantRepo().ListByBook(r.Context(), book.ID)
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	requestedByFormat := make(map[string]string)
+	var selectedLanguage string
+	if raw, present := r.URL.Query()["language"]; present {
+		if len(raw) != 1 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "choose one requested language"})
+			return
+		}
+		codes, err := models.NormalizeRequestLanguages(raw)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid requested language"})
+			return
+		}
+		selectedLanguage = codes[0]
+	}
+	for _, format := range models.RequestedMediaTypes(book.MediaType) {
+		foundWanted := false
+		for _, v := range variants {
+			if v.MediaType != format {
+				continue
+			}
+			if selectedLanguage != "" {
+				if v.Language == selectedLanguage {
+					requestedByFormat[format] = v.Language
+					break
+				}
+				continue
+			}
+			// Prefer a wanted copy, English first when more than one is
+			// wanted. Otherwise default to English among imported copies.
+			if v.Status == models.VariantWanted {
+				if !foundWanted || v.Language == "eng" {
+					requestedByFormat[format] = v.Language
+				}
+				foundWanted = true
+			} else if !foundWanted && (requestedByFormat[format] == "" || v.Language == "eng") {
+				requestedByFormat[format] = v.Language
+			}
+		}
+		if selectedLanguage != "" && requestedByFormat[format] == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "language not requested for this book format"})
+			return
+		}
+	}
+
 	idxs, err := h.indexers.List(r.Context())
 	if err != nil {
 		writeServerError(w, r, err)
@@ -678,12 +727,13 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	crit := indexer.MatchCriteria{
-		Title:            indexer.SearchTitle(*book, allowedLangs),
-		Author:           authorName,
-		MediaType:        book.MediaType,
-		ASIN:             book.ASIN,
-		AllowedLanguages: allowedLangs,
-		AuthorAliases:    authorAliases,
+		Title:             indexer.SearchTitle(*book, allowedLangs),
+		Author:            authorName,
+		MediaType:         book.MediaType,
+		ASIN:              book.ASIN,
+		AllowedLanguages:  allowedLangs,
+		RequestedLanguage: requestedByFormat[book.MediaType],
+		AuthorAliases:     authorAliases,
 		// The searcher ranks by the profile's order (#2733); the same profile
 		// builds the QualityAllowed annotation below, so the book page's
 		// order and its approved flags come from one definition.
@@ -734,8 +784,10 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 		// own list: ebooks by the ebook list, audiobooks by the audiobook list.
 		ebookCrit := crit
 		ebookCrit.MediaType = models.MediaTypeEbook
+		ebookCrit.RequestedLanguage = requestedByFormat[models.MediaTypeEbook]
 		audioCrit := crit
 		audioCrit.MediaType = models.MediaTypeAudiobook
+		audioCrit.RequestedLanguage = requestedByFormat[models.MediaTypeAudiobook]
 
 		type searchOut struct {
 			results []newznab.SearchResult
@@ -807,21 +859,61 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 	if dbg != nil {
 		// The debug log keeps this payload; it must not keep raw URLs.
 		dbg.Dropped = nil
+		if book.MediaType != models.MediaTypeBoth {
+			dbg.Query.RequestedLanguage = requestedByFormat[book.MediaType]
+		} else if requestedByFormat[models.MediaTypeEbook] == requestedByFormat[models.MediaTypeAudiobook] {
+			dbg.Query.RequestedLanguage = requestedByFormat[models.MediaTypeEbook]
+		}
 	}
 
 	// Build decision specs.
 	var specs []decision.Specification
 
-	// Language filter: author profile takes precedence, fall back to global setting.
+	// Apply the requested copy's language before the metadata profile so an
+	// explicit mismatch keeps its specific reason in interactive debug.
+	// Unknown releases remain eligible, but a known mismatch cannot fill the
+	// selected variant. Dual-format searches retain each leg's quality order.
+	var variantDropped []indexer.DroppedRelease
+	if book.MediaType == models.MediaTypeBoth {
+		var matched []newznab.SearchResult
+		for _, format := range models.RequestedMediaTypes(book.MediaType) {
+			var group []newznab.SearchResult
+			for _, res := range results {
+				if res.MediaType == format {
+					group = append(group, res)
+				}
+			}
+			kept, dropped := indexer.SplitForRequestedLanguage(group, requestedByFormat[format])
+			matched = append(matched, kept...)
+			variantDropped = append(variantDropped, dropped...)
+		}
+		results = matched
+	} else {
+		results, variantDropped = indexer.SplitForRequestedLanguage(results, requestedByFormat[book.MediaType])
+	}
+	if dbg != nil {
+		for _, dropped := range variantDropped {
+			dbg.Filters = append(dbg.Filters, indexer.FilterDebug{
+				Title: dropped.Result.Title, IndexerName: dropped.Result.IndexerName,
+				Stage: dropped.Stage, Reason: dropped.Reason,
+			})
+		}
+	}
+	// The author profile still filters every indexer; the requested variant
+	// narrows it further, not a global English-only profile substitute.
 	beforeLang := len(results)
 	filterDesc := ""
 	var langDropped []newznab.SearchResult
 	if len(allowedLangs) > 0 {
 		results, langDropped = indexer.SplitByAllowedLanguages(results, allowedLangs)
 		filterDesc = "allowed=" + strings.Join(allowedLangs, ",")
-	} else if s, _ := h.settings.Get(r.Context(), "search.preferredLanguage"); s != nil {
-		results, langDropped = indexer.SplitByLanguage(results, s.Value)
-		filterDesc = "filter=" + s.Value
+	} else if len(requestedByFormat) == 0 {
+		// The global English preference is for old books with no variant;
+		// it must not override a per-request Romanian or French copy.
+		if s, _ := h.settings.Get(r.Context(), "search.preferredLanguage"); s != nil {
+			results, langDropped = indexer.SplitByLanguage(results, s.Value)
+			filterDesc = "filter=" + s.Value
+		}
 	}
 	langReason := "release name tagged with a language outside the profile (" + filterDesc + ")"
 	if dbg != nil && beforeLang != len(results) {
@@ -834,6 +926,7 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 	// Releases the relevance and language stages removed, offered behind a
 	// collapsed section so the user can still grab one deliberately (#2334).
 	// Language drops come first: they are the right book in the wrong tag.
+	relDropped = append(variantDropped, relDropped...)
 	filtered, filteredTotal := collectFiltered(results, langDropped, langReason, relDropped)
 
 	// Blocklist spec.

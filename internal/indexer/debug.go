@@ -89,14 +89,15 @@ func droppedFilterDebug(dropped []DroppedRelease) []FilterDebug {
 
 // SearchQueryDebug is the effective criteria sent into the searcher.
 type SearchQueryDebug struct {
-	Title            string   `json:"title,omitempty"`
-	Author           string   `json:"author,omitempty"`
-	Year             int      `json:"year,omitempty"`
-	ISBN             string   `json:"isbn,omitempty"`
-	ASIN             string   `json:"asin,omitempty"`
-	MediaType        string   `json:"mediaType,omitempty"`
-	AllowedLanguages []string `json:"allowedLanguages,omitempty"`
-	FreeText         string   `json:"freeText,omitempty"`
+	Title             string   `json:"title,omitempty"`
+	Author            string   `json:"author,omitempty"`
+	Year              int      `json:"year,omitempty"`
+	ISBN              string   `json:"isbn,omitempty"`
+	ASIN              string   `json:"asin,omitempty"`
+	MediaType         string   `json:"mediaType,omitempty"`
+	AllowedLanguages  []string `json:"allowedLanguages,omitempty"`
+	RequestedLanguage string   `json:"requestedLanguage,omitempty"`
+	FreeText          string   `json:"freeText,omitempty"`
 }
 
 // IndexerDebug describes what happened for a single indexer: whether it was
@@ -156,13 +157,14 @@ func (s *Searcher) SearchBookWithDebug(ctx context.Context, indexers []models.In
 	dbg := &SearchDebug{
 		StartedAt: time.Now(),
 		Query: SearchQueryDebug{
-			Title:            c.Title,
-			Author:           c.Author,
-			Year:             c.Year,
-			ISBN:             c.ISBN,
-			ASIN:             c.ASIN,
-			MediaType:        c.MediaType,
-			AllowedLanguages: c.AllowedLanguages,
+			Title:             c.Title,
+			Author:            c.Author,
+			Year:              c.Year,
+			ISBN:              c.ISBN,
+			ASIN:              c.ASIN,
+			MediaType:         c.MediaType,
+			AllowedLanguages:  c.AllowedLanguages,
+			RequestedLanguage: c.RequestedLanguage,
 		},
 		Filters: []FilterDebug{},
 	}

@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/vavallee/bindery/internal/db"
@@ -81,6 +82,7 @@ func languageFixture(t *testing.T, allowedLanguages string, results []newznab.Se
 	ss := &fixedResultsSearcher{results: results}
 	s := &Scheduler{
 		searcher:  ss,
+		books:     books,
 		indexers:  indexers,
 		authors:   authors,
 		settings:  db.NewSettingsRepo(database),
@@ -88,6 +90,7 @@ func languageFixture(t *testing.T, allowedLanguages string, results []newznab.Se
 		downloads: downloads,
 		clients:   clients,
 		profiles:  profiles,
+		pending:   db.NewPendingReleaseRepo(database),
 	}
 	return s, ss, downloads, book
 }
@@ -134,6 +137,114 @@ func TestSearchAndGrabFormat_GrabsAllowedLanguage(t *testing.T) {
 	}
 	if rows[0].GUID != "g-ita" {
 		t.Errorf("grabbed GUID = %q, want g-ita", rows[0].GUID)
+	}
+}
+
+// A new Romanian wanted variant overrides the old profile's broad ENG+RUM
+// permission: automatic grabs must not fall through to a marked English copy.
+func TestMAMLanguageAutomaticSearchUsesWantedVariant(t *testing.T) {
+	ctx := context.Background()
+	s, ss, downloads, book := languageFixture(t, "eng,rum", []newznab.SearchResult{
+		{GUID: "g-eng", Title: "Il Libro [ENG / EPUB]", NZBURL: "http://127.0.0.1:1/en", Protocol: "usenet"},
+		{GUID: "g-rum", Title: "Il Libro [ROM / EPUB]", NZBURL: "http://127.0.0.1:1/ro", Protocol: "usenet"},
+	})
+	if _, err := s.books.VariantRepo().EnsureWanted(ctx, book.ID, models.MediaTypeEbook, []string{"rum"}); err != nil {
+		t.Fatal(err)
+	}
+	s.searchAndGrabFormat(ctx, book, models.MediaTypeEbook, nil)
+	if ss.lastCrit.RequestedLanguage != "rum" {
+		t.Errorf("search requested language = %q; want rum", ss.lastCrit.RequestedLanguage)
+	}
+	rows, err := downloads.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].GUID != "g-rum" {
+		t.Fatalf("automatic grabs = %+v; want Romanian only", rows)
+	}
+}
+
+// The global English preference is only a fallback for legacy books with no
+// requested variant; it cannot veto an explicit Romanian request.
+func TestMAMLanguageAutomaticSearchOverridesGlobalEnglishPreference(t *testing.T) {
+	ctx := context.Background()
+	s, ss, downloads, book := languageFixture(t, "", []newznab.SearchResult{
+		{GUID: "g-ro-pref", Title: "Il Libro [ROM / EPUB]", NZBURL: "http://127.0.0.1:1/ro", Protocol: "usenet"},
+	})
+	if _, err := s.books.VariantRepo().EnsureWanted(ctx, book.ID, models.MediaTypeEbook, []string{"rum"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.settings.Set(ctx, "search.preferredLanguage", "en"); err != nil {
+		t.Fatal(err)
+	}
+	s.searchAndGrabFormat(ctx, book, models.MediaTypeEbook, nil)
+	if ss.lastCrit.RequestedLanguage != "rum" {
+		t.Errorf("search requested language = %q; want rum", ss.lastCrit.RequestedLanguage)
+	}
+	rows, err := downloads.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].GUID != "g-ro-pref" {
+		t.Errorf("global English preference suppressed requested Romanian release: %+v", rows)
+	}
+}
+
+// A stale book-level wanted state cannot trigger another grab for a format
+// whose only variant has already been imported.
+func TestMAMLanguageAutomaticSearchSkipsFormatWithoutWantedVariant(t *testing.T) {
+	ctx := context.Background()
+	s, ss, downloads, book := languageFixture(t, "eng", []newznab.SearchResult{
+		{GUID: "g-extra", Title: "Il Libro [ENG / EPUB]", NZBURL: "http://127.0.0.1:1/en", Protocol: "usenet"},
+	})
+	variants, err := s.books.VariantRepo().EnsureWanted(ctx, book.ID, models.MediaTypeEbook, []string{"eng"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.books.VariantRepo().SetStatus(ctx, variants[0].ID, models.VariantImported); err != nil {
+		t.Fatal(err)
+	}
+	s.searchAndGrabFormat(ctx, book, models.MediaTypeEbook, nil)
+	rows, err := downloads.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 || ss.lastCrit.Title != "" {
+		t.Errorf("format without a wanted variant searched/grabbed: criteria=%+v downloads=%+v", ss.lastCrit, rows)
+	}
+}
+
+// A held English release must not bypass the language filter when the current
+// sweep searches a Romanian variant and finds nothing new.
+func TestMAMLanguagePendingReleaseCannotFillWrongVariant(t *testing.T) {
+	ctx := context.Background()
+	s, _, downloads, book := languageFixture(t, "eng,rum", nil)
+	if _, err := s.books.VariantRepo().EnsureWanted(ctx, book.ID, models.MediaTypeEbook, []string{"rum"}); err != nil {
+		t.Fatal(err)
+	}
+	idxs, err := s.indexers.List(ctx)
+	if err != nil || len(idxs) != 1 {
+		t.Fatalf("indexers = %+v, %v", idxs, err)
+	}
+	res := newznab.SearchResult{GUID: "held-eng", Title: "Il Libro [ENG / EPUB]", IndexerID: idxs[0].ID, Protocol: "usenet", NZBURL: "http://127.0.0.1:1/en"}
+	payload, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.pending.Upsert(ctx, &models.PendingRelease{BookID: book.ID, MediaType: models.MediaTypeEbook, Title: res.Title, IndexerID: &res.IndexerID, GUID: res.GUID, Protocol: res.Protocol, ReleaseJSON: string(payload)}); err != nil {
+		t.Fatal(err)
+	}
+	s.searchAndGrabFormat(ctx, book, models.MediaTypeEbook, nil)
+	rows, err := downloads.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("English pending release auto-grabbed for Romanian variant: %+v", rows)
+	}
+	remaining, err := s.pending.ListByBookAndMediaType(ctx, book.ID, models.MediaTypeEbook)
+	if err != nil || len(remaining) != 1 {
+		t.Errorf("pending row lost without an eligible variant: %+v, %v", remaining, err)
 	}
 }
 

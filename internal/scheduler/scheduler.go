@@ -1180,6 +1180,31 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 	indexerCount = len(idxs)
 
 	lang := s.sweepPreferredLanguage(ctx, sweep)
+	// Until the variant-aware sweep dispatches each wanted copy separately,
+	// constrain this format search to a real wanted variant when one exists.
+	requestedLanguage := ""
+	if s.books != nil {
+		variants, err := s.books.VariantRepo().ListByBook(ctx, book.ID)
+		if err != nil {
+			slog.Error("failed to load requested book variants for search", "book_id", book.ID, "error", err)
+			outcome = "variant lookup failed"
+			return
+		}
+		hasFormatVariant := false
+		for _, v := range variants {
+			if v.MediaType != mediaType {
+				continue
+			}
+			hasFormatVariant = true
+			if v.Status == models.VariantWanted && requestedLanguage == "" {
+				requestedLanguage = v.Language
+			}
+		}
+		if hasFormatVariant && requestedLanguage == "" {
+			outcome = "no wanted variant"
+			return
+		}
+	}
 
 	authorName := ""
 	var authorAliases []string
@@ -1202,12 +1227,13 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 		}
 	}
 	crit := indexer.MatchCriteria{
-		Title:            indexer.SearchTitle(book, allowedLangs),
-		Author:           authorName,
-		MediaType:        mediaType,
-		ASIN:             book.ASIN,
-		AuthorAliases:    authorAliases,
-		AllowedLanguages: allowedLangs,
+		Title:             indexer.SearchTitle(book, allowedLangs),
+		Author:            authorName,
+		MediaType:         mediaType,
+		ASIN:              book.ASIN,
+		AuthorAliases:     authorAliases,
+		AllowedLanguages:  allowedLangs,
+		RequestedLanguage: requestedLanguage,
 		// Ranked by the profile's order (#2733). The grab below takes the
 		// first approved release in ranked order, so this is what decides
 		// which format the sweep picks.
@@ -1272,7 +1298,9 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 	// #1572: auto-grab previously ignored the profile entirely).
 	if len(allowedLangs) > 0 {
 		results = indexer.FilterByAllowedLanguages(results, allowedLangs)
-	} else {
+	} else if requestedLanguage == "" {
+		// Legacy-only fallback; a global English preference cannot veto a
+		// Romanian or French copy explicitly requested by this book.
 		results = indexer.FilterByLanguage(results, lang)
 	}
 	if dbg != nil && len(results) < rawResults {
@@ -1281,6 +1309,16 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 			Reason: "release name tagged with a language outside the profile",
 			Title:  "(" + strconv.Itoa(rawResults-len(results)) + " result(s) dropped)",
 		})
+	}
+	results, variantDropped := indexer.SplitForRequestedLanguage(results, requestedLanguage)
+	if dbg != nil {
+		dbg.Query.RequestedLanguage = requestedLanguage
+		for _, drop := range variantDropped {
+			dbg.Filters = append(dbg.Filters, indexer.FilterDebug{
+				Title: drop.Result.Title, IndexerName: drop.Result.IndexerName,
+				Stage: drop.Stage, Reason: drop.Reason,
+			})
+		}
 	}
 	afterFilters = len(results)
 
@@ -1391,6 +1429,9 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 		// Re-evaluate any existing pending releases for this book/format with the current age.
 		var pendErr error
 		best, bestClient, pendErr = s.pendingApproved(ctx, book, mediaType, dm, func(res *newznab.SearchResult) (*models.DownloadClient, bool, error) {
+			if len(indexer.ForRequestedLanguage([]newznab.SearchResult{*res}, requestedLanguage)) == 0 {
+				return nil, true, nil
+			}
 			return s.checkPin(ctx, book, res, skippedPinned)
 		})
 		if pendErr != nil {
