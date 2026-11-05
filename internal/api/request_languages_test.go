@@ -136,6 +136,160 @@ func TestRequestLanguagesPendingMergeAndForUserAtCap(t *testing.T) {
 	}
 }
 
+// An omitted format still requests the provider's format (or the configured
+// default). A later explicit format must not narrow that first selection.
+func TestRequestLanguagesPendingMergePreservesOmittedFormat(t *testing.T) {
+	for _, tc := range []struct {
+		name, providerFormat string
+		defaultFormat        string
+		legacyEmpty          bool
+	}{
+		{name: "provider supports both", providerFormat: models.MediaTypeBoth},
+		{name: "provider has no format, default is both", defaultFormat: models.MediaTypeBoth},
+		{name: "older pending row with omitted format", providerFormat: models.MediaTypeBoth, legacyEmpty: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := wellsRequestStub()
+			provider.getBookByID["OL27482W"].MediaType = tc.providerFormat
+			f := newRequestsFixture(t, provider, nil)
+			if tc.defaultFormat != "" {
+				if err := f.settings.Set(context.Background(), SettingDefaultMediaType, tc.defaultFormat); err != nil {
+					t.Fatal(err)
+				}
+			}
+			first := assertRequestLanguages(t, f, f.create(t, f.requester, `{"kind":"book","foreignId":"OL27482W","languages":["en"]}`), []string{"eng"})
+			if tc.legacyEmpty {
+				// Pending rows written before this fix retained an empty format.
+				if _, err := f.database.Exec(`UPDATE requests SET media_type = '', payload_json = json_set(payload_json, '$.mediaType', '') WHERE id = ?`, first); err != nil {
+					t.Fatal(err)
+				}
+			}
+			second := assertRequestLanguages(t, f, f.create(t, f.requester, requestBookBody(`,"languages":["ro"]`)), []string{"eng", "rum"})
+			if second != first {
+				t.Fatalf("merge created request %d instead of reusing %d", second, first)
+			}
+			row, err := f.requests.GetByID(context.Background(), first)
+			if err != nil || row == nil {
+				t.Fatalf("merged request = %+v %v", row, err)
+			}
+			var payload requestPayload
+			if err := json.Unmarshal([]byte(row.PayloadJSON), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if row.MediaType != models.MediaTypeBoth || payload.MediaType != models.MediaTypeBoth {
+				t.Fatalf("merge narrowed omitted format: row %q, payload %q; want both", row.MediaType, payload.MediaType)
+			}
+			approved := f.approve(f.admin, first, `{}`)
+			if approved.Code != http.StatusOK {
+				t.Fatalf("approval = %d %s", approved.Code, approved.Body.String())
+			}
+			bookID := *decodeRequest(t, approved).ResultBookID
+			variants, err := db.NewBookVariantRepo(f.database).ListByBook(context.Background(), bookID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := make([]string, 0, len(variants))
+			for _, v := range variants {
+				got = append(got, v.MediaType+"/"+v.Language)
+			}
+			sort.Strings(got)
+			want := []string{"audiobook/eng", "audiobook/rum", "ebook/eng", "ebook/rum"}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("approved variants = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// Resolving an older empty-format row must not turn a repeat selection into
+// a new request merely because its persisted format becomes explicit.
+func TestRequestLanguagesLegacyOmittedFormatRepeatConflicts(t *testing.T) {
+	provider := wellsRequestStub()
+	provider.getBookByID["OL27482W"].MediaType = models.MediaTypeBoth
+	f := newRequestsFixture(t, provider, nil)
+	first := assertRequestLanguages(t, f, f.create(t, f.requester, `{"kind":"book","foreignId":"OL27482W","languages":["en"]}`), []string{"eng"})
+	if _, err := f.database.Exec(`UPDATE requests SET media_type = '', payload_json = json_set(payload_json, '$.mediaType', '') WHERE id = ?`, first); err != nil {
+		t.Fatal(err)
+	}
+	if rec := f.create(t, f.requester, requestBookBody(`,"languages":["en"]`)); rec.Code != http.StatusConflict {
+		t.Fatalf("repeat ebook already included in omitted both = %d %s, want 409", rec.Code, rec.Body.String())
+	}
+}
+
+// Both submissions see no row, but the second lookup finishes after the first
+// insert has filled the pending cap. The same book may still merge; another
+// book must remain capped. The gate fixes the interleaving without sleeps.
+func TestRequestLanguagesConcurrentInitialCreatesMergeAtCap(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		forUser bool
+	}{
+		{name: "requester"},
+		{name: "admin API key for requester", forUser: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRequestsFixture(t, wellsRequestStub(), nil)
+			if err := f.settings.Set(context.Background(), SettingRequestsMaxPendingPerUser, "1"); err != nil {
+				t.Fatal(err)
+			}
+			provider := wellsRequestStub()
+			entered, gate := make(chan struct{}, 1), make(chan struct{})
+			provider.getBookEntered, provider.getBookGate = entered, gate
+			var release sync.Once
+			defer release.Do(func() { close(gate) })
+			late := NewRequestHandler(f.requests, f.books, f.authors, f.settings, f.users, provider, f.author).
+				WithProviderLimiter(auth.NewRequesterLimiter(1<<20, 1<<20, time.Minute, 64))
+			body := `{"kind":"book","foreignId":"OL27482W","mediaType":"ebook","languages":["ro"]`
+			if tc.forUser {
+				body += `,"forUser":` + strconv.FormatInt(f.requester.ID, 10)
+			}
+			body += `}`
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/requests", strings.NewReader(body))
+			if tc.forUser {
+				req = req.WithContext(auth.WithAPIKeyAuth(auth.WithUserRole(auth.WithUserID(req.Context(), f.admin.ID), auth.RoleAdmin)))
+			} else {
+				req = asUser(req, f.requester)
+			}
+			lateResult := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				rec := httptest.NewRecorder()
+				late.Create(rec, req)
+				lateResult <- rec
+			}()
+			select {
+			case <-entered:
+				// The second submission has passed the no-row and cap checks.
+			case rec := <-lateResult:
+				t.Fatalf("second submission returned before metadata gate: %d %s", rec.Code, rec.Body.String())
+			case <-time.After(5 * time.Second):
+				t.Fatal("second submission did not enter metadata lookup")
+			}
+			first := assertRequestLanguages(t, f, f.create(t, f.requester, requestBookBody(`,"languages":["en"]`)), []string{"eng"})
+			release.Do(func() { close(gate) })
+			var rec *httptest.ResponseRecorder
+			select {
+			case rec = <-lateResult:
+			case <-time.After(5 * time.Second):
+				t.Fatal("second submission did not finish")
+			}
+			second := assertRequestLanguages(t, f, rec, []string{"eng", "rum"})
+			if second != first {
+				t.Fatalf("second submission created row %d instead of merging into %d", second, first)
+			}
+			row, err := f.requests.GetByID(context.Background(), first)
+			if err != nil || row == nil || row.OwnerUserID != f.requester.ID || row.CreatedVia != "" {
+				t.Fatalf("merge changed owner or first asker's attribution: %+v %v", row, err)
+			}
+			if n, err := f.requests.CountPendingByOwner(context.Background(), f.requester.ID); err != nil || n != 1 {
+				t.Fatalf("pending count = %d, want one: %v", n, err)
+			}
+			if blocked := f.create(t, f.requester, `{"kind":"book","foreignId":"OL-OTHER"}`); blocked.Code != http.StatusTooManyRequests {
+				t.Fatalf("different book at cap = %d %s, want 429", blocked.Code, blocked.Body.String())
+			}
+		})
+	}
+}
+
 func TestRequestLanguagesApprovedOwnedBookExtendsAndFulfilsEveryVariant(t *testing.T) {
 	auth.SetEnforceTenancyForTests(t, true)
 	f := newRequestsFixture(t, wellsRequestStub(), nil)
@@ -311,7 +465,7 @@ func TestRequestLanguagesPendingMergeHandlesJSONWhitespace(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
-	merged, err := f.requests.MergePending(ctx, first, f.requester.ID, "ebook", []string{"rum"})
+	merged, err := f.requests.MergePending(ctx, first, f.requester.ID, "ebook", []string{"rum"}, "ebook")
 	if err != nil || merged == nil || !reflect.DeepEqual(merged.Languages, []string{"eng", "rum"}) {
 		t.Fatalf("merge valid noncanonical JSON = %+v %v, want eng+rum", merged, err)
 	}

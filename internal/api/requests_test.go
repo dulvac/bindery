@@ -495,6 +495,10 @@ func TestRequestsApprove_RevalidatesPayload(t *testing.T) {
 	f := newRequestsFixture(t, wellsRequestStub(), adder)
 	ctx := context.Background()
 	created := decodeRequest(t, f.create(t, f.requester, `{"kind":"book","foreignId":"OL27482W"}`))
+	original, err := f.requests.GetByID(ctx, created.ID)
+	if err != nil || original == nil {
+		t.Fatalf("read original request: %+v %v", original, err)
+	}
 
 	for _, payload := range []string{
 		`{"kind":"book","foreignId":"OL-SOMETHING-ELSE"}`,
@@ -514,8 +518,7 @@ func TestRequestsApprove_RevalidatesPayload(t *testing.T) {
 		t.Fatalf("add core ran %d times on invalid payloads", adder.calls.Load())
 	}
 
-	good := `{"kind":"book","foreignId":"OL27482W"}`
-	if _, err := f.database.ExecContext(ctx, "UPDATE requests SET payload_json = ? WHERE id = ?", good, created.ID); err != nil {
+	if _, err := f.database.ExecContext(ctx, "UPDATE requests SET payload_json = ? WHERE id = ?", original.PayloadJSON, created.ID); err != nil {
 		t.Fatal(err)
 	}
 	author := seedWells(t, f.authors)

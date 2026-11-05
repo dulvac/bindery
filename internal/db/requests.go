@@ -539,8 +539,9 @@ func (r *RequestRepo) Decline(ctx context.Context, id, adminID int64, reason str
 // MergePending adds missing languages/formats to the owner's pending book
 // request. Its compare-and-swap updates both the row and its approval payload
 // together. A concurrent merge retries against the newly saved selection;
-// an approval claim cannot be changed while it is running.
-func (r *RequestRepo) MergePending(ctx context.Context, id, ownerID int64, mediaType string, languages []string) (*models.LibraryRequest, error) {
+// an approval claim cannot be changed while it is running. originalMediaType
+// resolves older pending rows whose omitted format was stored as empty.
+func (r *RequestRepo) MergePending(ctx context.Context, id, ownerID int64, mediaType string, languages []string, originalMediaType string) (*models.LibraryRequest, error) {
 	for {
 		row := r.db.QueryRowContext(ctx, `SELECT `+requestColumns+` `+requestJoins+`
 			WHERE r.id = ? AND r.owner_user_id = ?`, id, ownerID)
@@ -556,13 +557,18 @@ func (r *RequestRepo) MergePending(ctx context.Context, id, ownerID int64, media
 		if err != nil {
 			return nil, err
 		}
-		mergedMedia := current.MediaType
-		if mergedMedia == "" {
-			mergedMedia = mediaType
-		} else if mediaType != "" && mergedMedia != mediaType {
+		effectiveCurrentMedia := current.MediaType
+		if effectiveCurrentMedia == "" {
+			if len(models.RequestedMediaTypes(originalMediaType)) == 0 {
+				return nil, fmt.Errorf("resolve omitted format before merging pending request")
+			}
+			effectiveCurrentMedia = originalMediaType
+		}
+		mergedMedia := effectiveCurrentMedia
+		if mediaType != "" && mergedMedia != mediaType {
 			mergedMedia = models.MediaTypeBoth
 		}
-		if slices.Equal(merged, current.Languages) && mergedMedia == current.MediaType {
+		if slices.Equal(merged, current.Languages) && mergedMedia == effectiveCurrentMedia {
 			return nil, ErrRequestExists
 		}
 		langJSON, _ := json.Marshal(merged)

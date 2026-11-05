@@ -562,7 +562,12 @@ func (h *RequestHandler) Create(w http.ResponseWriter, r *http.Request) {
 					writeErr(w, http.StatusConflict, msg)
 					return
 				}
-				merged, err := h.requests.MergePending(ctx, existing.ID, owner, body.MediaType, languages)
+				originalMedia, status, msg := h.pendingMediaType(ctx, existing)
+				if msg != "" {
+					writeErr(w, status, msg)
+					return
+				}
+				merged, err := h.requests.MergePending(ctx, existing.ID, owner, body.MediaType, languages, originalMedia)
 				if err == nil {
 					h.writeCreated(ctx, w, *merged, owner)
 					return
@@ -608,6 +613,36 @@ func (h *RequestHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, r, err)
 		return
 	} else if pending >= limit {
+		// A same-book insert can also land between our first owner lookup
+		// and this fast cap check, before any provider lookup. Recheck that
+		// owner's row here as well as after the conditional INSERT below.
+		if body.Kind == models.RequestKindBook && !reopen {
+			latest, err := h.requests.GetForOwner(ctx, owner, body.Kind, body.ForeignID)
+			if err != nil {
+				writeServerError(w, r, err)
+				return
+			}
+			if latest != nil {
+				if latest.Status == models.RequestStatusPending {
+					originalMedia, status, msg := h.pendingMediaType(ctx, latest)
+					if msg != "" {
+						writeErr(w, status, msg)
+						return
+					}
+					merged, mergeErr := h.requests.MergePending(ctx, latest.ID, owner, body.MediaType, languages, originalMedia)
+					if mergeErr == nil {
+						h.writeCreated(ctx, w, *merged, owner)
+						return
+					}
+					if !errors.Is(mergeErr, db.ErrRequestExists) && !errors.Is(mergeErr, db.ErrRequestNotPending) {
+						writeServerError(w, r, mergeErr)
+						return
+					}
+				}
+				writeErr(w, http.StatusConflict, requestSentence(forOther, "You have already requested this.", "This user has already requested this."))
+				return
+			}
+		}
 		capReached()
 		return
 	}
@@ -652,23 +687,41 @@ func (h *RequestHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.requests.Create(ctx, &req.LibraryRequest, limit); err != nil {
-		if errors.Is(err, db.ErrRequestCapReached) {
-			capReached()
-			return
-		}
-		if errors.Is(err, db.ErrRequestExists) {
+		if errors.Is(err, db.ErrRequestCapReached) || errors.Is(err, db.ErrRequestExists) {
+			// Another create can insert this book while our provider lookup is
+			// running. At the cap the conditional INSERT returns cap reached
+			// before the unique constraint can report the duplicate. Recheck
+			// only this owner's row; MergePending still protects approval claims.
+			sameRequest := false
 			if req.Kind == models.RequestKindBook {
 				merged, mergeErr := h.requests.GetForOwner(ctx, owner, req.Kind, req.ForeignID)
-				if mergeErr == nil && merged != nil && merged.Status == models.RequestStatusPending {
-					if merged, mergeErr = h.requests.MergePending(ctx, merged.ID, owner, req.MediaType, req.Languages); mergeErr == nil {
-						h.writeCreated(ctx, w, *merged, owner)
-						return
-					}
-				}
-				if mergeErr != nil && !errors.Is(mergeErr, db.ErrRequestExists) && !errors.Is(mergeErr, db.ErrRequestNotPending) {
+				if mergeErr != nil {
 					writeServerError(w, r, mergeErr)
 					return
 				}
+				if merged != nil {
+					sameRequest = true
+					if merged.Status == models.RequestStatusPending {
+						originalMedia, status, msg := h.pendingMediaType(ctx, merged)
+						if msg != "" {
+							writeErr(w, status, msg)
+							return
+						}
+						merged, mergeErr = h.requests.MergePending(ctx, merged.ID, owner, req.MediaType, req.Languages, originalMedia)
+						if mergeErr == nil {
+							h.writeCreated(ctx, w, *merged, owner)
+							return
+						}
+						if !errors.Is(mergeErr, db.ErrRequestExists) && !errors.Is(mergeErr, db.ErrRequestNotPending) {
+							writeServerError(w, r, mergeErr)
+							return
+						}
+					}
+				}
+			}
+			if errors.Is(err, db.ErrRequestCapReached) && !sameRequest {
+				capReached()
+				return
 			}
 			writeErr(w, http.StatusConflict, requestSentence(forOther, "You have already requested this.", "This user has already requested this."))
 			return
@@ -821,6 +874,16 @@ func (h *RequestHandler) buildRequest(ctx context.Context, owner int64, kind, fo
 		if book == nil || cleanRequestText(book.Title, requestTitleMaxRunes) == "" {
 			return nil, http.StatusNotFound, "No book with that id was found."
 		}
+		// Pin what an omitted format means before a later request merges
+		// explicit formats into this row. The add core otherwise resolves
+		// the provider's format (or the configured default) only at approval.
+		if out.MediaType == "" {
+			out.MediaType = book.MediaType
+			if len(models.RequestedMediaTypes(out.MediaType)) == 0 {
+				out.MediaType = resolveDefaultMediaTypeSetting(ctx, h.settings)
+			}
+			out.payload.MediaType = out.MediaType
+		}
 		out.Title = cleanRequestText(book.Title, requestTitleMaxRunes)
 		if validForeignID(book.ForeignID) {
 			out.resolvedID = book.ForeignID
@@ -854,6 +917,20 @@ func (h *RequestHandler) buildRequest(ctx context.Context, owner int64, kind, fo
 	}
 	out.PayloadJSON = string(raw)
 	return out, 0, ""
+}
+
+// pendingMediaType recovers the effective format of an older pending row that
+// stored an omitted mediaType as empty. A lookup failure keeps the row intact
+// rather than silently narrowing its requested formats during a merge.
+func (h *RequestHandler) pendingMediaType(ctx context.Context, current *models.LibraryRequest) (string, int, string) {
+	if current.MediaType != "" {
+		return current.MediaType, 0, ""
+	}
+	resolved, status, msg := h.buildRequest(ctx, current.OwnerUserID, current.Kind, current.ForeignID, "", current.Languages)
+	if resolved == nil {
+		return "", status, msg
+	}
+	return resolved.MediaType, 0, ""
 }
 
 // alreadyInLibrary returns the sentence to answer when the item is already in
