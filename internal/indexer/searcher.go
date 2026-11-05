@@ -774,7 +774,8 @@ func leadingByCreditTokens(toks []relTok, want int) []string {
 			}
 		}
 		if len(newznab.SigWords(tok.text)) == 0 {
-			if len(tok.text) != 1 {
+			// "Dr." precedes the credited name; its period is not a clause break.
+			if len(tok.text) != 1 && tok.text != "dr" {
 				skippedNonInitial = true
 			}
 			continue

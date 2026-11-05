@@ -1009,6 +1009,21 @@ func TestSingleWordAnchor(t *testing.T) {
 			release: "Dune by Brian Herbert - Essays by Frank Herbert [ENG / EPUB]",
 			want:    false,
 		},
+		{
+			name:    "honorific wrong by-credit precedes wanted author in subtitle",
+			release: "Dune by Dr. Brian Herbert - The Biography of Frank Herbert [ENG / EPUB]",
+			want:    false,
+		},
+		{
+			name:    "first honorific by-credit is decisive when later credit matches",
+			release: "Dune by Dr. Brian Herbert - Essays by Frank Herbert [ENG / EPUB]",
+			want:    false,
+		},
+		{
+			name:    "matching honorific by-credit survives a later wrong credit",
+			release: "Dune by Dr. Frank Herbert - Essays by Brian Herbert [ENG / EPUB]",
+			want:    true,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
