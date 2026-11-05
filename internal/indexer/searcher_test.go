@@ -969,16 +969,50 @@ func TestIsArticle(t *testing.T) {
 
 func TestTitleMatchesSingleKeyword(t *testing.T) {
 	// Single keyword without author tokens → accept (can't do better)
-	if !titleMatchesResult("dune", "dune", []string{"dune"}, nil, nil, false) {
+	if !titleMatchesResult("dune", "dune", []string{"dune"}, nil, nil, false, true) {
 		t.Error("single keyword, no author → should accept")
 	}
 	// Single keyword with non-matching surname → reject
-	if titleMatchesResult("dune novel", "dune novel", []string{"dune"}, []string{"herbert"}, nil, false) {
+	if titleMatchesResult("dune novel", "dune novel", []string{"dune"}, []string{"herbert"}, nil, false, true) {
 		t.Error("single keyword missing surname → should reject")
 	}
 	// Single keyword with matching surname → accept
-	if !titleMatchesResult("dune herbert", "dune herbert", []string{"dune"}, []string{"herbert"}, nil, false) {
+	if !titleMatchesResult("dune herbert", "dune herbert", []string{"dune"}, []string{"herbert"}, nil, false, true) {
 		t.Error("single keyword + matching surname → should accept")
+	}
+}
+
+func TestSingleWordAnchor(t *testing.T) {
+	author := authorTokens("Frank Herbert")
+	cases := []struct {
+		name    string
+		release string
+		want    bool
+	}{
+		{
+			name:    "series-number prefix is benign",
+			release: "Dune Chronicles 01 - Dune by Frank Herbert [ENG / EPUB]",
+			want:    true,
+		},
+		{
+			name:    "unrelated prefix is not anchored",
+			release: "Dreamer of Dune by Frank Herbert [ENG / EPUB]",
+			want:    false,
+		},
+		{
+			name:    "explicit by-credit for another author is rejected",
+			release: "Dune by Brian Herbert - The Biography of Frank Herbert [ENG / EPUB]",
+			want:    false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			norm := NormalizeRelease(tc.release)
+			got := titleMatchesResult(tc.release, norm, []string{"dune"}, author, nil, false, true)
+			if got != tc.want {
+				t.Errorf("titleMatchesResult(%q) = %v, want %v", tc.release, got, tc.want)
+			}
+		})
 	}
 }
 

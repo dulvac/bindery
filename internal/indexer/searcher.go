@@ -694,6 +694,111 @@ func matchAnchored(normResult string, re *regexp.Regexp, authorToks []string) bo
 	return true
 }
 
+// maxByCreditDistance is how far after a one-word title we search for an
+// explicit "by <author>" credit. A real attribution usually appears
+// immediately; the wider window catches subtitle forms like
+// "Dune ... by Brian Herbert".
+const maxByCreditDistance = 8
+
+// byCreditMatchesWantedAuthor reports whether an explicit "by <author>" credit
+// near the matched one-word title agrees with authorToks. If no explicit
+// by-credit is found, or the raw tokenization disagrees with NormalizeRelease,
+// it returns true (no contradiction found).
+func byCreditMatchesWantedAuthor(raw, kw string, authorToks []string) bool {
+	if len(authorToks) == 0 {
+		return true
+	}
+	rawToks, ok := tokenizeRelease(raw)
+	if !ok {
+		return true
+	}
+	kwRe := WordBoundaryRegex(kw)
+	for i := range rawToks {
+		if !kwRe.MatchString(rawToks[i].text) {
+			continue
+		}
+		if matches, found := byCreditForTitle(rawToks, i, len(authorToks), authorToks); found {
+			return matches
+		}
+	}
+	return true
+}
+
+// byCreditForTitle returns whether the first explicit "by" credit after the
+// title token at titleIdx matches authorToks. found is false when no such
+// by-credit appears in the search window.
+func byCreditForTitle(toks []relTok, titleIdx, wantAuthorToks int, authorToks []string) (matches, found bool) {
+	limit := titleIdx + maxByCreditDistance + 1
+	if limit > len(toks) {
+		limit = len(toks)
+	}
+	seenBy, matched := false, false
+	for i := titleIdx + 1; i < limit; i++ {
+		if toks[i].text != "by" {
+			continue
+		}
+		if i > 0 && creditRoleWords[toks[i-1].text] {
+			continue
+		}
+		credit := leadingByCreditTokens(toks[i+1:], wantAuthorToks)
+		if len(credit) == 0 {
+			continue
+		}
+		seenBy = true
+		if byCreditTokensMatchAuthor(credit, authorToks) {
+			matched = true
+		}
+	}
+	if matched {
+		return true, true
+	}
+	if seenBy {
+		return false, true
+	}
+	return true, false
+}
+
+// leadingByCreditTokens reads up to want significant tokens from the first
+// author-looking run after a "by" marker. Token collection stops at file
+// metadata words, digit-led tokens, a second "by", or punctuation introducing
+// a new clause.
+func leadingByCreditTokens(toks []relTok, want int) []string {
+	if want <= 0 || len(toks) == 0 {
+		return nil
+	}
+	out := make([]string, 0, want)
+	for _, tok := range toks {
+		if attributionStopToken(tok.text) || tok.text == "by" {
+			break
+		}
+		if len(out) > 0 && punctBefore(tok) {
+			break
+		}
+		if len(newznab.SigWords(tok.text)) == 0 {
+			continue
+		}
+		out = append(out, tok.text)
+		if len(out) == want {
+			break
+		}
+	}
+	return out
+}
+
+func byCreditTokensMatchAuthor(credit, authorToks []string) bool {
+	if len(credit) == 0 || len(authorToks) == 0 {
+		return true
+	}
+	if authorMatchesRelease(strings.Join(credit, " "), authorToks) {
+		return true
+	}
+	// Surname-only attribution is weak evidence and must not reject a release.
+	if len(credit) == 1 && credit[0] == textutil.TransliterateUmlauts(authorToks[len(authorToks)-1]) {
+		return true
+	}
+	return false
+}
+
 // titleExtensionConnectives are the words that, sitting immediately AFTER a
 // single-word title inside a release name, carry it on into a longer, different
 // title: "Treasure" -> "The Treasure of Khan" (#1731).
@@ -903,12 +1008,13 @@ func extendsAfter(toks []string, i int, authorToks []string) bool {
 // "SeriesName 01 - Title" release that names neither the author nor a bare
 // series marker is now rejected; a wrong grab imports the wrong book, a missed
 // grab retries on another release.
-func titleMatchesResult(raw, normResult string, titleKws []string, authorToks, otherTitles []string, allowKwFallback bool) bool {
+func titleMatchesResult(raw, normResult string, titleKws []string, authorToks, otherTitles []string, allowKwFallback, requireSingleWordAnchor bool) bool {
 	switch len(titleKws) {
 	case 0:
 		return authorMatchesRelease(normResult, authorToks)
 	case 1:
-		if !WordBoundaryRegex(titleKws[0]).MatchString(normResult) {
+		anchorRe := WordBoundaryRegex(titleKws[0])
+		if !anchorRe.MatchString(normResult) {
 			return false
 		}
 		// The word is present, but does the release title stop there? If it
@@ -921,6 +1027,12 @@ func titleMatchesResult(raw, normResult string, titleKws []string, authorToks, o
 		if len(authorToks) == 0 {
 			// No author tokens to anchor on — accept (can't do better).
 			return true
+		}
+		if requireSingleWordAnchor && !matchAnchored(normResult, anchorRe, authorToks) {
+			return false
+		}
+		if !byCreditMatchesWantedAuthor(raw, titleKws[0], authorToks) {
+			return false
 		}
 		return authorMatchesRelease(normResult, authorToks)
 	default:
@@ -1075,9 +1187,9 @@ func filterRelevantKeepDropped(results []newznab.SearchResult, title, author str
 
 	authorTokenSets := latinAliasTokenSets(author, aliases)
 
-	tryMatch := func(raw, n string, kws []string) bool {
+	tryMatch := func(raw, n string, kws []string, requireSingleWordAnchor bool) bool {
 		for _, toks := range authorTokenSets {
-			if titleMatchesResult(raw, n, kws, toks, bc.otherTitles, true) {
+			if titleMatchesResult(raw, n, kws, toks, bc.otherTitles, true, requireSingleWordAnchor) {
 				return true
 			}
 		}
@@ -1088,11 +1200,11 @@ func filterRelevantKeepDropped(results []newznab.SearchResult, title, author str
 	// separated reading of the same title. Never tried first, and skipped
 	// when the two readings are identical, so every result that matches today
 	// still matches for the same reason.
-	tryMatchElided := func(raw, n string, elided, kws []string) bool {
+	tryMatchElided := func(raw, n string, elided, kws []string, requireSingleWordAnchor bool) bool {
 		if len(elided) == 0 || sameKws(elided, kws) {
 			return false
 		}
-		return tryMatch(raw, n, elided)
+		return tryMatch(raw, n, elided, requireSingleWordAnchor)
 	}
 
 	// identityOK applies the title-identity gate, accepting the elided reading
@@ -1144,7 +1256,7 @@ func filterRelevantKeepDropped(results []newznab.SearchResult, title, author str
 	evalFull := func(i int) (keywords, ok bool, trailing string) {
 		r, n := results[i], normTitles[i]
 		identity := strings.Join(titleIdentityWords(r.Title), " ")
-		keywords = tryMatch(r.Title, n, fullKws) || tryMatchElided(r.Title, n, fullElided, fullKws)
+		keywords = tryMatch(r.Title, n, fullKws, true) || tryMatchElided(r.Title, n, fullElided, fullKws, true)
 		ok = keywords &&
 			identityOK(identity, fullIdentity, fullIdentityElided) &&
 			volumeNumberAgrees(n, title)
@@ -1201,7 +1313,7 @@ func filterRelevantKeepDropped(results []newznab.SearchResult, title, author str
 		fullKeywords, fullOK, trailing := evalFull(i)
 		primaryKeywords, primaryOK := false, false
 		if !fullOK && trailing == "" && len(primaryKws) > 0 && !sameKws(primaryKws, fullKws) {
-			primaryKeywords = tryMatch(r.Title, n, primaryKws) || tryMatchElided(r.Title, n, primaryElided, primaryKws)
+			primaryKeywords = tryMatch(r.Title, n, primaryKws, false) || tryMatchElided(r.Title, n, primaryElided, primaryKws, false)
 			primaryOK = primaryKeywords &&
 				identityOK(identity, primaryIdentity, primaryIdentityElided) &&
 				volumeNumberAgrees(n, primaryTitle(title))
@@ -1218,7 +1330,7 @@ func filterRelevantKeepDropped(results []newznab.SearchResult, title, author str
 		}
 		seriesKeywords, seriesOK := false, false
 		if !fullOK && !primaryOK && trailing == "" && len(seriesKws) > 0 {
-			seriesKeywords = tryMatch(r.Title, n, seriesKws)
+			seriesKeywords = tryMatch(r.Title, n, seriesKws, true)
 			seriesOK = seriesKeywords &&
 				(len(seriesIdentity) < 2 || ContainsPhrase(identity, seriesIdentity)) &&
 				volumeNumberAgrees(n, seriesTitle)
