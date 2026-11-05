@@ -673,6 +673,7 @@ func main() {
 		WithSettings(settingsRepo).
 		WithDownloads(downloadRepo).
 		WithVariantRejections(db.NewVariantRejectionRepo(database), cfg.DownloadDir, cfg.AudiobookDownloadDir).
+		WithRejectionTorrentSource(dlClientRepo, cfg.DownloadPathRemap).
 		WithAuthors(authorRepo).
 		WithSeries(seriesRepo).
 		WithEditionHydration(editionRepo).

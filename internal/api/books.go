@@ -38,6 +38,9 @@ type BookHandler struct {
 	roots                  *LibraryRoots // optional: library-root containment for delete
 	variantRejections      *db.VariantRejectionRepo
 	rejectionDownloadRoots []string
+	rejectionClients       *db.DownloadClientRepo
+	rejectionPathRemap     string
+	rejectionTorrentReader func(*models.DownloadClient) rejectionTorrentReader
 
 	coverStore *covers.Store // optional: enables POST /book/{id}/cover
 
