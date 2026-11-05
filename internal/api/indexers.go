@@ -799,6 +799,10 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 		ebookCh := make(chan searchOut, 1)
 		audioCh := make(chan searchOut, 1)
 		go func() {
+			if selectedLanguage != "" && ebookCrit.RequestedLanguage == "" {
+				ebookCh <- searchOut{}
+				return
+			}
 			res, d := h.searcher.SearchBookWithDebug(ctx, idxs, ebookCrit)
 			for i := range res {
 				res[i].MediaType = "ebook"
@@ -807,6 +811,10 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 			ebookCh <- searchOut{res, d}
 		}()
 		go func() {
+			if selectedLanguage != "" && audioCrit.RequestedLanguage == "" {
+				audioCh <- searchOut{}
+				return
+			}
 			res, d := h.searcher.SearchBookWithDebug(ctx, idxs, audioCrit)
 			for i := range res {
 				res[i].MediaType = "audiobook"
@@ -844,11 +852,9 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 		} else {
 			dbg = ebookDbg
 		}
-		// The merged panel describes one search over both category trees, so
-		// the Query summary reports the book's media type. Whichever leg the
-		// merge happened to start from, its per-format criteria would read as
-		// "only ebooks were searched" (#1636) while the indexer rows below it
-		// list both the 7xxx and 3xxx queries.
+		// The Query summary reports the book's media type; the indexer rows
+		// show which format legs actually ran. When both legs run, reporting
+		// just the first leg here would hide the other format (#1636).
 		if dbg != nil {
 			dbg.Query.MediaType = book.MediaType
 		}
