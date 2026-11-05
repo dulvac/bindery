@@ -182,6 +182,7 @@ func TestAssessVariantEvidence_AudioIdentityAndUnknownLanguage(t *testing.T) {
 		{"biography still wrong under override", "Dune", "Frank Herbert", "Dreamer of Dune: The Biography of Frank Herbert by Brian Herbert [ENG / M4B]", "Dreamer of Dune: The Biography of Frank Herbert", "Brian Herbert", true, true, false},
 		{"coherent album retitle cannot hide biography release", "Dune", "Frank Herbert", "Dreamer of Dune: The Biography of Frank Herbert by Brian Herbert [ENG / M4B]", "Dune", "Brian Herbert", true, true, false},
 		{"authorless release names another work corroborated by tag author", "Dune", "Frank Herbert", "Dreamer of Dune [ENG / M4B]", "Dune", "Brian Herbert", true, true, false},
+		{"named release author and matching album outweigh bare narrator artist", "Dune", "Frank Herbert", "Dune Unabridged by Frank Herbert [ENG / M4B]", "Dune", "Simon Vance", false, false, false},
 		{"retitled release with matching author is not wrong work", "Dune", "Frank Herbert", "Duna [ENG / M4B]", "Dune", "Frank Herbert", false, false, false},
 		{"clean release cannot hide wrong tagged work", "Dune", "Frank Herbert", "Dune by Frank Herbert [ENG / M4B]", "Dreamer of Dune: The Biography of Frank Herbert", "Brian Herbert", false, true, false},
 		{"matching title but release and tags agree on wrong author", "Dune", "Frank Herbert", "Dune by Brian Herbert [ENG / M4B]", "Dune", "Brian Herbert", true, true, false},

@@ -54,7 +54,7 @@ func (s *Scanner) AssessVariantEvidence(ctx context.Context, download *models.Do
 	// title overlap (e.g. "Dreamer of Dune" contains the word "Dune").
 	names := s.authorNamesFor(ctx, author)
 	parsed := ParseFilename(strings.ReplaceAll(download.Title, "/", " "))
-	releaseAuthorAgrees, _ := ebookAuthorAgreement(names, parsed.Author)
+	releaseAuthorAgrees, releaseAuthorNamed := ebookAuthorAgreement(names, parsed.Author)
 	if authorAndWorkDisagree(book.Title, names, parsed.Title, parsed.Author) {
 		e.WrongWork = true
 		e.Reason = "release identifies a different work and author"
@@ -65,7 +65,9 @@ func (s *Scanner) AssessVariantEvidence(ctx context.Context, download *models.Do
 		s.assessEbookVariant(ctx, book, author, variant.Language, sourceFiles, &e)
 	case models.MediaTypeAudiobook:
 		releaseTitleDiffers := usableWorkTitle(parsed.Title) && !equivalentWorkTitle(book.Title, parsed.Title)
-		s.assessAudiobookVariant(ctx, book, names, releaseTitleDiffers, !releaseAuthorAgrees, sourceFiles, &e)
+		// A bare Artist tag may name the narrator. A different release title
+		// alone cannot corroborate it when the release names the right author.
+		s.assessAudiobookVariant(ctx, book, names, releaseTitleDiffers && !releaseAuthorNamed, !releaseAuthorAgrees, sourceFiles, &e)
 	}
 	if err := ctx.Err(); err != nil {
 		return VariantEvidence{Verification: "unverified"}, err
