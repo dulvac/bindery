@@ -16,6 +16,44 @@ type DownloadRepo struct {
 	db *sql.DB
 }
 
+// ErrVariantUnavailable means a wanted variant already has an active grab, or
+// moved out of wanted before this grab could reserve it.
+var ErrVariantUnavailable = errors.New("book variant is not available for a grab")
+
+// The reservation and status reconciliation must agree about what still fills
+// a variant. A failed or imported download alone does not fill it.
+const variantActiveSQL = `status IN ('grabbed', 'downloading', 'completed', 'importPending', 'importing', 'importExternal', 'importHeld', 'importFailed')`
+
+func checkVariantClaim(ctx context.Context, tx *sql.Tx, d *models.Download) error {
+	if d.VariantID == nil {
+		return nil
+	}
+	switch d.Status {
+	case models.StateGrabbed, models.StateDownloading, models.StateCompleted,
+		models.StateImportPending, models.StateImporting, models.StateImportExternal,
+		models.StateImportHeld, models.StateImportFailed:
+		// These states reserve the copy until the grab/import ends.
+	default:
+		return nil // historical/dead rows do not reserve a wanted copy
+	}
+	var status string
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM book_variants WHERE id = ?`, *d.VariantID).Scan(&status); err != nil {
+		return fmt.Errorf("look up variant claim: %w", err)
+	}
+	if status != models.VariantWanted {
+		return ErrVariantUnavailable
+	}
+	var busy bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM downloads
+		WHERE variant_id = ? AND id != ? AND `+variantActiveSQL+`)`, *d.VariantID, d.ID).Scan(&busy); err != nil {
+		return fmt.Errorf("check active variant downloads: %w", err)
+	}
+	if busy {
+		return ErrVariantUnavailable
+	}
+	return nil
+}
+
 const downloadSelectColumns = `
 	id, guid, book_id, edition_id, indexer_id, download_client_id,
 	title, nzb_url, size, sabnzbd_nzo_id, torrent_id, status, protocol,
@@ -327,6 +365,9 @@ func (r *DownloadRepo) Create(ctx context.Context, d *models.Download) error {
 	if err := checkDownloadVariantOwner(ctx, tx, d); err != nil {
 		return fmt.Errorf("create download: %w", err)
 	}
+	if err := checkVariantClaim(ctx, tx, d); err != nil {
+		return fmt.Errorf("create download: %w", err)
+	}
 	now := time.Now().UTC()
 	result, err := tx.ExecContext(ctx, `
 		INSERT INTO downloads (guid, book_id, variant_id, edition_id, indexer_id, download_client_id,
@@ -462,6 +503,9 @@ func (r *DownloadRepo) claimForRegrab(ctx context.Context, d *models.Download, q
 	}
 	defer func() { _ = tx.Rollback() }()
 	if err := checkDownloadVariantOwner(ctx, tx, d); err != nil {
+		return false, fmt.Errorf("retry failed download: %w", err)
+	}
+	if err := checkVariantClaim(ctx, tx, d); err != nil {
 		return false, fmt.Errorf("retry failed download: %w", err)
 	}
 
@@ -647,6 +691,9 @@ func (r *DownloadRepo) UpdateStatus(ctx context.Context, id int64, next models.D
 		// silently no-op'ing.
 		return models.ErrInvalidTransition{From: current, To: next}
 	}
+	if next == models.StateFailed {
+		return r.releaseFailedVariant(ctx, id)
+	}
 	return nil
 }
 
@@ -725,7 +772,21 @@ func (r *DownloadRepo) SetError(ctx context.Context, id int64, errMsg string) er
 	_, err := r.db.ExecContext(ctx,
 		"UPDATE downloads SET status=?, error_message=?, dead_at=? WHERE id=?",
 		models.StateFailed, errMsg, time.Now().UTC(), id)
-	return err
+	if err != nil {
+		return err
+	}
+	return r.releaseFailedVariant(ctx, id)
+}
+
+func (r *DownloadRepo) releaseFailedVariant(ctx context.Context, downloadID int64) error {
+	_, err := r.db.ExecContext(ctx, `UPDATE book_variants SET status = 'wanted'
+		WHERE id = (SELECT variant_id FROM downloads WHERE id = ?)
+		AND status = 'downloading'
+		AND NOT EXISTS (SELECT 1 FROM downloads WHERE variant_id = book_variants.id AND `+variantActiveSQL+`)`, downloadID)
+	if err != nil {
+		return fmt.Errorf("release failed download's variant: %w", err)
+	}
+	return nil
 }
 
 // SetErrorWithStatus transitions the download to the given failure state and

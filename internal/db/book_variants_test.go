@@ -879,7 +879,14 @@ func TestDownloadBookReassignmentKeepsOtherVariantClaims(t *testing.T) {
 					state = models.StateFailed
 				}
 				second := &models.Download{GUID: "remaining-" + tc.name, BookID: &book.ID, VariantID: &id, Title: "Remaining", Status: state, Protocol: "usenet"}
-				if err := downloads.Create(ctx, second); err != nil {
+				if tc.name == "active download" {
+					// Simulate a pre-claim duplicate in an existing database; new grabs
+					// cannot create two active downloads for the same variant.
+					if _, err := database.ExecContext(ctx, `INSERT INTO downloads (guid, book_id, variant_id, title, nzb_url, status, protocol)
+						VALUES (?, ?, ?, ?, '', ?, ?)`, second.GUID, book.ID, id, second.Title, second.Status, second.Protocol); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := downloads.Create(ctx, second); err != nil {
 					t.Fatal(err)
 				}
 			}

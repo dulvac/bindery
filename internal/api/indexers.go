@@ -910,12 +910,13 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
-	// The author profile still filters every indexer; the requested variant
-	// narrows it further, not a global English-only profile substitute.
+	// The metadata profile still governs catalogue discovery and search-title
+	// localization. An explicitly requested copy governs release filtering,
+	// even when the author's catalogue profile is narrower.
 	beforeLang := len(results)
 	filterDesc := ""
 	var langDropped []newznab.SearchResult
-	if len(allowedLangs) > 0 {
+	if len(requestedByFormat) == 0 && len(allowedLangs) > 0 {
 		results, langDropped = indexer.SplitByAllowedLanguages(results, allowedLangs)
 		filterDesc = "allowed=" + strings.Join(allowedLangs, ",")
 	} else if len(requestedByFormat) == 0 {

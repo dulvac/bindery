@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -718,7 +719,30 @@ func (s *Scheduler) Stop() {
 // It is the same logic the 12-hour wanted-scan uses, promoted so on-add and
 // status-transition hooks can trigger a search without waiting for the next run.
 func (s *Scheduler) SearchAndGrabBook(ctx context.Context, book models.Book) {
-	s.searchAndGrabFormats(ctx, book, neededFormats(&book), nil)
+	s.searchAndGrabFormats(ctx, book, s.formatsForSearch(ctx, &book), nil)
+}
+
+// A language can be wanted even after another copy of the same format was
+// imported. For variant books, book-level file paths cannot decide the work.
+func (s *Scheduler) formatsForSearch(ctx context.Context, book *models.Book) []string {
+	if s.books == nil {
+		return neededFormats(book)
+	}
+	variants, err := s.books.VariantRepo().ListByBook(ctx, book.ID)
+	if err != nil {
+		slog.Error("failed to list variants before automatic search", "book_id", book.ID, "error", err)
+		return nil // fail closed; an unreadable variant must not trigger a legacy grab
+	}
+	if len(variants) == 0 {
+		return neededFormats(book)
+	}
+	var formats []string
+	for _, v := range variants {
+		if v.Status == models.VariantWanted && slices.Contains(models.RequestedMediaTypes(book.MediaType), v.MediaType) && !slices.Contains(formats, v.MediaType) {
+			formats = append(formats, v.MediaType)
+		}
+	}
+	return formats
 }
 
 // neededFormats returns the media types a book still wants and does not have
@@ -762,8 +786,38 @@ func (s *Scheduler) searchAndGrabFormats(ctx context.Context, book models.Book, 
 	if s.skipUnmonitoredAuthor(ctx, book, sweep) {
 		return
 	}
+	var variants []models.BookVariant
+	if s.books != nil {
+		var err error
+		variants, err = s.books.VariantRepo().ListByBook(ctx, book.ID)
+		if err != nil {
+			slog.Error("failed to list variants for automatic grab", "book_id", book.ID, "error", err)
+			return
+		}
+	}
+	var held map[string]bool
+	var busy map[int64]bool
+	if len(variants) > 0 {
+		// An immediate search has no sweep queue to filter legacy in-flight
+		// downloads or a variant's import retry. The transactional claim is
+		// still the final guard against a concurrent search.
+		held = s.inFlightFormatsByBook(ctx)[book.ID]
+		busy = s.inFlightVariants(ctx)
+	}
 	for _, mediaType := range formats {
-		s.searchAndGrabFormat(ctx, book, mediaType, sweep)
+		if len(variants) == 0 {
+			s.searchAndGrabFormat(ctx, book, mediaType, sweep)
+			continue
+		}
+		for _, v := range variants {
+			if v.MediaType != mediaType || v.Status != models.VariantWanted || !slices.Contains(models.RequestedMediaTypes(book.MediaType), v.MediaType) || busy[v.ID] {
+				continue
+			}
+			if held[""] || held[v.MediaType] || (book.MediaType != models.MediaTypeBoth && len(held) > 0) {
+				continue
+			}
+			s.searchAndGrabVariant(ctx, book, v, sweep)
+		}
 	}
 }
 
@@ -1138,6 +1192,16 @@ func freeleechOnlyIndexerIDs(idxs []models.Indexer) map[int64]bool {
 // searchAndGrabFormat searches for and grabs a specific format of a book.
 // mediaType must be MediaTypeEbook or MediaTypeAudiobook.
 func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, mediaType string, sweep *sweepContext) {
+	s.searchAndGrabFormatForVariant(ctx, book, mediaType, nil, sweep)
+}
+
+// Only searchAndGrabFormats calls this for production grabs, after the global
+// kill switch and author-monitoring checks. The wanted copy is explicit here.
+func (s *Scheduler) searchAndGrabVariant(ctx context.Context, book models.Book, v models.BookVariant, sweep *sweepContext) {
+	s.searchAndGrabFormatForVariant(ctx, book, v.MediaType, &v, sweep)
+}
+
+func (s *Scheduler) searchAndGrabFormatForVariant(ctx context.Context, book models.Book, mediaType string, variant *models.BookVariant, sweep *sweepContext) {
 	// #2154: a search that found nothing used to log nothing at all, so "the
 	// sweep never ran" and "the sweep ran and found nothing" were
 	// indistinguishable from the outside. Every return path below now leaves
@@ -1180,10 +1244,8 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 	indexerCount = len(idxs)
 
 	lang := s.sweepPreferredLanguage(ctx, sweep)
-	// Until the variant-aware sweep dispatches each wanted copy separately,
-	// constrain this format search to a real wanted variant when one exists.
 	requestedLanguage := ""
-	if s.books != nil {
+	if variant == nil && s.books != nil {
 		variants, err := s.books.VariantRepo().ListByBook(ctx, book.ID)
 		if err != nil {
 			slog.Error("failed to load requested book variants for search", "book_id", book.ID, "error", err)
@@ -1191,19 +1253,26 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 			return
 		}
 		hasFormatVariant := false
-		for _, v := range variants {
-			if v.MediaType != mediaType {
+		for i := range variants {
+			if variants[i].MediaType != mediaType {
 				continue
 			}
 			hasFormatVariant = true
-			if v.Status == models.VariantWanted && requestedLanguage == "" {
-				requestedLanguage = v.Language
+			if variants[i].Status == models.VariantWanted && variant == nil {
+				variant = &variants[i]
 			}
 		}
-		if hasFormatVariant && requestedLanguage == "" {
+		if hasFormatVariant && variant == nil {
 			outcome = "no wanted variant"
 			return
 		}
+	}
+	if variant != nil {
+		if variant.Status != models.VariantWanted || variant.BookID != book.ID || variant.MediaType != mediaType {
+			outcome = "no wanted variant"
+			return
+		}
+		requestedLanguage = variant.Language
 	}
 
 	authorName := ""
@@ -1293,15 +1362,15 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 			"attempted", attemptedIndexers,
 			"indexers", strings.Join(names, ", "))
 	}
-	// Author profile takes precedence over the global preferred-language
-	// setting, mirroring the interactive SearchBook endpoint (Discussion
-	// #1572: auto-grab previously ignored the profile entirely).
-	if len(allowedLangs) > 0 {
-		results = indexer.FilterByAllowedLanguages(results, allowedLangs)
-	} else if requestedLanguage == "" {
-		// Legacy-only fallback; a global English preference cannot veto a
-		// Romanian or French copy explicitly requested by this book.
-		results = indexer.FilterByLanguage(results, lang)
+	// The owner's selected copy governs release filtering. For old books
+	// without variants, keep the metadata profile ahead of the global language
+	// preference (Discussion #1572). Catalogue filtering is unchanged.
+	if requestedLanguage == "" {
+		if len(allowedLangs) > 0 {
+			results = indexer.FilterByAllowedLanguages(results, allowedLangs)
+		} else {
+			results = indexer.FilterByLanguage(results, lang)
+		}
 	}
 	if dbg != nil && len(results) < rawResults {
 		dbg.Filters = append(dbg.Filters, indexer.FilterDebug{
@@ -1524,6 +1593,9 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 		Protocol:         best.Protocol,
 		Quality:          indexer.ParseRelease(best.Title).Format,
 	}
+	if variant != nil {
+		dl.VariantID = &variant.ID
+	}
 
 	if existing != nil {
 		// RetryDeadForAutoGrab resets every per grab column, owner and
@@ -1546,6 +1618,10 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 			return
 		}
 	} else if err := s.downloads.Create(ctx, dl); err != nil {
+		if errors.Is(err, db.ErrVariantUnavailable) {
+			outcome = "variant claimed by another grab"
+			return
+		}
 		slog.Error("SearchAndGrabBook: failed to create download record", "error", err)
 		outcome = "download record failed"
 		return
@@ -1579,6 +1655,11 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 	}
 	if err := s.downloads.UpdateStatus(ctx, dl.ID, models.StateDownloading); err != nil {
 		slog.Warn("failed to update download status", "download_id", dl.ID, "status", models.StateDownloading, "error", err)
+	}
+	if variant != nil {
+		if marked, err := s.books.VariantRepo().MarkDownloading(ctx, variant.ID); err != nil || !marked {
+			slog.Warn("failed to mark sent variant downloading", "variant_id", variant.ID, "error", err)
+		}
 	}
 	outcome = "grabbed"
 	slog.Info("sent to downloader", "client", client.Type, "title", best.Title)
@@ -1623,10 +1704,16 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 	// entries for the book would discard the other format's candidates for a
 	// dual-format ('both') book, forcing an unnecessary re-search (see #707).
 	if s.pending != nil {
-		if err := s.pending.DeleteByBookAndMediaType(ctx, book.ID, mediaType); err != nil {
-			// A surviving pending entry can be re-approved and re-grabbed on a
-			// later cycle, producing duplicate downloads with no visible cause.
-			slog.Warn("failed to clear pending releases after grab",
+		var err error
+		if variant != nil {
+			// A second language of this format may still be wanted or held for
+			// review. Only this release is consumed by the successful grab.
+			err = s.pending.DeleteByGUID(ctx, best.GUID)
+		} else {
+			err = s.pending.DeleteByBookAndMediaType(ctx, book.ID, mediaType)
+		}
+		if err != nil {
+			slog.Warn("failed to clear pending release after grab",
 				"book_id", book.ID, "media_type", mediaType, "error", err)
 		}
 	}
@@ -1796,11 +1883,41 @@ func (s *Scheduler) wantedSearchQueue(ctx context.Context) []wantedSearch {
 		slog.Error("failed to list wanted books", "error", err)
 		return nil
 	}
+	// The book may already be imported in English while its Romanian variant
+	// remains wanted. Global ListWanted catches that book even though the old
+	// book-level Wanted query cannot see it.
+	wantedVariants, err := s.books.VariantRepo().ListWanted(ctx)
+	if err != nil {
+		slog.Error("failed to list wanted variants", "error", err)
+		return nil // never fall back to a possibly wrong-language book grab
+	}
+	byBook := make(map[int64][]models.BookVariant)
+	for _, v := range wantedVariants {
+		byBook[v.BookID] = append(byBook[v.BookID], v)
+	}
+	seen := make(map[int64]bool, len(wanted))
+	for _, book := range wanted {
+		seen[book.ID] = true
+	}
+	for bookID := range byBook {
+		if seen[bookID] {
+			continue
+		}
+		book, err := s.books.GetByID(ctx, bookID)
+		if err != nil {
+			slog.Warn("failed to load book for wanted variant", "book_id", bookID, "error", err)
+			continue
+		}
+		if book != nil {
+			wanted = append(wanted, *book)
+		}
+	}
 	if len(wanted) == 0 {
 		return nil
 	}
 
 	inFlight := s.inFlightFormatsByBook(ctx)
+	inFlightVariants := s.inFlightVariants(ctx)
 	splitParts := s.coveredSplitEditionParts(ctx)
 
 	searchQueue := make([]wantedSearch, 0, len(wanted))
@@ -1818,6 +1935,39 @@ func (s *Scheduler) wantedSearchQueue(ctx context.Context) []wantedSearch {
 			continue
 		}
 		held := inFlight[book.ID]
+		// A variant book has separate slots for each language, including after
+		// its book-level format was imported. Legacy unbound downloads are
+		// conservative holds on the whole format, never on a sibling language
+		// already associated with a different variant.
+		variants, err := s.books.VariantRepo().ListByBook(ctx, book.ID)
+		if err != nil {
+			slog.Error("failed to load book variants for wanted sweep", "book_id", book.ID, "error", err)
+			continue
+		}
+		if len(variants) > 0 {
+			formats := make([]string, 0, 2)
+			// With one book-level format, an unbound legacy download holds
+			// that slot regardless of misleading format tokens in its title.
+			singleSlotHeld := book.MediaType != models.MediaTypeBoth && len(held) > 0
+			for _, v := range byBook[book.ID] {
+				if v.Status != models.VariantWanted || inFlightVariants[v.ID] || singleSlotHeld || held[""] || held[v.MediaType] {
+					continue
+				}
+				if !slices.Contains(models.RequestedMediaTypes(book.MediaType), v.MediaType) {
+					continue
+				}
+				if !slices.Contains(formats, v.MediaType) {
+					formats = append(formats, v.MediaType)
+				}
+			}
+			if len(formats) > 0 {
+				searchQueue = append(searchQueue, wantedSearch{book: book, formats: formats})
+			}
+			continue
+		}
+		if book.Status != models.BookStatusWanted {
+			continue
+		}
 		// A book monitored for a SINGLE format has only one slot a download can
 		// be filling, whatever container tokens the release title happens to
 		// carry, so the book's own media type settles it and inference is not
@@ -1888,7 +2038,7 @@ func (s *Scheduler) inFlightFormatsByBook(ctx context.Context) map[int64]map[str
 	}
 	for i := range active {
 		d := &active[i]
-		if d.BookID == nil {
+		if d.BookID == nil || d.VariantID != nil {
 			continue
 		}
 		if inFlight[*d.BookID] == nil {
@@ -1897,6 +2047,30 @@ func (s *Scheduler) inFlightFormatsByBook(ctx context.Context) map[int64]map[str
 		inFlight[*d.BookID][downloadMediaType(d)] = true
 	}
 	return inFlight
+}
+
+// inFlightVariants is an additional per-copy guard for the sweep. The
+// transactional download claim remains authoritative when an immediate search
+// starts between this snapshot and the scheduled search.
+func (s *Scheduler) inFlightVariants(ctx context.Context) map[int64]bool {
+	busy := make(map[int64]bool)
+	if s.downloads == nil {
+		return busy
+	}
+	// ImportFailed still has automatic scanner retries; unlike a dead
+	// download-side failure it must not spend another indexer query.
+	states := append(slices.Clone(inFlightDownloadStates), models.StateImportFailed)
+	active, err := s.downloads.ListByStatuses(ctx, states...)
+	if err != nil {
+		slog.Warn("failed to list in-flight variant downloads", "error", err)
+		return busy
+	}
+	for _, d := range active {
+		if d.VariantID != nil {
+			busy[*d.VariantID] = true
+		}
+	}
+	return busy
 }
 
 // downloadMediaType resolves which format slot a download is working toward,

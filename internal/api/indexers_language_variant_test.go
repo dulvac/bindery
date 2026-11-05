@@ -167,6 +167,50 @@ func TestMAMLanguageInteractiveDebugExplainsWrongVariantBeforeProfile(t *testing
 	}
 }
 
+// The author profile still filters catalogue metadata, but the owner's
+// explicit copy controls release filtering even when that profile is narrower.
+func TestVariantGrabInteractiveRequestedLanguageOverridesNarrowProfile(t *testing.T) {
+	f := newGrabSecFixture(t)
+	book := regrabOwnedBook(t, f.database, f.books, "mam-narrow-profile", f.bob)
+	if _, err := f.books.VariantRepo().EnsureWanted(f.ctx, book.ID, models.MediaTypeEbook, []string{"rum"}); err != nil {
+		t.Fatal(err)
+	}
+	profiles := db.NewMetadataProfileRepo(f.database)
+	p := &models.MetadataProfile{Name: "English only", AllowedLanguages: "eng"}
+	if err := profiles.Create(f.ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	authors := db.NewAuthorRepo(f.database)
+	a, err := authors.GetByID(f.ctx, book.AuthorID)
+	if err != nil || a == nil {
+		t.Fatalf("author = %+v, %v", a, err)
+	}
+	a.MetadataProfileID = &p.ID
+	if err := authors.Update(f.ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	f.searcher.results = []newznab.SearchResult{{GUID: "requested-rum", Title: "Some Book [ROM / EPUB]", Protocol: "usenet"}}
+	h := NewIndexerHandler(db.NewIndexerRepo(f.database), f.books, authors, profiles,
+		f.searcher, db.NewSettingsRepo(f.database), db.NewBlocklistRepo(f.database))
+	rec := httptest.NewRecorder()
+	req := withURLParam(httptest.NewRequest(http.MethodGet, "/indexer/book/1/search?language=rum", nil), "id", strconv.FormatInt(book.ID, 10))
+	h.SearchBook(rec, asRole(req, f.bob, auth.RoleUser))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("search status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Results []struct {
+			GUID string `json:"guid"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 1 || response.Results[0].GUID != "requested-rum" {
+		t.Fatalf("Romanian request under English profile: %+v", response.Results)
+	}
+}
+
 // Selecting a valid ebook variant must not require the audiobook leg to
 // request the same language; that leg uses its own wanted copy instead.
 func TestMAMLanguageDualFormatSelectionFallsBackToOtherLegWantedVariant(t *testing.T) {

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,6 +47,7 @@ var queueClientPollTimeout = 1 * time.Second
 const queueImportedVisibleFor = 7 * 24 * time.Hour
 
 var errAlreadyGrabbed = errors.New("already grabbed")
+var errGrabVariantInvalid = errors.New("invalid variant grab")
 
 // errNoDownloadClient marks a grab or retry that no enabled download client
 // can take. It is a setup problem the user can fix, so the handlers answer 400
@@ -133,6 +135,8 @@ func writeGrabError(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.As(err, &perr):
 		slog.Warn("grab: the indexer's pinned download client cannot take the release", "method", r.Method, "path", r.URL.Path, "error", perr.Error())
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": pinnedMessage(r.Context(), perr), "code": codeIndexerClientUnavailable})
+	case errors.Is(err, errGrabVariantInvalid):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 	case errors.Is(err, errNoDownloadClient):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error(), "code": codeNoDownloadClient})
 	case errors.Is(err, errSendFailed):
@@ -1027,6 +1031,10 @@ type grabRequest struct {
 	IndexerID *int64 `json:"indexerId"`
 	Protocol  string `json:"protocol"`
 	MediaType string `json:"mediaType"`
+	VariantID *int64 `json:"variantId"`
+	// A named admin may approve a known wrong-language tag for exactly this
+	// variant and release. Ordinary users cannot waive this check.
+	LanguageOverrideReason string `json:"languageOverrideReason"`
 	// Force re-grabs a release whose earlier download already imported,
 	// after the user confirmed it (#2289). See forceRegrabbable.
 	Force bool `json:"force"`
@@ -1061,7 +1069,7 @@ func (h *QueueHandler) Grab(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dl, err := h.grab(r.Context(), req)
-	if errors.Is(err, errAlreadyGrabbed) {
+	if errors.Is(err, errAlreadyGrabbed) || errors.Is(err, db.ErrVariantUnavailable) {
 		// err carries alreadyGrabbedDetail's explanation; the search page shows
 		// this string verbatim, so send it rather than the bare sentinel (#1955).
 		// forceAvailable tells the UI it may offer to grab anyway (#2289).
@@ -1211,6 +1219,7 @@ func retryGrabRequest(d models.Download) grabRequest {
 		IndexerID: d.IndexerID,
 		Protocol:  d.Protocol,
 		MediaType: indexer.MediaTypeForFormat(d.Quality),
+		VariantID: d.VariantID,
 	}
 }
 
@@ -1485,11 +1494,104 @@ func grabMediaType(requested, title string) string {
 	return indexer.MediaTypeForFormat(indexer.ParseRelease(title).Format)
 }
 
+// validateGrabVariant never trusts a release's search result grouping or a
+// client-supplied bookId/variantId. The book, chosen format and known language
+// must agree; only an identified admin may approve a known mismatch.
+func (h *QueueHandler) validateGrabVariant(ctx context.Context, req grabRequest) (*models.BookVariant, error) {
+	if req.VariantID != nil && (*req.VariantID <= 0 || req.BookID == nil || *req.BookID <= 0) {
+		return nil, fmt.Errorf("%w: variantId requires a bookId", errGrabVariantInvalid)
+	}
+	if req.BookID == nil || *req.BookID == 0 {
+		if req.LanguageOverrideReason != "" {
+			return nil, fmt.Errorf("%w: language override requires a variant", errGrabVariantInvalid)
+		}
+		return nil, nil
+	}
+	book, err := h.books.GetByID(ctx, *req.BookID)
+	if err != nil {
+		return nil, err
+	}
+	if book == nil || !auth.CheckOwnership(ctx, book.OwnerUserID) {
+		return nil, errGrabBookNotFound
+	}
+	variants, err := h.books.VariantRepo().ListByBook(ctx, book.ID)
+	if err != nil {
+		return nil, err
+	}
+	if req.VariantID == nil {
+		if len(variants) != 0 {
+			return nil, fmt.Errorf("%w: variantId required for a book with requested copies", errGrabVariantInvalid)
+		}
+		if req.LanguageOverrideReason != "" {
+			return nil, fmt.Errorf("%w: language override requires a variant", errGrabVariantInvalid)
+		}
+		return nil, nil
+	}
+	for i := range variants {
+		v := &variants[i]
+		if v.ID != *req.VariantID {
+			continue
+		}
+		if v.Status != models.VariantWanted {
+			return nil, db.ErrVariantUnavailable
+		}
+		if !slices.Contains(models.RequestedMediaTypes(book.MediaType), v.MediaType) || req.MediaType != v.MediaType {
+			return nil, fmt.Errorf("%w: selected variant does not match the requested format", errGrabVariantInvalid)
+		}
+		for _, format := range indexer.ReleaseFormats(req.Title) {
+			if kind := indexer.MediaTypeForFormat(format); kind != "" && kind != v.MediaType {
+				return nil, fmt.Errorf("%w: release format does not match variant", errGrabVariantInvalid)
+			}
+		}
+		codes := indexer.ReleaseLanguages(req.Title)
+		mismatch := len(codes) != 0 && (len(codes) != 1 || codes[0] != v.Language)
+		reason := strings.TrimSpace(req.LanguageOverrideReason)
+		if reason != "" && (!isAdminCtx(ctx) || auth.UserIDFromContext(ctx) == 0 || len(reason) > 500) {
+			return nil, fmt.Errorf("%w: named admin and a reason required for language override", errGrabVariantInvalid)
+		}
+		if mismatch && reason == "" {
+			return nil, fmt.Errorf("%w: release language does not match selected variant", errGrabVariantInvalid)
+		}
+		return v, nil
+	}
+	// Opaque 404 for an unknown or another book's variant ID.
+	return nil, errGrabBookNotFound
+}
+
+// recordVariantOverride persists an admin's approval before an externally
+// visible send. Refuse the send if the audit cannot be saved.
+func (h *QueueHandler) recordVariantOverride(ctx context.Context, req grabRequest, downloadID int64) error {
+	reason := strings.TrimSpace(req.LanguageOverrideReason)
+	if reason == "" {
+		return nil
+	}
+	if h.history == nil || req.VariantID == nil || req.BookID == nil {
+		return fmt.Errorf("%w: cannot persist language override", errGrabVariantInvalid)
+	}
+	data, err := json.Marshal(map[string]any{
+		"actorUserId": auth.UserIDFromContext(ctx), "variantId": *req.VariantID,
+		"downloadId": downloadID, "reason": reason, "releaseLanguages": indexer.ReleaseLanguages(req.Title),
+	})
+	if err != nil {
+		return err
+	}
+	return h.history.Create(ctx, &models.HistoryEvent{
+		BookID: req.BookID, EventType: "variantLanguageOverride", SourceTitle: req.Title, Data: string(data),
+	})
+}
+
 // grab executes the core grab logic: creates a download record and sends to the client.
 // It is called by both the HTTP Grab handler and PendingHandler.Grab.
 func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Download, error) {
 	if req.Protocol == "" {
 		req.Protocol = "usenet"
+	}
+	// Reject cross-user and cross-book variant IDs before looking up the GUID:
+	// even a conflicting GUID must not reveal that someone else's row exists.
+	if req.BookID != nil || req.VariantID != nil {
+		if _, err := h.validateGrabVariant(ctx, req); err != nil {
+			return nil, err
+		}
 	}
 	existing, err := h.downloads.GetByGUID(ctx, req.GUID)
 	if err != nil {
@@ -1564,11 +1666,16 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 		bookOwner = b.OwnerUserID
 	}
 
-	// The media type picks the client, its category and the download
-	// directory, so it has to name the release being sent, not the book it is
-	// for. A dual-format book is "both", which no client category matches, so
-	// an audiobook grabbed from the book page's combined search landed in the
-	// ebook category (#2933). See grabMediaType.
+	// Legacy retry/grab calls can inherit their book from a previous row;
+	// check those too before a missing variant ID becomes an unbound grab.
+	if req.BookID == nil && bookID != nil {
+		req.BookID = bookID
+		if _, err := h.validateGrabVariant(ctx, req); err != nil {
+			return nil, err
+		}
+	}
+	// A dual-format book has separate client categories. An explicit variant
+	// already validated the supplied media type; legacy grabs still infer it.
 	req.MediaType = grabMediaType(req.MediaType, req.Title)
 
 	// Tenancy (#1457): stamp from the request identity. API key and trusted
@@ -1642,6 +1749,7 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 	dl := &models.Download{
 		GUID:             req.GUID,
 		BookID:           bookID,
+		VariantID:        req.VariantID,
 		EditionID:        editionID,
 		IndexerID:        indexerID,
 		DownloadClientID: &client.ID,
@@ -1682,6 +1790,12 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 	} else if err := h.downloads.Create(ctx, dl); err != nil {
 		return nil, err
 	}
+	if err := h.recordVariantOverride(ctx, req, dl.ID); err != nil {
+		if setErr := h.downloads.SetError(ctx, dl.ID, "language override audit failed"); setErr != nil {
+			slog.Error("failed to release unaudited variant grab", "download_id", dl.ID, "error", setErr)
+		}
+		return nil, err
+	}
 
 	sendRes, err := downloader.SendDownload(ctx, client, nzbURL, req.Title, downloader.SendOptions{
 		MediaType:            req.MediaType,
@@ -1719,6 +1833,11 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 		slog.Warn("failed to update download status", "download_id", dl.ID, "status", models.StateDownloading, "error", err)
 	}
 	dl.Status = models.StateDownloading
+	if req.VariantID != nil {
+		if marked, err := h.books.VariantRepo().MarkDownloading(ctx, *req.VariantID); err != nil || !marked {
+			slog.Warn("failed to mark manual variant downloading", "variant_id", *req.VariantID, "error", err)
+		}
+	}
 
 	h.recordHistory(ctx, models.HistoryEventGrabbed, req.Title, bookID, map[string]any{
 		"guid": req.GUID,

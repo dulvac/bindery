@@ -113,6 +113,19 @@ func reconcileVariantAfterDetach(ctx context.Context, tx *sql.Tx, variantID sql.
 	return nil
 }
 
+// MarkDownloading records a successfully sent grab without overwriting an
+// imported or review decision made while the download was being sent.
+func (r *BookVariantRepo) MarkDownloading(ctx context.Context, variantID int64) (bool, error) {
+	result, err := r.db.ExecContext(ctx, `UPDATE book_variants SET status = 'downloading'
+		WHERE id = ? AND status = 'wanted' AND EXISTS (
+			SELECT 1 FROM downloads WHERE variant_id = ? AND `+variantActiveSQL+`)`, variantID, variantID)
+	if err != nil {
+		return false, fmt.Errorf("mark book variant downloading: %w", err)
+	}
+	count, err := result.RowsAffected()
+	return count == 1, err
+}
+
 func (r *BookVariantRepo) SetStatus(ctx context.Context, variantID int64, status string) error {
 	switch status {
 	case models.VariantWanted, models.VariantDownloading, models.VariantImported, models.VariantReview:
