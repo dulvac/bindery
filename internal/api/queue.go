@@ -48,7 +48,7 @@ const queueImportedVisibleFor = 7 * 24 * time.Hour
 
 var errAlreadyGrabbed = errors.New("already grabbed")
 var errGrabVariantInvalid = errors.New("invalid variant grab")
-var errQueueMAMRemoval = errors.New("mam category downloads require removeFromClient=false to forget only in Bindery")
+var errQueueMAMRemoval = errors.New("qBittorrent or mam-category downloads require removeFromClient=false to forget only in Bindery")
 
 // errNoDownloadClient marks a grab or retry that no enabled download client
 // can take. It is a setup problem the user can fix, so the handlers answer 400
@@ -1931,8 +1931,10 @@ func (h *QueueHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	// default. Destroying the files is opt-in via `?deleteFiles=true`,
 	// mirroring book Delete. It does NOT preserve a torrent's seed — the
 	// client is told to delete the torrent either way, and data left on disk
-	// with no torrent is not seeding. `?removeFromClient=false` is what keeps
-	// the release where it is (#2167).
+	// with no torrent is not seeding. For qBittorrent, default removal is
+	// refused because the configured category may differ from the torrent's
+	// actual category. `?removeFromClient=false` only forgets the Bindery row
+	// and leaves the release where it is (#2167).
 	opts := queueRemoveOptions{
 		DeleteFiles:      r.URL.Query().Get("deleteFiles") == "true",
 		RemoveFromClient: r.URL.Query().Get("removeFromClient") != "false",
@@ -1995,9 +1997,8 @@ func (o queueRemoveOptions) validate() error {
 // not queue work (#2374). DownloadRepo.Delete does reconcile the associated
 // variant in its transaction so an unfilled copy can become wanted again.
 //
-// Everything other than the client call runs either way: the point of
-// RemoveFromClient=false is to forget the download, not to pretend it never
-// happened.
+// When removal is allowed, everything other than the client call runs either
+// way: RemoveFromClient=false forgets the download without touching the client.
 //
 // The client call is skipped, deleteFiles included, while another download
 // row still uses the same torrent or job (downloader.ClientJobShared): a
@@ -2020,7 +2021,11 @@ func (h *QueueHandler) removeQueueItem(ctx context.Context, target *models.Downl
 		if client == nil {
 			return fmt.Errorf("download client %d missing before queue removal", *target.DownloadClientID)
 		}
-		if strings.EqualFold(strings.TrimSpace(client.Category), "mam") ||
+		// A qBittorrent torrent may still be in mam even after the configured
+		// destination category changes. Without positive remote provenance,
+		// never delete one by hash (with or without its files).
+		if strings.EqualFold(strings.TrimSpace(client.Type), "qbittorrent") ||
+			strings.EqualFold(strings.TrimSpace(client.Category), "mam") ||
 			strings.EqualFold(strings.TrimSpace(client.CategoryAudiobook), "mam") {
 			return errQueueMAMRemoval
 		}

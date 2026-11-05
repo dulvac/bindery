@@ -614,24 +614,12 @@ func TestQueueBulkDelete_KeepsMonitoringByDefault(t *testing.T) {
 // behaviour while an explicit false is honoured, and the incoherent
 // deleteFiles + removeFromClient:false pair is rejected rather than half-applied.
 func TestQueueBulkDelete_HonoursRemoveFromClient(t *testing.T) {
-	var called int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/v2/torrents/delete" {
-			called++
-		}
-		if r.URL.Path == "/api/v2/auth/login" {
-			_, _ = w.Write([]byte("Ok."))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
+	stub := newRemovalStub(t, "transmission")
 	h, _, downloads, clients, _, ctx := queueFixture(t)
-	host, port := testServerHostPort(t, srv.URL)
+	host, port := testServerHostPort(t, stub.URL)
 	client := &models.DownloadClient{
-		Name: "qb", Type: "qbittorrent", Host: host, Port: port,
-		Username: "user", Password: "pass", Enabled: true,
+		Name: "transmission", Type: "transmission", Host: host, Port: port,
+		Enabled: true,
 	}
 	if err := clients.Create(ctx, client); err != nil {
 		t.Fatalf("create client: %v", err)
@@ -655,7 +643,7 @@ func TestQueueBulkDelete_HonoursRemoveFromClient(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if called != 0 {
+	if _, called := stub.counts(); called != 0 {
 		t.Errorf("client delete called %d times with removeFromClient:false, want 0", called)
 	}
 	if got, _ := downloads.GetByGUID(ctx, "bulk-keep"); got != nil {
@@ -669,7 +657,7 @@ func TestQueueBulkDelete_HonoursRemoveFromClient(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if called != 1 {
+	if _, called := stub.counts(); called != 1 {
 		t.Errorf("client delete called %d times with the field absent, want 1", called)
 	}
 
@@ -759,30 +747,41 @@ func TestQueueList_EnrichesBookAndAuthor(t *testing.T) {
 	}
 }
 
-// queueDeleteFilesProbe spins up a qBittorrent stub and runs Queue.Delete for
-// a torrent download, returning the deleteFiles form value the client sent.
-func queueDeleteFilesProbe(t *testing.T, urlSuffix string) string {
+// queueDeleteFilesProbe runs Queue.Delete against a fake Transmission client
+// and returns whether it asked the client to delete the torrent's data.
+func queueDeleteFilesProbe(t *testing.T, urlSuffix string) bool {
 	t.Helper()
-	var gotDeleteFiles string
+	var gotDeleteFiles, gotRemoval bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v2/auth/login":
-			_, _ = w.Write([]byte("Ok."))
-		case "/api/v2/torrents/delete":
-			_ = r.ParseForm()
-			gotDeleteFiles = r.FormValue("deleteFiles")
-			w.WriteHeader(http.StatusOK)
-		default:
-			t.Fatalf("unexpected qBittorrent path: %s", r.URL.Path)
+		if r.URL.Path != "/transmission/rpc" {
+			t.Errorf("unexpected Transmission path: %s", r.URL.Path)
+			return
 		}
+		var req struct {
+			Method    string `json:"method"`
+			Arguments struct {
+				DeleteLocalData bool `json:"delete-local-data"`
+			} `json:"arguments"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode Transmission request: %v", err)
+			return
+		}
+		if req.Method != "torrent-remove" {
+			t.Errorf("unexpected Transmission method: %s", req.Method)
+			return
+		}
+		gotRemoval = true
+		gotDeleteFiles = req.Arguments.DeleteLocalData
+		_, _ = fmt.Fprint(w, `{"result":"success","arguments":{}}`)
 	}))
 	defer srv.Close()
 
 	h, _, downloads, clients, _, ctx := queueFixture(t)
 	host, port := testServerHostPort(t, srv.URL)
 	client := &models.DownloadClient{
-		Name: "qb", Type: "qbittorrent", Host: host, Port: port,
-		Username: "user", Password: "pass", Enabled: true,
+		Name: "transmission", Type: "transmission", Host: host, Port: port,
+		Enabled: true,
 	}
 	if err := clients.Create(ctx, client); err != nil {
 		t.Fatalf("create client: %v", err)
@@ -811,49 +810,53 @@ func queueDeleteFilesProbe(t *testing.T, urlSuffix string) string {
 	if got != nil {
 		t.Fatalf("download row should be deleted, got %+v", got)
 	}
+	if !gotRemoval {
+		t.Fatal("Transmission never received torrent-remove")
+	}
 	return gotDeleteFiles
 }
 
 // TestQueueDelete_DefaultsToKeepingFiles is the data-loss guard (#715 finding 1):
 // removing an item from the queue must NOT delete downloaded data by default.
 func TestQueueDelete_DefaultsToKeepingFiles(t *testing.T) {
-	if got := queueDeleteFilesProbe(t, ""); got != "false" {
-		t.Fatalf("deleteFiles should default to false, got %q", got)
+	if got := queueDeleteFilesProbe(t, ""); got {
+		t.Fatal("delete-local-data should be false by default")
 	}
 }
 
 // TestQueueDelete_OptInDeletesFiles verifies the explicit ?deleteFiles=true
 // opt-in destroys the downloaded data.
 func TestQueueDelete_OptInDeletesFiles(t *testing.T) {
-	if got := queueDeleteFilesProbe(t, "?deleteFiles=true"); got != "true" {
-		t.Fatalf("deleteFiles should be true with opt-in, got %q", got)
+	if got := queueDeleteFilesProbe(t, "?deleteFiles=true"); !got {
+		t.Fatal("delete-local-data should be true with opt-in")
 	}
 }
 
-// queueClientCallProbe spins up a qBittorrent stub, runs Queue.Delete with the
-// given query suffix, and reports whether the client's delete endpoint was
-// called and whether Bindery's own row went away.
+// queueClientCallProbe runs Queue.Delete against a fake Transmission client
+// and reports whether it removed the job and whether Bindery's row went away.
 func queueClientCallProbe(t *testing.T, urlSuffix string) (clientCalled bool, rowDeleted bool, status int) {
 	t.Helper()
 	var called bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v2/auth/login":
-			_, _ = w.Write([]byte("Ok."))
-		case "/api/v2/torrents/delete":
-			called = true
-			w.WriteHeader(http.StatusOK)
-		default:
-			w.WriteHeader(http.StatusOK)
+		var req struct {
+			Method string `json:"method"`
 		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode Transmission request: %v", err)
+			return
+		}
+		if req.Method == "torrent-remove" {
+			called = true
+		}
+		_, _ = fmt.Fprint(w, `{"result":"success","arguments":{}}`)
 	}))
 	defer srv.Close()
 
 	h, _, downloads, clients, _, ctx := queueFixture(t)
 	host, port := testServerHostPort(t, srv.URL)
 	client := &models.DownloadClient{
-		Name: "qb", Type: "qbittorrent", Host: host, Port: port,
-		Username: "user", Password: "pass", Enabled: true,
+		Name: "transmission", Type: "transmission", Host: host, Port: port,
+		Enabled: true,
 	}
 	if err := clients.Create(ctx, client); err != nil {
 		t.Fatalf("create client: %v", err)
@@ -879,8 +882,8 @@ func queueClientCallProbe(t *testing.T, urlSuffix string) (clientCalled bool, ro
 	return called, got == nil, rec.Code
 }
 
-// TestQueueDelete_RemovesFromClientByDefault pins the pre-#2167 behaviour: with
-// no flag, the download client is still told to drop the job.
+// TestQueueDelete_RemovesFromClientByDefault pins the pre-#2167 behaviour
+// for non-qBittorrent clients: absent a flag, the client drops the job.
 func TestQueueDelete_RemovesFromClientByDefault(t *testing.T) {
 	called, rowDeleted, status := queueClientCallProbe(t, "")
 	if status != http.StatusNoContent {

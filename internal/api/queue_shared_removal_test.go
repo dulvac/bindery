@@ -25,6 +25,9 @@ type removalStub struct {
 	mu       sync.Mutex
 	requests int
 	removals int
+	// The fake remembers the torrent's actual category independently of the
+	// mutable category configured in Bindery's download-client row.
+	torrents map[string]string
 }
 
 func newRemovalStub(t *testing.T, clientType string) *removalStub {
@@ -39,6 +42,14 @@ func newRemovalStub(t *testing.T, clientType string) *removalStub {
 		switch clientType {
 		case "qbittorrent":
 			removal = r.URL.Path == "/api/v2/torrents/delete"
+			if removal {
+				_ = r.ParseForm()
+				s.mu.Lock()
+				for _, hash := range strings.Split(r.FormValue("hashes"), "|") {
+					delete(s.torrents, strings.ToLower(hash))
+				}
+				s.mu.Unlock()
+			}
 			if r.URL.Path == "/api/v2/auth/login" {
 				_, _ = w.Write([]byte("Ok."))
 			}
@@ -79,6 +90,21 @@ func (s *removalStub) counts() (requests, removals int) {
 	return s.requests, s.removals
 }
 
+func (s *removalStub) seedTorrent(hash, category string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.torrents == nil {
+		s.torrents = make(map[string]string)
+	}
+	s.torrents[hash] = category
+}
+
+func (s *removalStub) torrentCategory(hash string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.torrents[hash]
+}
+
 // sharedRemovalCase is one client type and the remote id two rows share.
 type sharedRemovalCase struct {
 	clientType string
@@ -97,8 +123,9 @@ func (c sharedRemovalCase) apply(dl *models.Download) {
 	}
 }
 
+// qBittorrent removal is now fail-closed: these shared-client removal cases
+// exercise clients for which Bindery can still delete a job by default.
 var sharedRemovalCases = []sharedRemovalCase{
-	{"qbittorrent", "0123456789abcdef0123456789abcdef01234567"},
 	{"transmission", "0123456789abcdef0123456789abcdef01234567"},
 	{"deluge", "0123456789abcdef0123456789abcdef01234567"},
 	{"rtorrent", "0123456789abcdef0123456789abcdef01234567"},
@@ -166,6 +193,8 @@ func mamRemovalFixture(t *testing.T, category, audioCategory string) (*QueueHand
 	t.Helper()
 	h, database, downloads, clients, books, ctx := queueFixture(t)
 	stub := newRemovalStub(t, "qbittorrent")
+	id := "0123456789abcdef0123456789abcdef01234567"
+	stub.seedTorrent(id, "mam")
 	host, port := testServerHostPort(t, stub.URL)
 	client := &models.DownloadClient{Name: "test-qbit", Type: "qbittorrent", Host: host, Port: port,
 		Category: category, CategoryAudiobook: audioCategory, Enabled: true}
@@ -182,7 +211,6 @@ func mamRemovalFixture(t *testing.T, category, audioCategory string) (*QueueHand
 	if err != nil {
 		t.Fatal(err)
 	}
-	id := "0123456789abcdef0123456789abcdef01234567"
 	dl := &models.Download{GUID: "mam-release", BookID: &book.ID, VariantID: &copies[0].ID,
 		DownloadClientID: &client.ID, Title: "Book [ROM / EPUB]", NZBURL: "magnet:?xt=urn:btih:" + id,
 		Status: models.StateDownloading, Protocol: "torrent", TorrentID: &id}
@@ -218,6 +246,127 @@ func TestQueueDeleteMamRefusesClientOrFileRemovalBeforeDBDelete(t *testing.T) {
 			}
 			if req, removed := stub.counts(); req != 0 || removed != 0 {
 				t.Fatalf("qbit contacted on refusal: requests=%d removals=%d", req, removed)
+			}
+		})
+	}
+}
+
+func TestQueueDeleteQbitCategoryDriftKeepsMAMTorrentAndDownload(t *testing.T) {
+	const hash = "0123456789abcdef0123456789abcdef01234567"
+	for _, tc := range []struct{ name, suffix string }{
+		{"default", ""},
+		{"delete files", "?deleteFiles=true"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Bindery's configured category has drifted to books, but the
+			// existing torrent in the fake qBittorrent is still in mam.
+			h, downloads, variants, stub, id, bookID, variantID := mamRemovalFixture(t, "books", "")
+			path := "/api/v1/queue/" + strconv.FormatInt(id, 10) + tc.suffix
+			rec := httptest.NewRecorder()
+			h.Delete(rec, withURLParam(httptest.NewRequest(http.MethodDelete, path, nil), "id", strconv.FormatInt(id, 10)))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("drifted-category qbit deletion = %d: %s; want 400", rec.Code, rec.Body.String())
+			}
+			if got, err := downloads.GetByID(context.Background(), id); err != nil || got == nil {
+				t.Fatalf("refusal lost download row: %+v, %v", got, err)
+			}
+			rows, err := variants.ListByBook(context.Background(), bookID)
+			if err != nil || len(rows) != 1 || rows[0].ID != variantID || rows[0].Status != models.VariantDownloading {
+				t.Fatalf("refusal changed variant: %+v, %v", rows, err)
+			}
+			if req, removed := stub.counts(); req != 0 || removed != 0 {
+				t.Fatalf("qbit contacted on refusal: requests=%d removals=%d", req, removed)
+			}
+			if category := stub.torrentCategory(hash); category != "mam" {
+				t.Fatalf("remote MAM torrent category = %q; want mam", category)
+			}
+		})
+	}
+}
+
+func TestQueueBulkDeleteQbitCategoryDriftKeepsMAMTorrentAndDownload(t *testing.T) {
+	const hash = "0123456789abcdef0123456789abcdef01234567"
+	for _, tc := range []struct{ name, field string }{
+		{"default", ""},
+		{"delete files", `,"deleteFiles":true`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, downloads, variants, stub, id, bookID, variantID := mamRemovalFixture(t, "books", "")
+			body := `{"ids":[` + strconv.FormatInt(id, 10) + `]` + tc.field + `}`
+			rec := httptest.NewRecorder()
+			h.BulkDelete(rec, httptest.NewRequest(http.MethodPost, "/api/v1/queue/bulk-delete", strings.NewReader(body)))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("bulk drifted-category qbit refusal = %d: %s; want 200 with per-item refusal", rec.Code, rec.Body.String())
+			}
+			var response bulkResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			result := response.Results[strconv.FormatInt(id, 10)]
+			if result.OK || !strings.Contains(result.Error, "removeFromClient=false") {
+				t.Fatalf("bulk drifted-category qbit result = %+v; want explicit forget refusal", result)
+			}
+			if got, err := downloads.GetByID(context.Background(), id); err != nil || got == nil {
+				t.Fatalf("bulk refusal lost download row: %+v, %v", got, err)
+			}
+			rows, err := variants.ListByBook(context.Background(), bookID)
+			if err != nil || len(rows) != 1 || rows[0].ID != variantID || rows[0].Status != models.VariantDownloading {
+				t.Fatalf("bulk refusal changed variant: %+v, %v", rows, err)
+			}
+			if req, removed := stub.counts(); req != 0 || removed != 0 {
+				t.Fatalf("qbit contacted on bulk refusal: requests=%d removals=%d", req, removed)
+			}
+			if category := stub.torrentCategory(hash); category != "mam" {
+				t.Fatalf("remote MAM torrent category = %q; want mam", category)
+			}
+		})
+	}
+}
+
+func TestQueueQbitCategoryDriftAllowsBinderyOnlyForget(t *testing.T) {
+	const hash = "0123456789abcdef0123456789abcdef01234567"
+	for _, tc := range []struct {
+		name string
+		bulk bool
+	}{
+		{"single", false},
+		{"bulk", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, downloads, variants, stub, id, bookID, _ := mamRemovalFixture(t, "books", "")
+			rec := httptest.NewRecorder()
+			if tc.bulk {
+				body := `{"ids":[` + strconv.FormatInt(id, 10) + `],"removeFromClient":false}`
+				h.BulkDelete(rec, httptest.NewRequest(http.MethodPost, "/api/v1/queue/bulk-delete", strings.NewReader(body)))
+				if rec.Code != http.StatusOK {
+					t.Fatalf("bulk Bindery-only forget = %d: %s", rec.Code, rec.Body.String())
+				}
+				var response bulkResponse
+				if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+					t.Fatal(err)
+				}
+				if !response.Results[strconv.FormatInt(id, 10)].OK {
+					t.Fatalf("bulk Bindery-only forget refused: %s", rec.Body.String())
+				}
+			} else {
+				path := "/api/v1/queue/" + strconv.FormatInt(id, 10) + "?removeFromClient=false"
+				h.Delete(rec, withURLParam(httptest.NewRequest(http.MethodDelete, path, nil), "id", strconv.FormatInt(id, 10)))
+				if rec.Code != http.StatusNoContent {
+					t.Fatalf("single Bindery-only forget = %d: %s", rec.Code, rec.Body.String())
+				}
+			}
+			if got, err := downloads.GetByID(context.Background(), id); err != nil || got != nil {
+				t.Fatalf("Bindery row after forget: %+v, %v; want none", got, err)
+			}
+			rows, err := variants.ListByBook(context.Background(), bookID)
+			if err != nil || len(rows) != 1 || rows[0].Status != models.VariantWanted {
+				t.Fatalf("variant after forget: %+v, %v; want wanted", rows, err)
+			}
+			if req, removed := stub.counts(); req != 0 || removed != 0 {
+				t.Fatalf("qbit contacted on Bindery-only forget: requests=%d removals=%d", req, removed)
+			}
+			if category := stub.torrentCategory(hash); category != "mam" {
+				t.Fatalf("remote MAM torrent category = %q; want mam", category)
 			}
 		})
 	}
@@ -306,7 +455,7 @@ func TestQueueDelete_KeepsDownloadAnotherQueueItemUses(t *testing.T) {
 // TestQueueDelete_SharedDownloadIgnoresCase: torrent ids are compared without
 // regard to case, so a row written in upper case still counts as a user.
 func TestQueueDelete_SharedDownloadIgnoresCase(t *testing.T) {
-	c := sharedRemovalCase{"qbittorrent", "0123456789abcdef0123456789abcdef01234567"}
+	c := sharedRemovalCase{"transmission", "0123456789abcdef0123456789abcdef01234567"}
 	h, database, _, stub, alice, _, dlA, dlB := seedSharedDownloads(t, c)
 	if _, err := database.Exec("UPDATE downloads SET torrent_id=UPPER(torrent_id) WHERE id=?", dlB.ID); err != nil {
 		t.Fatal(err)
@@ -321,7 +470,7 @@ func TestQueueDelete_SharedDownloadIgnoresCase(t *testing.T) {
 // finished attempt nothing will act on again, so it does not keep the
 // download in the client.
 func TestQueueDelete_FailedSiblingDoesNotHoldTheDownload(t *testing.T) {
-	c := sharedRemovalCase{"qbittorrent", "0123456789abcdef0123456789abcdef01234567"}
+	c := sharedRemovalCase{"transmission", "0123456789abcdef0123456789abcdef01234567"}
 	h, database, _, stub, alice, _, dlA, dlB := seedSharedDownloads(t, c)
 	if _, err := database.Exec("UPDATE downloads SET status=? WHERE id=?", models.StateFailed, dlB.ID); err != nil {
 		t.Fatal(err)
@@ -338,7 +487,7 @@ func TestQueueDelete_FailedSiblingDoesNotHoldTheDownload(t *testing.T) {
 // be left in the client with nothing tracking it.
 func TestQueueBulkDelete_SharedDownloadRemovedOnce(t *testing.T) {
 	for i := 0; i < 20; i++ {
-		c := sharedRemovalCase{"qbittorrent", "0123456789abcdef0123456789abcdef01234567"}
+		c := sharedRemovalCase{"transmission", "0123456789abcdef0123456789abcdef01234567"}
 		h, _, downloads, stub, _, _, dlA, dlB := seedSharedDownloads(t, c)
 		body := `{"ids":[` + strconv.FormatInt(dlA.ID, 10) + `,` + strconv.FormatInt(dlB.ID, 10) + `]}`
 		rec := httptest.NewRecorder()
@@ -359,11 +508,11 @@ func TestQueueBulkDelete_SharedDownloadRemovedOnce(t *testing.T) {
 
 // TestQueueDelete_SharedAcrossClientEntriesOnOneDaemon: two client entries
 // configured against one daemon (an ebook and an audiobook entry on the same
-// qBittorrent) adopt torrents across each other, so a row on the second entry
-// still uses the torrent a row on the first one is being removed from.
+// Transmission instance) adopt torrents across each other, so a row on the
+// second entry still uses the torrent a row on the first one is being removed from.
 func TestQueueDelete_SharedAcrossClientEntriesOnOneDaemon(t *testing.T) {
 	t.Setenv("BINDERY_ENFORCE_TENANCY", "true")
-	c := sharedRemovalCase{"qbittorrent", "0123456789abcdef0123456789abcdef01234567"}
+	c := sharedRemovalCase{"transmission", "0123456789abcdef0123456789abcdef01234567"}
 	h, database, downloads, stub, alice, bob, dlA, dlB := seedSharedDownloads(t, c)
 	ctx := context.Background()
 	clients := db.NewDownloadClientRepo(database)
@@ -374,7 +523,7 @@ func TestQueueDelete_SharedAcrossClientEntriesOnOneDaemon(t *testing.T) {
 	}
 	second := *first
 	second.ID = 0
-	second.Name = "qbittorrent audiobooks"
+	second.Name = "transmission audiobooks"
 	second.Host = strings.ToUpper(first.Host)
 	second.Category = "audiobooks"
 	if err := clients.Create(ctx, &second); err != nil {
