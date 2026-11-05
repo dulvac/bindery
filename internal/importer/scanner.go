@@ -1473,6 +1473,11 @@ func downloadFormat(dl *models.Download, book *models.Book, formatHint string) s
 // alone — which is why formatForRelease reads the whole title rather than the
 // single token the parser kept.
 func (s *Scanner) isBookAlreadyImported(ctx context.Context, dl *models.Download, formatHint string) bool {
+	// A book-level file does not prove that THIS variant's download was
+	// checked, even if the source path disappeared between poll cycles.
+	if dl.VariantID != nil {
+		return false
+	}
 	if dl.BookID == nil {
 		return false
 	}
@@ -1568,6 +1573,37 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 
 	s.updateDownloadStatus(ctx, dl.ID, models.StateImportPending)
 
+	// A caller can hold a stale Download object. Decide whether this is a
+	// variant import from the persisted row before the external handoff or
+	// the no-source idempotency shortcut can create any library link.
+	variantDownload := dl.VariantID != nil
+	if dl.ID > 0 && s.downloads != nil {
+		stored, err := s.downloads.GetByID(ctx, dl.ID)
+		if err != nil {
+			s.failImport(ctx, dl, models.StateImportFailed, fmt.Sprintf("cannot load download variant before import: %v", err))
+			return
+		}
+		if stored != nil {
+			if stored.VariantID != nil {
+				if dl.VariantID != nil && *dl.VariantID != *stored.VariantID {
+					s.failImport(ctx, dl, models.StateImportFailed, "download variant changed before import")
+					return
+				}
+				dl.VariantID = stored.VariantID
+				variantDownload = true
+			} else if variantDownload {
+				s.failImport(ctx, dl, models.StateImportFailed, "download variant is no longer persisted")
+				return
+			}
+		} else if variantDownload {
+			s.failImport(ctx, dl, models.StateImportFailed, "variant download no longer exists")
+			return
+		}
+	} else if variantDownload {
+		slog.Error("variant import requires a persisted download", "downloadID", dl.ID)
+		return
+	}
+
 	// Read the configured import mode ONCE for the whole download (issue #705
 	// finding 2). Re-reading "import.mode" per file means an operator toggling
 	// copy↔move in the UI mid-run mixes copy and move within a single download;
@@ -1585,6 +1621,11 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 	// both formats share import.mode and this is the same single read as
 	// before.
 	configuredMode := effectiveConfiguredMode(s.downloadImportMode(ctx, downloadPath, formatHint, explicitFiles), cleanupClientType)
+	// Variant torrent imports may never move or delete the seeding source,
+	// regardless of an operator's global import-mode setting.
+	if variantDownload && dl.Protocol == "torrent" && configuredMode != "external" {
+		configuredMode = "hardlink"
+	}
 
 	// External mode: skip all file operations and leave the book Wanted so the
 	// library scan can reconcile it after the user's external tool (Calibre,
@@ -1598,7 +1639,7 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 	// sweep, each prior download reading as a success. StateImportExternal lets
 	// searchWanted skip the book while the hand-off is outstanding, and
 	// ScanLibrary still reconciles the file the moment it lands.
-	if configuredMode == "external" {
+	if configuredMode == "external" && !variantDownload {
 		// Escape hatch for pair gating (#942): before handing off, release any
 		// formats that have been held past the timeout waiting for a sibling
 		// that never arrived. Evaluated here — on every external-mode tick —
@@ -1633,12 +1674,24 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 	// An ebook file under MinPlausibleEbookBytes is left out: a release's
 	// notes or link .txt is not a second format of the book (#3224). A manual
 	// import keeps every file, as it is the override for a book that small.
+	// Variant torrents cannot fall back to a walk: an RPC failure can leave
+	// downloadPath pointing at a shared save root containing other torrents.
+	if variantDownload && dl.Protocol == "torrent" && len(explicitFiles) == 0 {
+		s.failImport(ctx, dl, models.StateImportFailed, "variant torrent file list unavailable for safe pre-link review")
+		return
+	}
 	bookFiles, tooSmallFiles := discoverBookFilesSized(downloadPath, explicitFiles, !isManualImport(ctx))
 	for _, f := range tooSmallFiles {
 		slog.Info("skipping a file too small to be a book", "file", f, "minBytes", MinPlausibleEbookBytes)
 	}
 
 	if len(bookFiles) == 0 {
+		if variantDownload {
+			// No source means no evidence; never infer a variant from a
+			// previously imported book-level file.
+			s.failImport(ctx, dl, models.StateImportFailed, "variant source files unavailable for pre-link review")
+			return
+		}
 		// Before failing, check whether the book is already in the library. This
 		// covers the case where a torrent was re-grabbed after its files were moved
 		// to the library by a prior Bindery import (move mode): the download path is
@@ -1780,6 +1833,28 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 	detectedFormat := detectDownloadFormat(bookFiles)
 	if formatHint == models.MediaTypeAudiobook || formatHint == models.MediaTypeEbook {
 		detectedFormat = formatHint
+	}
+
+	if variantDownload {
+		selected, reviewed, reason, err := s.reviewVariantImport(importCtx, dl, book, author, detectedFormat, downloadPath, bookFiles)
+		if err != nil {
+			s.failImport(ctx, dl, models.StateImportBlocked, fmt.Sprintf("variant pre-link review failed: %v", err))
+			return
+		}
+		if reviewed {
+			// Existing rejections stay in review; a new rejection's record
+			// and review status were both persisted before this point.
+			s.failImport(ctx, dl, models.StateImportBlocked, reason)
+			return
+		}
+		bookFiles = selected
+		if configuredMode == "external" {
+			// A drop-folder handoff can itself create a library hardlink.
+			// Wait for Task 8's variant-aware external handoff rather than
+			// losing this selected, checked source list in dropToFolder.
+			s.failImport(ctx, dl, models.StateImportBlocked, "external variant handoff needs variant-aware destinations")
+			return
+		}
 	}
 
 	// Post-download format enforcement (#1782).
@@ -1934,6 +2009,10 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 		// run AudiobookDestDir through UniqueDir and land a duplicate
 		// "Title (2)" folder. Short-circuit straight to StateImported instead.
 		if existing := s.importedFormatPath(ctx, book, models.MediaTypeAudiobook); existing != "" {
+			if variantDownload {
+				s.failImport(ctx, dl, models.StateImportBlocked, "existing audiobook cannot prove this variant's source; needs variant-aware destination")
+				return
+			}
 			// A manual import is a person asking for these files to be
 			// placed, not a retry of one that already was. Marking it
 			// imported left every file where it was while the queue and
@@ -2024,7 +2103,11 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 		// per-file placement.
 		audiobookSource := downloadPath
 		usePerFile := false
-		if len(explicitFiles) > 0 {
+		if variantDownload {
+			// The folder placer links sidecars and other files that were not
+			// assessed. Place only the checked source list for a variant.
+			usePerFile = true
+		} else if len(explicitFiles) > 0 {
 			src, perFile := s.resolveAudiobookSource(downloadPath, bookFiles, isTorrentOwnFolder(ctx))
 			usePerFile = perFile
 			if !perFile {
@@ -2089,7 +2172,11 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 					var fileErr error
 					switch mode {
 					case "hardlink":
-						fileErr = HardlinkFile(srcFile, dstFile)
+						if variantDownload {
+							fileErr = osLink(srcFile, dstFile) // no cross-device copy fallback for torrents
+						} else {
+							fileErr = HardlinkFile(srcFile, dstFile)
+						}
 					case "copy":
 						fileErr = CopyFileCtx(importCtx, srcFile, dstFile)
 					default:
@@ -2460,7 +2547,10 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 	// attempt placed them, they are in the library, so a retry's row still lists
 	// every format the download delivered.
 	var importedDestPaths []string
-	readLanguage := book != nil && !book.IsFieldLocked(models.BookFieldLanguage)
+	// Catalogue-level language is not a claim about a variant file. Task 8
+	// records verified language per book_file; do not copy a lying OPF to the
+	// work's language in the meantime.
+	readLanguage := book != nil && !variantDownload && !book.IsFieldLocked(models.BookFieldLanguage)
 	// Resolve the ebook destination root and (auto) placement mode once: the
 	// root is stable for this author across the loop, and choosing hardlink-vs-
 	// copy against it rather than s.libraryDir avoids a cross-device hardlink
@@ -2518,6 +2608,22 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 			continue
 		}
 
+		if variantDownload {
+			// Before staging, refuse a colliding destination even when no
+			// book_files row tracks it. A same-path retry is idempotent only
+			// when this very source inode is already tracked by this book.
+			if to, statErr := os.Lstat(destPath); statErr == nil {
+				from, fromErr := os.Lstat(srcFile)
+				if fromErr != nil || !to.Mode().IsRegular() || !os.SameFile(from, to) || !s.alreadyImportedPath(ctx, book, destPath) {
+					s.failImport(ctx, dl, models.StateImportBlocked, "variant destination already holds another or untracked source; needs language-bearing destination")
+					return
+				}
+			} else if !os.IsNotExist(statErr) {
+				s.failImport(ctx, dl, models.StateImportBlocked, fmt.Sprintf("cannot inspect variant destination: %v", statErr))
+				return
+			}
+		}
+
 		// Idempotency guard (issue #706 finding 2): if a prior attempt already
 		// landed this exact destination file and recorded it in book_files but
 		// crashed before writing the terminal status, re-importing would
@@ -2546,6 +2652,14 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 		// atomic-rename for the durability invariant: either the user
 		// sees the final file with its DB row, or neither.
 		stagedPath, commit, rollback, stageErr := StagedImport(importCtx, mode, srcFile, destPath)
+		if stageErr == nil && variantDownload && mode == "hardlink" {
+			from, fromErr := os.Lstat(srcFile)
+			staged, stagedErr := os.Lstat(stagedPath)
+			if fromErr != nil || stagedErr != nil || !os.SameFile(from, staged) {
+				rollback()
+				stageErr = fmt.Errorf("variant torrent import requires an actual hardlink, not a cross-device copy")
+			}
+		}
 		if stageErr != nil {
 			slog.Error("failed to stage import", "src", srcFile, "mode", mode, "error", stageErr)
 			failed++
@@ -2572,7 +2686,21 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 			}
 			continue
 		}
-		if err := commit(); err != nil {
+		// A variant torrent is staged as a real hardlink. Promote it with
+		// another link (O_EXCL-like) rather than Rename, which silently
+		// replaces a path created after the preflight above.
+		var commitErr error
+		if variantDownload && mode == "hardlink" {
+			commitErr = osLink(stagedPath, destPath)
+			if commitErr == nil {
+				if err := os.Remove(stagedPath); err != nil {
+					slog.Warn("variant import: staged hardlink could not be removed", "path", stagedPath, "error", err)
+				}
+			}
+		} else {
+			commitErr = commit()
+		}
+		if err := commitErr; err != nil {
 			// The DB row exists but the rename failed (e.g. a concurrent
 			// reader holds destPath, or the FS went read-only between
 			// AddBookFile and Rename). Best-effort delete the book_files
@@ -2631,7 +2759,7 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 	// blank dc:language that the backfill above fills in moments later, and
 	// a multi-file download (epub + mobi + pdf sharing one folder) would
 	// otherwise regenerate the identical sidecar once per format.
-	if imported > 0 && sidecarDir != "" {
+	if imported > 0 && sidecarDir != "" && !variantDownload {
 		seriesTitle, seriesNum := s.primarySeriesFor(ctx, book)
 		s.writeOPFSidecar(ctx, sidecarDir, []string{ebookRoot}, book, author, edition, seriesTitle, seriesNum)
 	}
@@ -4287,6 +4415,10 @@ func (s *Scanner) scanLibrary(ctx context.Context) {
 				"title", b.Title, "path", path)
 			return false
 		}
+		if rejected, err := s.rejectedLibraryInode(ctx, b.ID, path); err != nil || rejected {
+			slog.Warn("library scan: refusing rejected or uncheckable source", "bookID", b.ID, "path", path, "rejected", rejected, "error", err)
+			return false
+		}
 		if err := s.books.AddBookFile(ctx, b.ID, detectedFmt, registeredPath); err != nil {
 			slog.Error("library scan: failed to update book", "id", b.ID, "error", err)
 			return false
@@ -4584,6 +4716,10 @@ func (s *Scanner) scanLibrary(ctx context.Context) {
 				if fileTooSmall {
 					continue
 				}
+				if rejected, err := s.rejectedLibraryInode(ctx, b.ID, path); err != nil || rejected {
+					slog.Warn("library scan: refusing rejected or uncheckable ASIN source", "bookID", b.ID, "path", path, "rejected", rejected, "error", err)
+					continue
+				}
 				if err := s.books.AddBookFile(ctx, b.ID, detectedFmt, registeredPath); err != nil {
 					slog.Error("library scan: failed to update book", "id", b.ID, "error", err)
 					continue
@@ -4649,7 +4785,9 @@ func (s *Scanner) scanLibrary(ctx context.Context) {
 			} else if book != nil {
 				effDir := s.effectiveRootForFormat(ctx, authorMap[book.AuthorID], detectedFmt)
 				if pathUnderDir(path, effDir) && !fileTooSmall {
-					if err := s.books.AddBookFile(ctx, book.ID, detectedFmt, registeredPath); err != nil {
+					if rejected, err := s.rejectedLibraryInode(ctx, book.ID, path); err != nil || rejected {
+						slog.Warn("library scan: refusing rejected or uncheckable series source", "bookID", book.ID, "path", path, "rejected", rejected, "error", err)
+					} else if err := s.books.AddBookFile(ctx, book.ID, detectedFmt, registeredPath); err != nil {
 						slog.Error("library scan: failed to update book via series match", "id", book.ID, "error", err)
 					} else {
 						slog.Info("library scan: reconciled book via series position",

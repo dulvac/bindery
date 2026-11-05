@@ -22,6 +22,12 @@ func NewVariantRejectionRepo(database *sql.DB) *VariantRejectionRepo {
 	return &VariantRejectionRepo{db: database}
 }
 
+// RejectionRepo shares the scanner's book database, including in the API and
+// tests. Rejection checks cannot silently be disabled by missing wiring.
+func (r *BookRepo) RejectionRepo() *VariantRejectionRepo {
+	return NewVariantRejectionRepo(r.db)
+}
+
 func (r *VariantRejectionRepo) Record(ctx context.Context, bookID, variantID, downloadID int64, sourcePath, reason string) error {
 	if bookID <= 0 || variantID <= 0 || downloadID <= 0 || !filepath.IsAbs(sourcePath) || filepath.Clean(sourcePath) != sourcePath || strings.TrimSpace(reason) == "" {
 		return fmt.Errorf("record variant rejection: invalid identifiers, source path or reason")
@@ -52,6 +58,31 @@ func (r *VariantRejectionRepo) Record(ctx context.Context, bookID, variantID, do
 		return fmt.Errorf("commit variant rejection: %w", err)
 	}
 	return nil
+}
+
+// ListSourcePaths supplies the exact source identities for inode-based scan
+// reconciliation. The caller must bound and validate any source-folder walk.
+func (r *VariantRejectionRepo) ListSourcePaths(ctx context.Context, bookID int64) ([]string, error) {
+	if bookID <= 0 {
+		return nil, fmt.Errorf("list variant rejections: invalid book")
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT source_path FROM variant_rejections WHERE book_id = ?`, bookID)
+	if err != nil {
+		return nil, fmt.Errorf("list variant rejections: %w", err)
+	}
+	defer rows.Close()
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, fmt.Errorf("read variant rejection: %w", err)
+		}
+		paths = append(paths, path)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list variant rejections: %w", err)
+	}
+	return paths, nil
 }
 
 // IsRejected must be handled fail-closed: a DB error is not a clean negative.
