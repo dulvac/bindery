@@ -23,32 +23,142 @@ func TestEnsureWantedLanguagesIsIdempotent(t *testing.T) {
 	if len(first) != 2 || first[0].Language != "eng" || first[1].Language != "rum" || first[0].ID == first[1].ID || first[0].Status != "wanted" {
 		t.Fatalf("initial ebook variants = %#v", first)
 	}
-	if err := repo.SetStatus(ctx, first[0].ID, "satisfied"); err != nil {
+	if err := repo.SetStatus(ctx, first[0].ID, "imported"); err != nil {
 		t.Fatal(err)
 	}
 	again, err := repo.EnsureWanted(ctx, book.ID, "ebook", []string{"ron", "EN", "rum"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(again) != 2 || first[0].ID != again[0].ID || first[1].ID != again[1].ID || again[0].Status != "satisfied" {
+	if len(again) != 2 || first[0].ID != again[0].ID || first[1].ID != again[1].ID || again[0].Status != "imported" {
 		t.Fatalf("not idempotent: first=%#v again=%#v", first, again)
 	}
-	wanted, err := repo.ListWanted(ctx, book.ID)
+	wanted, err := repo.ListWanted(ctx)
 	if err != nil || len(wanted) != 1 || wanted[0].ID != first[1].ID {
 		t.Fatalf("wanted = %#v, %v; want Romanian only", wanted, err)
 	}
 }
 
-func TestNormalizeRequestLanguages(t *testing.T) {
-	input := []string{" RO ", "ron", "en-US", "ENG", "", "deu"}
-	if got := models.NormalizeRequestLanguages(input); !reflect.DeepEqual(got, []string{"eng", "ger", "rum"}) {
-		t.Fatalf("normalized = %v; want [eng ger rum]", got)
+// SetStatus must accept only the four lifecycle states; an invalid state
+// must not overwrite the current one.
+func TestBookVariantStatusRejectsUnknownValues(t *testing.T) {
+	database, _, book := openTestDB(t)
+	ctx := context.Background()
+	repo := NewBookVariantRepo(database)
+	variants, err := repo.EnsureWanted(ctx, book.ID, "ebook", []string{"eng"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(input, []string{" RO ", "ron", "en-US", "ENG", "", "deu"}) {
+	id := variants[0].ID
+	for _, status := range []string{"downloading", "review", "imported", "wanted"} {
+		if err := repo.SetStatus(ctx, id, status); err != nil {
+			t.Fatalf("valid status %q: %v", status, err)
+		}
+		got, err := repo.ListByBook(ctx, book.ID)
+		if err != nil || len(got) != 1 || got[0].Status != status {
+			t.Fatalf("status after %q = %#v, %v", status, got, err)
+		}
+	}
+	for _, status := range []string{"satisfied", "", "WANTED", "unknown"} {
+		if err := repo.SetStatus(ctx, id, status); err == nil || !strings.Contains(err.Error(), "invalid variant status") {
+			t.Errorf("SetStatus(%q) error = %v; want validation error", status, err)
+		}
+	}
+	got, err := repo.ListByBook(ctx, book.ID)
+	if err != nil || len(got) != 1 || got[0].Status != "wanted" {
+		t.Fatalf("invalid status changed row: %#v, %v", got, err)
+	}
+}
+
+// The database constraint also protects status when bypassing SetStatus.
+func TestVariantMigrationConstrainsStatus(t *testing.T) {
+	database, _, book := openTestDB(t)
+	ctx := context.Background()
+	repo := NewBookVariantRepo(database)
+	variants, err := repo.EnsureWanted(ctx, book.ID, "ebook", []string{"eng"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `UPDATE book_variants SET status = 'satisfied' WHERE id = ?`, variants[0].ID); err == nil {
+		t.Fatal("direct SQL update accepted a status outside the lifecycle")
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO book_variants (book_id, media_type, language, status) VALUES (?, 'ebook', 'rum', 'satisfied')`, book.ID); err == nil {
+		t.Fatal("direct SQL insert accepted a status outside the lifecycle")
+	}
+	got, err := repo.ListByBook(ctx, book.ID)
+	if err != nil || len(got) != 1 || got[0].Status != "wanted" {
+		t.Fatalf("invalid SQL changed variants: %#v, %v", got, err)
+	}
+}
+
+// The scheduler needs all books' wanted variants, while ListByBook retains
+// the scoped view (including variants in other states).
+func TestBookVariantRepoListWantedAcrossBooks(t *testing.T) {
+	database, author, first := openTestDB(t)
+	ctx := context.Background()
+	second := &models.Book{ForeignID: "variants-second-book", AuthorID: author.ID, Title: "Second", SortTitle: "Second", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted}
+	if err := NewBookRepo(database).Create(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	repo := NewBookVariantRepo(database)
+	one, err := repo.EnsureWanted(ctx, first.ID, "ebook", []string{"eng", "rum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := repo.EnsureWanted(ctx, second.ID, "ebook", []string{"fre"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetStatus(ctx, one[1].ID, "imported"); err != nil {
+		t.Fatal(err)
+	}
+	wanted, err := repo.ListWanted(ctx)
+	if err != nil || len(wanted) != 2 || wanted[0].ID != one[0].ID || wanted[1].ID != two[0].ID {
+		t.Fatalf("global wanted variants = %#v, %v; want English and French across books", wanted, err)
+	}
+	scoped, err := repo.ListByBook(ctx, first.ID)
+	if err != nil || len(scoped) != 2 || scoped[1].Status != "imported" {
+		t.Fatalf("scoped variants = %#v, %v", scoped, err)
+	}
+}
+
+func TestNormalizeRequestLanguages(t *testing.T) {
+	input := []string{" RO ", "ron", "fr", "FRA", "EN", "eng"}
+	got, err := models.NormalizeRequestLanguages(input)
+	if err != nil || !reflect.DeepEqual(got, []string{"eng", "fre", "rum"}) {
+		t.Fatalf("normalized = %v, %v; want [eng fre rum]", got, err)
+	}
+	if !reflect.DeepEqual(input, []string{" RO ", "ron", "fr", "FRA", "EN", "eng"}) {
 		t.Fatalf("input changed: %v", input)
 	}
-	if got := models.NormalizeRequestLanguages(nil); !reflect.DeepEqual(got, []string{"eng"}) {
-		t.Fatalf("default = %v; want [eng]", got)
+	got, err = models.NormalizeRequestLanguages(nil)
+	if err != nil || !reflect.DeepEqual(got, []string{"eng"}) {
+		t.Fatalf("default = %v, %v; want [eng]", got, err)
+	}
+}
+
+func TestNormalizeRequestLanguagesRejectsExplicitEmptyOrUnsupported(t *testing.T) {
+	for _, input := range [][]string{{}, {""}, {"\t"}, {"eng", ""}, {"de"}, {"ger"}, {"deu"}, {"en-US"}, {"english"}, {"rom"}} {
+		if got, err := models.NormalizeRequestLanguages(input); err == nil {
+			t.Errorf("NormalizeRequestLanguages(%q) = %v, nil; want error", input, got)
+		}
+	}
+}
+
+// A rejected language selection must not silently create an English or
+// unsupported variant.
+func TestEnsureWantedRejectsInvalidLanguages(t *testing.T) {
+	database, _, book := openTestDB(t)
+	ctx := context.Background()
+	repo := NewBookVariantRepo(database)
+	for _, languages := range [][]string{{}, {""}, {"eng", "de"}, {"en-US"}} {
+		if variants, err := repo.EnsureWanted(ctx, book.ID, "ebook", languages); err == nil {
+			t.Errorf("EnsureWanted(%q) = %#v, nil; want error", languages, variants)
+		}
+	}
+	got, err := repo.ListByBook(ctx, book.ID)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("invalid requests wrote variants: %#v, %v", got, err)
 	}
 }
 

@@ -24,7 +24,10 @@ func (r *BookVariantRepo) EnsureWanted(ctx context.Context, bookID int64, mediaT
 	if mediaType != models.MediaTypeEbook && mediaType != models.MediaTypeAudiobook {
 		return nil, fmt.Errorf("invalid variant media type %q", mediaType)
 	}
-	canonical := models.NormalizeRequestLanguages(languages)
+	canonical, err := models.NormalizeRequestLanguages(languages)
+	if err != nil {
+		return nil, fmt.Errorf("normalize request languages: %w", err)
+	}
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin variants: %w", err)
@@ -55,9 +58,9 @@ func (r *BookVariantRepo) ListByBook(ctx context.Context, bookID int64) ([]model
 		WHERE book_id = ? ORDER BY media_type, language, id`, bookID)
 }
 
-func (r *BookVariantRepo) ListWanted(ctx context.Context, bookID int64) ([]models.BookVariant, error) {
+func (r *BookVariantRepo) ListWanted(ctx context.Context) ([]models.BookVariant, error) {
 	return r.list(ctx, `SELECT id, book_id, media_type, language, status FROM book_variants
-		WHERE book_id = ? AND status = 'wanted' ORDER BY media_type, language, id`, bookID)
+		WHERE status = 'wanted' ORDER BY book_id, media_type, language, id`)
 }
 
 func (r *BookVariantRepo) list(ctx context.Context, query string, args ...any) ([]models.BookVariant, error) {
@@ -78,6 +81,11 @@ func (r *BookVariantRepo) list(ctx context.Context, query string, args ...any) (
 }
 
 func (r *BookVariantRepo) SetStatus(ctx context.Context, variantID int64, status string) error {
+	switch status {
+	case models.VariantWanted, models.VariantDownloading, models.VariantImported, models.VariantReview:
+	default:
+		return fmt.Errorf("invalid variant status %q", status)
+	}
 	result, err := r.db.ExecContext(ctx, `UPDATE book_variants SET status = ? WHERE id = ?`, status, variantID)
 	if err != nil {
 		return fmt.Errorf("set book variant status: %w", err)

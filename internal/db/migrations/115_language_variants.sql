@@ -5,7 +5,7 @@ CREATE TABLE book_variants (
     book_id    INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
     media_type TEXT NOT NULL CHECK (media_type IN ('ebook', 'audiobook')),
     language   TEXT NOT NULL,
-    status     TEXT NOT NULL DEFAULT 'wanted',
+    status     TEXT NOT NULL DEFAULT 'wanted' CHECK (status IN ('wanted', 'downloading', 'imported', 'review')),
     UNIQUE (book_id, media_type, language)
 );
 
