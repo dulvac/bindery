@@ -62,25 +62,23 @@ export default function RequestConfirm({ kind, foreignId, title, subtitle, image
           </div>
         </div>
 
-        {kind === 'book' && (
-          <div className="mt-4 space-y-3">
-            <label className="flex items-center gap-2 text-sm select-none">
-              <span className="font-medium">{t('requests.confirm.format')}</span>
-              <select
-                aria-label={t('requests.confirm.formatLabel')}
-                value={mediaType}
-                onChange={e => setMediaType(e.target.value)}
-                className="text-xs bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-2 py-1"
-              >
-                <option value="">{t('requests.confirm.anyFormat')}</option>
-                <option value="ebook">{t('common.ebook')}</option>
-                <option value="audiobook">{t('common.audiobook')}</option>
-                <option value="both">{t('common.both')}</option>
-              </select>
-            </label>
-            <BookLanguages value={languages} onChange={setLanguages} disabled={sending} />
-          </div>
-        )}
+        <div className="mt-4 space-y-3">
+          <label className="flex items-center gap-2 text-sm select-none">
+            <span className="font-medium">{t('requests.confirm.format')}</span>
+            <select
+              aria-label={t('requests.confirm.formatLabel')}
+              value={mediaType}
+              onChange={e => setMediaType(e.target.value)}
+              className="text-xs bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-2 py-1"
+            >
+              <option value="">{t('requests.confirm.anyFormat')}</option>
+              <option value="ebook">{t('common.ebook')}</option>
+              <option value="audiobook">{t('common.audiobook')}</option>
+              <option value="both">{t('common.both')}</option>
+            </select>
+          </label>
+          {kind === 'book' && <BookLanguages value={languages} onChange={setLanguages} disabled={sending} />}
+        </div>
 
         {error && (
           <div role="alert" className="mt-3 px-3 py-2 bg-red-100 dark:bg-red-950/30 border border-red-300 dark:border-red-900 rounded text-sm text-red-800 dark:text-red-300">

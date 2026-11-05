@@ -477,6 +477,12 @@
       "addFailed": "Buch konnte nicht hinzugefügt werden"
     }
   },
+  "bookLanguages": {
+    "label": "Sprachen",
+    "english": "Englisch",
+    "french": "Französisch",
+    "romanian": "Rumänisch"
+  },
   "mergeAuthorsModal": {
     "title": "Autoren zusammenführen",
     "description": "Wählen Sie zwei Autoren zum Zusammenführen aus. Die Bücher des zweiten Autors werden zum ersten verschoben und das Duplikat wird entfernt.",

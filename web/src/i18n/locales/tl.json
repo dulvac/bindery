@@ -513,6 +513,12 @@
       "addFailed": "Nabigong idagdag ang libro"
     }
   },
+  "bookLanguages": {
+    "label": "Mga wika",
+    "english": "Ingles",
+    "french": "Pranses",
+    "romanian": "Rumano"
+  },
   "mergeAuthorsModal": {
     "title": "Pagsamahin ang mga May-akda",
     "description": "Pumili ng dalawang may-akda na pagsasamahin. Ang mga libro ng pangalawang may-akda ay ililipat sa una, at aalisin ang duplikado.",

@@ -1697,6 +1697,12 @@
     "previouslyLinked": "tidigare länkad",
     "noResults": "Inga alternativa metadatakandidater hittades"
   },
+  "bookLanguages": {
+    "label": "Språk",
+    "english": "Engelska",
+    "french": "Franska",
+    "romanian": "Rumänska"
+  },
   "mergeAuthorsModal": {
     "title": "Slå ihop författare",
     "description": "Välj två författare att slå ihop. Den andra författarens böcker flyttas till den första, och dubbletten tas bort.",

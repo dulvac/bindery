@@ -513,6 +513,12 @@
       "addFailed": "Gagal menambah buku"
     }
   },
+  "bookLanguages": {
+    "label": "Bahasa",
+    "english": "Inggris",
+    "french": "Prancis",
+    "romanian": "Rumania"
+  },
   "mergeAuthorsModal": {
     "title": "Gabungkan Penulis",
     "description": "Pilih dua penulis untuk digabungkan. Buku penulis kedua akan dipindahkan ke yang pertama, dan duplikatnya akan dihapus.",

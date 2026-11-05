@@ -803,6 +803,12 @@
     "ratings": "{{count}}개 평점",
     "noResults": "대체 메타데이터 후보를 찾을 수 없습니다"
   },
+  "bookLanguages": {
+    "label": "언어",
+    "english": "영어",
+    "french": "프랑스어",
+    "romanian": "루마니아어"
+  },
   "mergeAuthorsModal": {
     "title": "저자 병합",
     "description": "병합할 저자 두 명을 선택하세요. 두 번째 저자의 도서가 첫 번째 저자로 이동되고 중복 항목은 삭제됩니다.",

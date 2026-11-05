@@ -107,18 +107,20 @@ describe('confirm steps for a requester', () => {
     expect(api.createRequest).not.toHaveBeenCalled()
   })
 
-  it('sends an author request with no format or language selector', async () => {
+  it('sends an author request with the selected format and no language selector', async () => {
     const onRequested = vi.fn()
     render(<AddAuthorConfirm author={herbert} defaults={null} primaryProvider={null} onBack={vi.fn()} onClose={vi.fn()} onAdded={vi.fn()} onRequested={onRequested} />)
 
-    expect(screen.queryByRole('combobox', { name: 'Format to request' })).not.toBeInTheDocument()
+    const format = screen.getByRole('combobox', { name: 'Format to request' })
+    expect(format).toHaveValue('')
     expect(screen.queryByRole('checkbox', { name: 'English' })).not.toBeInTheDocument()
 
+    fireEvent.change(format, { target: { value: 'audiobook' } })
     fireEvent.click(screen.getByRole('button', { name: 'Request author' }))
 
     await waitFor(() => expect(onRequested).toHaveBeenCalled())
     const call = vi.mocked(api.createRequest).mock.calls[0]
-    expect(call).toEqual(['author', 'OL-FH', ''])
+    expect(call).toEqual(['author', 'OL-FH', 'audiobook'])
     expect(api.addAuthor).not.toHaveBeenCalled()
     expect(api.listIndexers).not.toHaveBeenCalled()
     expect(api.listDownloadClients).not.toHaveBeenCalled()

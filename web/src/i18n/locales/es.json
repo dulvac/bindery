@@ -519,6 +519,12 @@
       "addFailed": "Error al añadir el libro"
     }
   },
+  "bookLanguages": {
+    "label": "Idiomas",
+    "english": "Inglés",
+    "french": "Francés",
+    "romanian": "Rumano"
+  },
   "mergeAuthorsModal": {
     "title": "Fusionar autores",
     "description": "Selecciona dos autores para fusionar. Los libros del segundo autor se moverán al primero y el duplicado se eliminará.",
