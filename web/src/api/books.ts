@@ -196,8 +196,9 @@ export const booksApi = {
 
   // Add a single book to wanted (adds author silently if new). mediaType
   // optionally forces ebook/audiobook/both; empty keeps the provider value /
-  // default.media_type setting (#1397).
-  addBook: (data: { foreignBookId: string; foreignAuthorId: string; authorName?: string; searchOnAdd?: boolean; mediaType?: string }) =>
+  // default.media_type setting (#1397). languages defaults to English when
+  // omitted and may carry multiple choices for variant tracking.
+  addBook: (data: { foreignBookId: string; foreignAuthorId: string; authorName?: string; searchOnAdd?: boolean; mediaType?: string; languages?: string[] }) =>
     request<Book>('/author/book', { method: 'POST', body: JSON.stringify(data) }),
 
   // Fix Match (#1238): move a mis-matched file to a different book. The file is

@@ -477,6 +477,12 @@
       "addFailed": "Boek toevoegen mislukt"
     }
   },
+  "bookLanguages": {
+    "label": "Talen",
+    "english": "Engels",
+    "french": "Frans",
+    "romanian": "Roemeens"
+  },
   "mergeAuthorsModal": {
     "title": "Auteurs samenvoegen",
     "description": "Selecteer twee auteurs om samen te voegen. De boeken van de tweede auteur worden verplaatst naar de eerste, en het duplicaat wordt verwijderd.",

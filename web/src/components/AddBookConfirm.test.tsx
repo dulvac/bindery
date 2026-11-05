@@ -35,6 +35,10 @@ vi.mock('react-i18next', () => ({
         'common.ebook': 'Ebook',
         'common.audiobook': 'Audiobook',
         'common.both': 'Both',
+        'bookLanguages.label': 'Languages',
+        'bookLanguages.english': 'English',
+        'bookLanguages.french': 'French',
+        'bookLanguages.romanian': 'Romanian',
       }
       let out = strings[key] ?? key
       for (const [k, v] of Object.entries(options ?? {})) {
@@ -117,6 +121,7 @@ describe('AddBookConfirm', () => {
     expect(sourceLink).toHaveAttribute('target', '_blank')
     expect(sourceLink).toHaveAttribute('rel', 'noopener noreferrer')
     expect(screen.getByLabelText('Format to add')).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: 'English' })).toBeChecked()
     expect(screen.getByText('Search indexers after adding')).toBeInTheDocument()
   })
 
@@ -138,7 +143,13 @@ describe('AddBookConfirm', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Add book' }))
     await waitFor(() => expect(api.addBook).toHaveBeenCalled())
     const sent = vi.mocked(api.addBook).mock.calls[0][0]
-    expect(sent).toMatchObject({ foreignBookId: 'OL1W', foreignAuthorId: 'OL-FH', authorName: 'Frank Herbert', searchOnAdd: true })
+    expect(sent).toMatchObject({
+      foreignBookId: 'OL1W',
+      foreignAuthorId: 'OL-FH',
+      authorName: 'Frank Herbert',
+      searchOnAdd: true,
+      languages: ['eng'],
+    })
     expect(sent).not.toHaveProperty('mediaType')
     await waitFor(() => expect(onAdded).toHaveBeenCalledWith(expect.objectContaining({ id: 1 })))
     // Closing is the modal's job, so a caller can navigate first.
@@ -151,7 +162,26 @@ describe('AddBookConfirm', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: /search indexers after adding/i }))
     fireEvent.click(screen.getByRole('button', { name: 'Add book' }))
     await waitFor(() => expect(api.addBook).toHaveBeenCalled())
-    expect(vi.mocked(api.addBook).mock.calls[0][0]).toMatchObject({ mediaType: 'audiobook', searchOnAdd: false })
+    expect(vi.mocked(api.addBook).mock.calls[0][0]).toMatchObject({ mediaType: 'audiobook', searchOnAdd: false, languages: ['eng'] })
+  })
+
+  it('reuses one language selection for both formats', async () => {
+    renderConfirm(dune)
+    fireEvent.change(screen.getByLabelText('Format to add'), { target: { value: 'both' } })
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Romanian' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add book' }))
+
+    await waitFor(() => expect(api.addBook).toHaveBeenCalled())
+    expect(vi.mocked(api.addBook).mock.calls[0][0]).toMatchObject({ mediaType: 'both', languages: ['eng', 'rum'] })
+  })
+
+  it('disables Add when no language is selected', () => {
+    renderConfirm(dune)
+    fireEvent.click(screen.getByRole('checkbox', { name: 'English' }))
+    const add = screen.getByRole('button', { name: 'Add book' })
+    expect(add).toBeDisabled()
+    fireEvent.click(add)
+    expect(api.addBook).not.toHaveBeenCalled()
   })
 
   it('lets a result with no author be added, and sends empty author fields (#2187)', async () => {

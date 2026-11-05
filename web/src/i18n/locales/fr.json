@@ -479,6 +479,12 @@
       "addFailed": "Échec de l'ajout du livre"
     }
   },
+  "bookLanguages": {
+    "label": "Langues",
+    "english": "Anglais",
+    "french": "Français",
+    "romanian": "Roumain"
+  },
   "mergeAuthorsModal": {
     "title": "Fusionner des auteurs",
     "description": "Sélectionnez deux auteurs à fusionner. Les livres du second auteur seront déplacés vers le premier, et le doublon sera supprimé.",

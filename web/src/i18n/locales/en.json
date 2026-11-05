@@ -2841,6 +2841,12 @@
       "approveFailed": "Could not approve the request"
     }
   },
+  "bookLanguages": {
+    "label": "Languages",
+    "english": "English",
+    "french": "French",
+    "romanian": "Romanian"
+  },
   "bookStatus": {
     "wanted": "Wanted",
     "imported": "In library",

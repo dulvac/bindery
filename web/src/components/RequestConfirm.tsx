@@ -3,11 +3,13 @@ import { useTranslation } from 'react-i18next'
 import { api } from '../api/client'
 import type { LibraryRequest, RequestKind } from '../api/client'
 import CoverImage from './CoverImage'
+import BookLanguages from './BookLanguages'
 import { primaryFill } from './buttons'
 
 // The confirm step a requester sees in place of the Add Author and Add Book
-// steps. A requester chooses only the format; the admin who approves chooses
-// everything else, so none of the admin options are shown or sent.
+// steps. A requester chooses the wanted format and request languages for books;
+// the admin who approves chooses everything else, so none of the admin options
+// are shown or sent.
 interface Props {
   kind: RequestKind
   foreignId: string
@@ -22,6 +24,7 @@ interface Props {
 export default function RequestConfirm({ kind, foreignId, title, subtitle, imageUrl, onBack, onClose, onRequested }: Props) {
   const { t } = useTranslation()
   const [mediaType, setMediaType] = useState('')
+  const [languages, setLanguages] = useState<string[]>(['eng'])
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const headingRef = useRef<HTMLHeadingElement>(null)
@@ -34,7 +37,9 @@ export default function RequestConfirm({ kind, foreignId, title, subtitle, image
     setSending(true)
     setError(null)
     try {
-      const created = await api.createRequest(kind, foreignId, mediaType)
+      const created = kind === 'book'
+        ? await api.createRequest(kind, foreignId, mediaType, languages)
+        : await api.createRequest(kind, foreignId, mediaType)
       onRequested(created)
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : t('requests.confirm.failed'))
@@ -57,20 +62,25 @@ export default function RequestConfirm({ kind, foreignId, title, subtitle, image
           </div>
         </div>
 
-        <label className="mt-4 flex items-center gap-2 text-sm select-none">
-          <span className="font-medium">{t('requests.confirm.format')}</span>
-          <select
-            aria-label={t('requests.confirm.formatLabel')}
-            value={mediaType}
-            onChange={e => setMediaType(e.target.value)}
-            className="text-xs bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-2 py-1"
-          >
-            <option value="">{t('requests.confirm.anyFormat')}</option>
-            <option value="ebook">{t('common.ebook')}</option>
-            <option value="audiobook">{t('common.audiobook')}</option>
-            <option value="both">{t('common.both')}</option>
-          </select>
-        </label>
+        {kind === 'book' && (
+          <div className="mt-4 space-y-3">
+            <label className="flex items-center gap-2 text-sm select-none">
+              <span className="font-medium">{t('requests.confirm.format')}</span>
+              <select
+                aria-label={t('requests.confirm.formatLabel')}
+                value={mediaType}
+                onChange={e => setMediaType(e.target.value)}
+                className="text-xs bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-2 py-1"
+              >
+                <option value="">{t('requests.confirm.anyFormat')}</option>
+                <option value="ebook">{t('common.ebook')}</option>
+                <option value="audiobook">{t('common.audiobook')}</option>
+                <option value="both">{t('common.both')}</option>
+              </select>
+            </label>
+            <BookLanguages value={languages} onChange={setLanguages} disabled={sending} />
+          </div>
+        )}
 
         {error && (
           <div role="alert" className="mt-3 px-3 py-2 bg-red-100 dark:bg-red-950/30 border border-red-300 dark:border-red-900 rounded text-sm text-red-800 dark:text-red-300">
@@ -82,7 +92,7 @@ export default function RequestConfirm({ kind, foreignId, title, subtitle, image
       <div className="p-4 border-t border-slate-200 dark:border-zinc-800 flex justify-end gap-2">
         <button type="button" onClick={onBack} disabled={sending} className="mr-auto px-4 py-2 text-sm text-fg-muted hover:text-slate-900 dark:hover:text-white disabled:opacity-50">{t('addToLibrary.backToResults')}</button>
         <button type="button" onClick={onClose} className="px-4 py-2 text-sm text-fg-muted hover:text-slate-900 dark:hover:text-white">{t('common.cancel')}</button>
-        <button type="button" onClick={send} disabled={sending} className={`px-4 py-2 ${primaryFill} disabled:opacity-50 disabled:cursor-not-allowed rounded-md text-sm font-medium`}>
+        <button type="button" onClick={send} disabled={sending || (kind === 'book' && languages.length === 0)} className={`px-4 py-2 ${primaryFill} disabled:opacity-50 disabled:cursor-not-allowed rounded-md text-sm font-medium`}>
           {sending ? t('requests.confirm.sending') : kind === 'author' ? t('requests.confirm.requestAuthor') : t('requests.confirm.requestBook')}
         </button>
       </div>

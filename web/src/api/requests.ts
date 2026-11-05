@@ -10,6 +10,8 @@ export interface LibraryRequest {
   kind: RequestKind
   foreignId: string
   mediaType: string
+  // Languages are present on book requests only; author requests omit them.
+  languages?: string[]
   title: string
   authorName: string
   status: RequestStatus
@@ -79,8 +81,11 @@ function pageQuery(params: Record<string, string | number | undefined>): string 
 }
 
 export const requestsApi = {
-  createRequest: (kind: RequestKind, foreignId: string, mediaType = '') =>
-    request<LibraryRequest>('/requests', { method: 'POST', body: JSON.stringify({ kind, foreignId, mediaType }) }),
+  createRequest: (kind: RequestKind, foreignId: string, mediaType = '', languages: string[] = ['eng']) => {
+    const body: { kind: RequestKind; foreignId: string; mediaType: string; languages?: string[] } = { kind, foreignId, mediaType }
+    if (kind === 'book') body.languages = languages
+    return request<LibraryRequest>('/requests', { method: 'POST', body: JSON.stringify(body) })
+  },
   listMyRequests: (params: { limit?: number; offset?: number } = {}) =>
     request<LibraryRequestList>(`/requests${pageQuery(params)}`),
   withdrawRequest: (id: number) => request<void>(`/requests/${id}`, { method: 'DELETE' }),

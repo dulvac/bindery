@@ -8,11 +8,13 @@ import { metadataSourceLink, providerDisplayName, providerFromBookForeignId } fr
 import MetadataLinksMenu from './MetadataLinksMenu'
 import CoverImage from './CoverImage'
 import CoverPlaceholder from './CoverPlaceholder'
+import BookLanguages from './BookLanguages'
 import { primaryFill } from './buttons'
 
 // The confirm step for a book picked in AddToLibraryModal: the large cover,
-// identifiers, format and search-on-add, and the add call. Renders the dialog
-// body and footer as a fragment so it slots into the modal's flex column.
+// identifiers, format, request languages and search-on-add, and the add call.
+// Renders the dialog body and footer as a fragment so it slots into the
+// modal's flex column.
 interface Props {
   book: Book
   // The ISBN the user searched for, when the query was one. Shown apart from
@@ -70,6 +72,7 @@ function AddBookForm({ book, searchedISBN, onBack, onClose, onAdded }: Props) {
   const [searchOnAdd, setSearchOnAdd] = useState(true)
   // '' = keep the provider's media type / the default.media_type setting.
   const [mediaType, setMediaType] = useState('')
+  const [languages, setLanguages] = useState<string[]>(['eng'])
   const headingRef = useRef<HTMLHeadingElement>(null)
 
   useEffect(() => {
@@ -94,6 +97,7 @@ function AddBookForm({ book, searchedISBN, onBack, onClose, onAdded }: Props) {
         authorName: book.author?.authorName ?? '',
         searchOnAdd,
         ...(mediaType ? { mediaType } : {}),
+        languages,
       })
       onAdded(created)
     } catch (err: unknown) {
@@ -210,6 +214,8 @@ function AddBookForm({ book, searchedISBN, onBack, onClose, onAdded }: Props) {
             </select>
           </label>
 
+          <BookLanguages value={languages} onChange={setLanguages} disabled={adding} />
+
           <label className="flex items-start gap-2 text-sm cursor-pointer select-none">
             <input
               type="checkbox"
@@ -239,7 +245,7 @@ function AddBookForm({ book, searchedISBN, onBack, onClose, onAdded }: Props) {
       <div className="p-4 border-t border-slate-200 dark:border-zinc-800 flex justify-end gap-2">
         <button type="button" onClick={onBack} disabled={adding} className="mr-auto px-4 py-2 text-sm text-fg-muted hover:text-slate-900 dark:hover:text-white disabled:opacity-50">{t('addToLibrary.backToResults')}</button>
         <button type="button" onClick={onClose} className="px-4 py-2 text-sm text-fg-muted hover:text-slate-900 dark:hover:text-white">{t('common.cancel')}</button>
-        <button type="button" onClick={addBook} disabled={adding} className={`px-4 py-2 ${primaryFill} disabled:opacity-50 disabled:cursor-not-allowed rounded-md text-sm font-medium`}>{adding ? t('addToLibrary.adding') : t('addToLibrary.book.confirmAdd')}</button>
+        <button type="button" onClick={addBook} disabled={adding || languages.length === 0} className={`px-4 py-2 ${primaryFill} disabled:opacity-50 disabled:cursor-not-allowed rounded-md text-sm font-medium`}>{adding ? t('addToLibrary.adding') : t('addToLibrary.book.confirmAdd')}</button>
       </div>
     </>
   )
