@@ -57,6 +57,7 @@ type Download struct {
 	// non-empty under tenancy. Background grabs inherit the book's owner.
 	OwnerUserID      int64         `json:"-"`
 	BookID           *int64        `json:"bookId"`
+	VariantID        *int64        `json:"variantId"`
 	EditionID        *int64        `json:"editionId"`
 	IndexerID        *int64        `json:"indexerId"`
 	DownloadClientID *int64        `json:"downloadClientId"`

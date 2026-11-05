@@ -165,7 +165,7 @@ func (r *BookFileRepo) Track(ctx context.Context, bookID int64, format, path str
 		return TrackResult{Outcome: TrackAlreadyTracked}, nil
 	case !ownerTitle.Valid:
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE book_files SET book_id = ?, format = ? WHERE path = ?`, bookID, format, path); err != nil {
+			`UPDATE book_files SET book_id = ?, format = ?, variant_id = NULL, language = '', verification = 'unverified' WHERE path = ?`, bookID, format, path); err != nil {
 			return TrackResult{}, fmt.Errorf("book_files reclaim orphaned row: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -229,7 +229,7 @@ func (r *BookFileRepo) MoveToBook(ctx context.Context, bookID int64, format, pat
 		return prev, nil
 	default:
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE book_files SET book_id = ?, format = ? WHERE path = ?`, bookID, format, path); err != nil {
+			`UPDATE book_files SET book_id = ?, format = ?, variant_id = NULL, language = '', verification = 'unverified' WHERE path = ?`, bookID, format, path); err != nil {
 			return 0, fmt.Errorf("book_files move update: %w", err)
 		}
 	}
@@ -282,8 +282,9 @@ func (r *BookFileRepo) BookIDForFile(ctx context.Context, fileID int64) (int64, 
 func (r *BookFileRepo) GetByPath(ctx context.Context, path string) (*models.BookFile, error) {
 	var f models.BookFile
 	err := r.db.QueryRowContext(ctx,
-		`SELECT id, book_id, format, path, size_bytes, created_at FROM book_files WHERE path = ?`, path).
-		Scan(&f.ID, &f.BookID, &f.Format, &f.Path, &f.SizeBytes, &f.CreatedAt)
+		`SELECT id, book_id, format, path, size_bytes, created_at, variant_id, language, verification
+		 FROM book_files WHERE path = ?`, path).
+		Scan(&f.ID, &f.BookID, &f.Format, &f.Path, &f.SizeBytes, &f.CreatedAt, &f.VariantID, &f.Language, &f.Verification)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -296,7 +297,7 @@ func (r *BookFileRepo) GetByPath(ctx context.Context, path string) (*models.Book
 // ListByBook returns all book_files rows for the given book, ordered by id.
 func (r *BookFileRepo) ListByBook(ctx context.Context, bookID int64) ([]models.BookFile, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, book_id, format, path, size_bytes, created_at
+		`SELECT id, book_id, format, path, size_bytes, created_at, variant_id, language, verification
 		 FROM book_files WHERE book_id = ? ORDER BY id`,
 		bookID)
 	if err != nil {
@@ -307,7 +308,7 @@ func (r *BookFileRepo) ListByBook(ctx context.Context, bookID int64) ([]models.B
 	var files []models.BookFile
 	for rows.Next() {
 		var f models.BookFile
-		if err := rows.Scan(&f.ID, &f.BookID, &f.Format, &f.Path, &f.SizeBytes, &f.CreatedAt); err != nil {
+		if err := rows.Scan(&f.ID, &f.BookID, &f.Format, &f.Path, &f.SizeBytes, &f.CreatedAt, &f.VariantID, &f.Language, &f.Verification); err != nil {
 			return nil, fmt.Errorf("book_files scan: %w", err)
 		}
 		files = append(files, f)
@@ -331,7 +332,7 @@ func (r *BookFileRepo) ListByBooks(ctx context.Context, bookIDs []int64) (map[in
 		placeholders[i] = "?"
 		args[i] = id
 	}
-	query := `SELECT id, book_id, format, path, size_bytes, created_at
+	query := `SELECT id, book_id, format, path, size_bytes, created_at, variant_id, language, verification
 		FROM book_files WHERE book_id IN (` + strings.Join(placeholders, ",") + `) ORDER BY id` // #nosec G202 -- placeholders are generated from fixed ? tokens; book IDs remain bound args
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -341,7 +342,7 @@ func (r *BookFileRepo) ListByBooks(ctx context.Context, bookIDs []int64) (map[in
 
 	for rows.Next() {
 		var f models.BookFile
-		if err := rows.Scan(&f.ID, &f.BookID, &f.Format, &f.Path, &f.SizeBytes, &f.CreatedAt); err != nil {
+		if err := rows.Scan(&f.ID, &f.BookID, &f.Format, &f.Path, &f.SizeBytes, &f.CreatedAt, &f.VariantID, &f.Language, &f.Verification); err != nil {
 			return nil, fmt.Errorf("book_files scan: %w", err)
 		}
 		result[f.BookID] = append(result[f.BookID], f)

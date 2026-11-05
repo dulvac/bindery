@@ -20,7 +20,7 @@ const downloadSelectColumns = `
 	id, guid, book_id, edition_id, indexer_id, download_client_id,
 	title, nzb_url, size, sabnzbd_nzo_id, torrent_id, status, protocol,
 	quality, indexer_flags, error_message, added_at, grabbed_at, completed_at, imported_at,
-	dead_at, import_retry_count, COALESCE(owner_user_id, 0), import_path`
+	dead_at, import_retry_count, COALESCE(owner_user_id, 0), import_path, variant_id`
 
 // deadAtSQL is the moment a dead download's attempt ended, as the scheduler's
 // re-grab cooldown measures it. dead_at is the stamp written at the moment of
@@ -304,11 +304,11 @@ func downloadOwnerArg(ownerUserID int64) any {
 func (r *DownloadRepo) Create(ctx context.Context, d *models.Download) error {
 	now := time.Now().UTC()
 	result, err := r.db.ExecContext(ctx, `
-		INSERT INTO downloads (guid, book_id, edition_id, indexer_id, download_client_id,
+		INSERT INTO downloads (guid, book_id, variant_id, edition_id, indexer_id, download_client_id,
 		                       title, nzb_url, size, sabnzbd_nzo_id, torrent_id, status, protocol,
 		                       quality, indexer_flags, error_message, owner_user_id, added_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		d.GUID, d.BookID, d.EditionID, d.IndexerID, d.DownloadClientID,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		d.GUID, d.BookID, d.VariantID, d.EditionID, d.IndexerID, d.DownloadClientID,
 		d.Title, d.NZBURL, d.Size, d.SABnzbdNzoID, d.TorrentID, d.Status, d.Protocol,
 		d.Quality, d.IndexerFlags, d.ErrorMessage, downloadOwnerArg(d.OwnerUserID), now)
 	if err != nil {
@@ -401,6 +401,7 @@ func (r *DownloadRepo) RetryDeadForAutoGrab(ctx context.Context, d *models.Downl
 const regrabClaimSQL = `
 		UPDATE downloads
 		SET book_id=?,
+		    variant_id=?,
 		    edition_id=?,
 		    indexer_id=?,
 		    download_client_id=?,
@@ -429,7 +430,7 @@ const regrabClaimSQL = `
 func (r *DownloadRepo) claimForRegrab(ctx context.Context, d *models.Download, query string, states ...any) (bool, error) {
 	now := time.Now().UTC()
 	args := []any{
-		d.BookID, d.EditionID, d.IndexerID, d.DownloadClientID,
+		d.BookID, d.VariantID, d.EditionID, d.IndexerID, d.DownloadClientID,
 		d.Title, d.NZBURL, d.Size, models.StateGrabbed, d.Protocol,
 		d.Quality, d.IndexerFlags, downloadOwnerArg(d.OwnerUserID), now, d.ID,
 	}
@@ -623,9 +624,13 @@ func (r *DownloadRepo) SetTorrentID(ctx context.Context, id int64, torrentID str
 
 // SetBookID associates a download with a catalogue book after the fact. Used by
 // the importer when it recovers the association for a download that was grabbed
-// without one (e.g. a free-text Search grab) — issue #1014.
+// without one (e.g. a free-text Search grab) — issue #1014. Changing books
+// clears any variant assigned to the former book; setting the same book again
+// keeps its association.
 func (r *DownloadRepo) SetBookID(ctx context.Context, id, bookID int64) error {
-	_, err := r.db.ExecContext(ctx, "UPDATE downloads SET book_id=? WHERE id=?", bookID, id)
+	_, err := r.db.ExecContext(ctx,
+		"UPDATE downloads SET variant_id = CASE WHEN book_id = ? THEN variant_id ELSE NULL END, book_id = ? WHERE id = ?",
+		bookID, bookID, id)
 	return err
 }
 
@@ -1024,7 +1029,7 @@ func (r *DownloadRepo) query(ctx context.Context, q string, args ...interface{})
 			&d.Title, &d.NZBURL, &d.Size, &d.SABnzbdNzoID, &d.TorrentID, &d.Status, &d.Protocol,
 			&d.Quality, &d.IndexerFlags, &d.ErrorMessage,
 			&d.AddedAt, &d.GrabbedAt, &d.CompletedAt, &d.ImportedAt, &d.DeadAt,
-			&d.ImportRetryCount, &d.OwnerUserID, &d.ImportPath,
+			&d.ImportRetryCount, &d.OwnerUserID, &d.ImportPath, &d.VariantID,
 		); err != nil {
 			return nil, fmt.Errorf("scan download: %w", err)
 		}
