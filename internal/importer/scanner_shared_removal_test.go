@@ -42,31 +42,35 @@ var siblingCases = []struct {
 
 func TestCheckQbittorrentDownloads_RemoveOnImportKeepsSharedTorrent(t *testing.T) {
 	for _, sc := range qbitRemoveOnImportScenarios {
-		for _, sib := range siblingCases {
-			t.Run(sc.name+"/"+sib.name, func(t *testing.T) {
-				fx := newRemoveOnImportFixture(t)
-				torrent, files, status := sc.setup(t, fx)
-				fake := &fakeQbit{t: t, torrent: torrent, files: files}
-				srv := httptest.NewServer(fake)
-				defer srv.Close()
+		for _, cats := range qbitCategoryMatrix {
+			for _, sib := range siblingCases {
+				t.Run(sc.name+"/configured="+cats.configured+"/torrent="+cats.torrent+"/"+sib.name, func(t *testing.T) {
+					fx := newRemoveOnImportFixture(t)
+					torrent, files, status := sc.setup(t, fx)
+					torrent["category"] = cats.torrent
+					fake := &fakeQbit{t: t, torrent: torrent, files: files}
+					srv := httptest.NewServer(fake)
+					defer srv.Close()
 
-				client := fx.createClient(t, srv, "qbittorrent", true)
-				dl := fx.createDownload(t, client, status, removeOnImportHash)
-				other := fx.createSibling(t, client, sib.status)
+					client := fx.createClient(t, srv, "qbittorrent", true)
+					client.Category = cats.configured
+					dl := fx.createDownload(t, client, status, removeOnImportHash)
+					other := fx.createSibling(t, client, sib.status)
 
-				fx.s.checkQbittorrentDownloads(fx.ctx, client)
+					fx.s.checkQbittorrentDownloads(fx.ctx, client)
 
-				if got := fx.status(t, dl.GUID); got.Status != models.StateImported {
-					t.Fatalf("download status = %q (%s), want imported", got.Status, got.ErrorMessage)
-				}
-				if got := fx.status(t, other.GUID); got.Status != sib.status {
-					t.Fatalf("sibling status changed to %q", got.Status)
-				}
-				reqs := fake.deleteRequests()
-				if len(reqs) != 0 {
-					t.Fatalf("qBittorrent interlock violated: torrent was removed: %v", reqs)
-				}
-			})
+					if got := fx.status(t, dl.GUID); got.Status != models.StateImported {
+						t.Fatalf("download status = %q (%s), want imported", got.Status, got.ErrorMessage)
+					}
+					if got := fx.status(t, other.GUID); got.Status != sib.status {
+						t.Fatalf("sibling status changed to %q", got.Status)
+					}
+					reqs := fake.deleteRequests()
+					if len(reqs) != 0 {
+						t.Fatalf("qBittorrent interlock violated: torrent was removed: %v", reqs)
+					}
+				})
+			}
 		}
 	}
 }

@@ -1290,30 +1290,8 @@ func (s *Scanner) tryImportQbittorrent(ctx context.Context, qb *qbittorrent.Clie
 // Task 7A's MAM interlock is absolute: qBittorrent in this deployment is a
 // read-only source and must never be asked to remove torrents or payload data,
 // even when RemoveOnImport is enabled or category config drifts.
-func (s *Scanner) qbittorrentRemoveOnImportCleanup(ctx context.Context, qb *qbittorrent.Client, client *models.DownloadClient, dl *models.Download) func() error {
-	if client == nil {
-		return nil
-	}
-	if strings.EqualFold(strings.TrimSpace(client.Type), "qbittorrent") {
-		return nil
-	}
-	if qb == nil || !client.RemoveOnImport || dl == nil || dl.TorrentID == nil {
-		return nil
-	}
-	hash := strings.TrimSpace(*dl.TorrentID)
-	if hash == "" {
-		return nil
-	}
-	return func() error {
-		if downloader.ClientJobShared(ctx, s.downloads, client, dl, "remove on import") {
-			return nil
-		}
-		slog.Info("removing torrent from qBittorrent after import", "hash", hash, "title", dl.Title)
-		if err := qb.DeleteTorrent(ctx, hash, false); err != nil {
-			return fmt.Errorf("remove torrent %s: %w", hash, err)
-		}
-		return nil
-	}
+func (s *Scanner) qbittorrentRemoveOnImportCleanup(context.Context, *qbittorrent.Client, *models.DownloadClient, *models.Download) func() error {
+	return nil
 }
 
 // torrentFile is the minimal shape resolveTorrentFiles consumes; it matches

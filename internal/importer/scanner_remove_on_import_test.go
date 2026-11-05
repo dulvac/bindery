@@ -292,22 +292,32 @@ var qbitRemoveOnImportScenarios = []qbitScenario{
 	},
 }
 
+var qbitCategoryMatrix = []struct {
+	configured string
+	torrent    string
+}{
+	{configured: "mam", torrent: "mam"},
+	{configured: "mam", torrent: "books"},
+	{configured: "books", torrent: "mam"},
+	{configured: "books", torrent: "books"},
+}
+
 // TestCheckQbittorrentDownloads_RemoveOnImport keeps the source torrent in
 // qBittorrent on every imported path, even with RemoveOnImport enabled and
-// category drift (configured mam, torrent reported as books).
+// category drift or a category match.
 func TestCheckQbittorrentDownloads_RemoveOnImport(t *testing.T) {
 	for _, sc := range qbitRemoveOnImportScenarios {
-		for _, torrentCategory := range []string{"mam", "books"} {
-			t.Run(sc.name+"/category="+torrentCategory, func(t *testing.T) {
+		for _, cats := range qbitCategoryMatrix {
+			t.Run(sc.name+"/configured="+cats.configured+"/torrent="+cats.torrent, func(t *testing.T) {
 				fx := newRemoveOnImportFixture(t)
 				torrent, files, status := sc.setup(t, fx)
-				torrent["category"] = torrentCategory
+				torrent["category"] = cats.torrent
 				fake := &fakeQbit{t: t, torrent: torrent, files: files}
 				srv := httptest.NewServer(fake)
 				defer srv.Close()
 
 				client := fx.createClient(t, srv, "qbittorrent", true)
-				client.Category = "mam"
+				client.Category = cats.configured
 				dl := fx.createDownload(t, client, status, removeOnImportHash)
 
 				fx.s.checkQbittorrentDownloads(fx.ctx, client)
@@ -365,17 +375,17 @@ func TestCheckQbittorrentDownloads_RemoveOnImportOff(t *testing.T) {
 // is wired to fail, no delete is sent and no cleanup-failed warning is logged.
 func TestCheckQbittorrentDownloads_RemoveOnImportFailureKeepsImport(t *testing.T) {
 	for _, sc := range qbitRemoveOnImportScenarios {
-		for _, torrentCategory := range []string{"mam", "books"} {
-			t.Run(sc.name+"/category="+torrentCategory, func(t *testing.T) {
+		for _, cats := range qbitCategoryMatrix {
+			t.Run(sc.name+"/configured="+cats.configured+"/torrent="+cats.torrent, func(t *testing.T) {
 				fx := newRemoveOnImportFixture(t)
 				torrent, files, status := sc.setup(t, fx)
-				torrent["category"] = torrentCategory
+				torrent["category"] = cats.torrent
 				fake := &fakeQbit{t: t, torrent: torrent, files: files, deleteStatus: http.StatusInternalServerError}
 				srv := httptest.NewServer(fake)
 				defer srv.Close()
 
 				client := fx.createClient(t, srv, "qbittorrent", true)
-				client.Category = "mam"
+				client.Category = cats.configured
 				dl := fx.createDownload(t, client, status, removeOnImportHash)
 				logBuf := captureRemoveOnImportLog(t)
 

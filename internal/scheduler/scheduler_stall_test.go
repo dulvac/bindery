@@ -308,157 +308,171 @@ func (r *stallDeleteRecorder) calls() ([]string, []string) {
 	return append([]string(nil), r.hashes...), append([]string(nil), r.files...)
 }
 
+var qbitStallCategoryMatrix = []struct {
+	configured string
+	torrent    string
+}{
+	{configured: "mam", torrent: "mam"},
+	{configured: "mam", torrent: "books"},
+	{configured: "books", torrent: "mam"},
+	{configured: "books", torrent: "books"},
+}
+
 // TestCheckStalledDownloads_QBitStalledTorrent walks the full path: qBit
 // reports a stalledDL torrent whose hash matches an old download, so
 // handleStalledDownload fires. The qBittorrent interlock keeps the torrent in
 // the client (no delete call), while the row is still failed, blocklisted and
 // recorded in history.
 func TestCheckStalledDownloads_QBitStalledTorrent(t *testing.T) {
-	deletes := &stallDeleteRecorder{}
-	sourceBytes := []byte("mam-stalled-payload")
-	sourceFile := filepath.Join(t.TempDir(), "stalled.epub")
-	if err := os.WriteFile(sourceFile, sourceBytes, 0o644); err != nil {
-		t.Fatalf("write source: %v", err)
-	}
+	for _, cats := range qbitStallCategoryMatrix {
+		t.Run("configured="+cats.configured+"/torrent="+cats.torrent, func(t *testing.T) {
+			deletes := &stallDeleteRecorder{}
+			sourceBytes := []byte("stalled-payload")
+			sourceFile := filepath.Join(t.TempDir(), "stalled.epub")
+			if err := os.WriteFile(sourceFile, sourceBytes, 0o644); err != nil {
+				t.Fatalf("write source: %v", err)
+			}
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v2/auth/login":
-			_, _ = w.Write([]byte("Ok."))
-		case "/api/v2/torrents/info":
-			_ = json.NewEncoder(w).Encode([]map[string]any{{
-				"hash":     "DEADBEEF",
-				"state":    "stalledDL",
-				"category": "books", // drift from configured "mam"
-			}})
-		case "/api/v2/torrents/delete":
-			deletes.record(r)
-		default:
-			t.Errorf("unexpected path: %s", r.URL.Path)
-		}
-	}))
-	defer srv.Close()
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/v2/auth/login":
+					_, _ = w.Write([]byte("Ok."))
+				case "/api/v2/torrents/info":
+					_ = json.NewEncoder(w).Encode([]map[string]any{{
+						"hash":     "DEADBEEF",
+						"state":    "stalledDL",
+						"category": cats.torrent,
+					}})
+				case "/api/v2/torrents/delete":
+					deletes.record(r)
+				default:
+					t.Errorf("unexpected path: %s", r.URL.Path)
+				}
+			}))
+			defer srv.Close()
 
-	host, port := stallServerHostPort(t, srv.URL)
+			host, port := stallServerHostPort(t, srv.URL)
 
-	database, err := db.OpenMemory()
-	if err != nil {
-		t.Fatalf("OpenMemory: %v", err)
-	}
-	defer database.Close()
-	ctx := context.Background()
+			database, err := db.OpenMemory()
+			if err != nil {
+				t.Fatalf("OpenMemory: %v", err)
+			}
+			defer database.Close()
+			ctx := context.Background()
 
-	authorsRepo := db.NewAuthorRepo(database)
-	booksRepo := db.NewBookRepo(database)
-	author := &models.Author{ForeignID: "OLSTALL", Name: "Stall", SortName: "Stall", MetadataProvider: "ol", Monitored: true}
-	if err := authorsRepo.Create(ctx, author); err != nil {
-		t.Fatalf("create author: %v", err)
-	}
-	book := &models.Book{
-		ForeignID: "OLB1", AuthorID: author.ID, Title: "Stalled Book",
-		SortTitle: "Stalled Book", Status: models.BookStatusWanted,
-		Genres: []string{}, MetadataProvider: "ol", Monitored: true,
-	}
-	if err := booksRepo.Create(ctx, book); err != nil {
-		t.Fatalf("create book: %v", err)
-	}
+			authorsRepo := db.NewAuthorRepo(database)
+			booksRepo := db.NewBookRepo(database)
+			author := &models.Author{ForeignID: "OLSTALL", Name: "Stall", SortName: "Stall", MetadataProvider: "ol", Monitored: true}
+			if err := authorsRepo.Create(ctx, author); err != nil {
+				t.Fatalf("create author: %v", err)
+			}
+			book := &models.Book{
+				ForeignID: "OLB1", AuthorID: author.ID, Title: "Stalled Book",
+				SortTitle: "Stalled Book", Status: models.BookStatusWanted,
+				Genres: []string{}, MetadataProvider: "ol", Monitored: true,
+			}
+			if err := booksRepo.Create(ctx, book); err != nil {
+				t.Fatalf("create book: %v", err)
+			}
 
-	clientsRepo := db.NewDownloadClientRepo(database)
-	client := &models.DownloadClient{
-		Name: "qb", Type: "qbittorrent", Host: host, Port: port,
-		Username: "u", Password: "p", Enabled: true,
-		Category: "mam",
-	}
-	if err := clientsRepo.Create(ctx, client); err != nil {
-		t.Fatalf("create client: %v", err)
-	}
+			clientsRepo := db.NewDownloadClientRepo(database)
+			client := &models.DownloadClient{
+				Name: "qb", Type: "qbittorrent", Host: host, Port: port,
+				Username: "u", Password: "p", Enabled: true,
+				Category: cats.configured,
+			}
+			if err := clientsRepo.Create(ctx, client); err != nil {
+				t.Fatalf("create client: %v", err)
+			}
 
-	indexersRepo := db.NewIndexerRepo(database)
-	idx := &models.Indexer{Name: "mock", Type: "newznab", URL: "http://x", APIKey: "k", Enabled: true, Priority: 25}
-	if err := indexersRepo.Create(ctx, idx); err != nil {
-		t.Fatalf("create indexer: %v", err)
-	}
+			indexersRepo := db.NewIndexerRepo(database)
+			idx := &models.Indexer{Name: "mock", Type: "newznab", URL: "http://x", APIKey: "k", Enabled: true, Priority: 25}
+			if err := indexersRepo.Create(ctx, idx); err != nil {
+				t.Fatalf("create indexer: %v", err)
+			}
 
-	downloadsRepo := db.NewDownloadRepo(database)
-	tid := strings.ToLower("DEADBEEF")
-	dl := &models.Download{
-		GUID: "g-stalled", Title: "Stalled Release", BookID: &book.ID,
-		IndexerID: &idx.ID, DownloadClientID: &client.ID,
-		Status: models.StateGrabbed, Protocol: "torrent",
-		TorrentID: &tid, ImportPath: sourceFile,
-	}
-	if err := downloadsRepo.Create(ctx, dl); err != nil {
-		t.Fatalf("create download: %v", err)
-	}
-	old := time.Now().UTC().Add(-3 * time.Hour)
-	if _, err := database.ExecContext(ctx,
-		"UPDATE downloads SET status=?, grabbed_at=? WHERE id=?",
-		models.DownloadStatusDownloading, old, dl.ID); err != nil {
-		t.Fatalf("backdate: %v", err)
-	}
+			downloadsRepo := db.NewDownloadRepo(database)
+			tid := strings.ToLower("DEADBEEF")
+			dl := &models.Download{
+				GUID: "g-stalled", Title: "Stalled Release", BookID: &book.ID,
+				IndexerID: &idx.ID, DownloadClientID: &client.ID,
+				Status: models.StateGrabbed, Protocol: "torrent",
+				TorrentID: &tid, ImportPath: sourceFile,
+			}
+			if err := downloadsRepo.Create(ctx, dl); err != nil {
+				t.Fatalf("create download: %v", err)
+			}
+			old := time.Now().UTC().Add(-3 * time.Hour)
+			if _, err := database.ExecContext(ctx,
+				"UPDATE downloads SET status=?, grabbed_at=? WHERE id=?",
+				models.DownloadStatusDownloading, old, dl.ID); err != nil {
+				t.Fatalf("backdate: %v", err)
+			}
 
-	blocklistRepo := db.NewBlocklistRepo(database)
-	historyRepo := db.NewHistoryRepo(database)
+			blocklistRepo := db.NewBlocklistRepo(database)
+			historyRepo := db.NewHistoryRepo(database)
 
-	// autoGrab.enabled=false prevents the re-search goroutine from firing.
-	settingsRepo := db.NewSettingsRepo(database)
-	_ = settingsRepo.Set(ctx, "autoGrab.enabled", "false")
+			// autoGrab.enabled=false prevents the re-search goroutine from firing.
+			settingsRepo := db.NewSettingsRepo(database)
+			_ = settingsRepo.Set(ctx, "autoGrab.enabled", "false")
 
-	s := &Scheduler{
-		downloads: downloadsRepo,
-		clients:   clientsRepo,
-		indexers:  indexersRepo,
-		books:     booksRepo,
-		authors:   authorsRepo,
-		settings:  settingsRepo,
-		blocklist: blocklistRepo,
-		history:   historyRepo,
-		searcher:  indexer.NewSearcher(),
-	}
-	s.checkStalledDownloads(ctx)
+			s := &Scheduler{
+				downloads: downloadsRepo,
+				clients:   clientsRepo,
+				indexers:  indexersRepo,
+				books:     booksRepo,
+				authors:   authorsRepo,
+				settings:  settingsRepo,
+				blocklist: blocklistRepo,
+				history:   historyRepo,
+				searcher:  indexer.NewSearcher(),
+			}
+			s.checkStalledDownloads(ctx)
 
-	hashes, _ := deletes.calls()
-	if len(hashes) != 0 {
-		t.Fatalf("qBittorrent interlock violated: expected 0 delete calls, got %d (%v)", len(hashes), hashes)
-	}
-	payload, err := os.ReadFile(sourceFile)
-	if err != nil {
-		t.Fatalf("read source after stall handling: %v", err)
-	}
-	if !bytes.Equal(payload, sourceBytes) {
-		t.Fatalf("source bytes changed unexpectedly: got %q, want %q", payload, sourceBytes)
-	}
+			hashes, _ := deletes.calls()
+			if len(hashes) != 0 {
+				t.Fatalf("qBittorrent interlock violated: expected 0 delete calls, got %d (%v)", len(hashes), hashes)
+			}
+			payload, err := os.ReadFile(sourceFile)
+			if err != nil {
+				t.Fatalf("read source after stall handling: %v", err)
+			}
+			if !bytes.Equal(payload, sourceBytes) {
+				t.Fatalf("source bytes changed unexpectedly: got %q, want %q", payload, sourceBytes)
+			}
 
-	got, err := downloadsRepo.GetByGUID(ctx, "g-stalled")
-	if err != nil {
-		t.Fatalf("GetByGUID: %v", err)
-	}
-	if got.Status != models.DownloadStatusFailed {
-		t.Errorf("download status: want %q, got %q",
-			models.DownloadStatusFailed, got.Status)
-	}
-	if got.ErrorMessage == "" {
-		t.Error("expected ErrorMessage to be set on stalled download")
-	}
+			got, err := downloadsRepo.GetByGUID(ctx, "g-stalled")
+			if err != nil {
+				t.Fatalf("GetByGUID: %v", err)
+			}
+			if got.Status != models.DownloadStatusFailed {
+				t.Errorf("download status: want %q, got %q",
+					models.DownloadStatusFailed, got.Status)
+			}
+			if got.ErrorMessage == "" {
+				t.Error("expected ErrorMessage to be set on stalled download")
+			}
 
-	blocked, err := blocklistRepo.IsBlocked(ctx, "g-stalled")
-	if err != nil {
-		t.Fatalf("IsBlocked: %v", err)
-	}
-	if !blocked {
-		t.Error("expected GUID to be blocklisted after stall")
-	}
+			blocked, err := blocklistRepo.IsBlocked(ctx, "g-stalled")
+			if err != nil {
+				t.Fatalf("IsBlocked: %v", err)
+			}
+			if !blocked {
+				t.Error("expected GUID to be blocklisted after stall")
+			}
 
-	events, err := historyRepo.ListByType(ctx, models.HistoryEventDownloadStalled)
-	if err != nil {
-		t.Fatalf("ListByType: %v", err)
-	}
-	if len(events) != 1 {
-		t.Fatalf("expected 1 downloadStalled history event, got %d", len(events))
-	}
-	if events[0].SourceTitle != "Stalled Release" {
-		t.Errorf("history source_title: want %q, got %q",
-			"Stalled Release", events[0].SourceTitle)
+			events, err := historyRepo.ListByType(ctx, models.HistoryEventDownloadStalled)
+			if err != nil {
+				t.Fatalf("ListByType: %v", err)
+			}
+			if len(events) != 1 {
+				t.Fatalf("expected 1 downloadStalled history event, got %d", len(events))
+			}
+			if events[0].SourceTitle != "Stalled Release" {
+				t.Errorf("history source_title: want %q, got %q",
+					"Stalled Release", events[0].SourceTitle)
+			}
+		})
 	}
 }
 
