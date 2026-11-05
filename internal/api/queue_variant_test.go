@@ -48,6 +48,43 @@ func TestQueueVariantGrabAnotherUsersVariantIs404(t *testing.T) {
 	}
 }
 
+// A failed same-user download can lend its book to a re-grab. An explicit
+// bookId:0 must not turn that inherited variant book into an unbound send.
+func TestQueueVariantGrabZeroBookIDCannotRegrabWithoutVariant(t *testing.T) {
+	auth.SetEnforceTenancyForTests(t, true)
+	f := newGrabSecFixture(t)
+	book := regrabOwnedBook(t, f.database, f.books, "zero-id-retry", f.bob)
+	book.MediaType = models.MediaTypeEbook
+	if err := f.books.Update(f.ctx, book); err != nil {
+		t.Fatal(err)
+	}
+	copies, err := f.books.VariantRepo().EnsureWanted(f.ctx, book.ID, models.MediaTypeEbook, []string{"eng"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := &models.Download{GUID: f.guid, BookID: &book.ID, VariantID: &copies[0].ID,
+		OwnerUserID: f.bob, Title: "Lee Child - One Shot [ENG / EPUB]", NZBURL: f.downloadURL,
+		Status: models.StateFailed, Protocol: "usenet"}
+	if err := f.downloads.Create(f.ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	f.queue.searchResults.remember([]newznab.SearchResult{{GUID: f.guid, Title: old.Title,
+		NZBURL: f.downloadURL, Protocol: "usenet"}})
+	payload := map[string]any{"guid": f.guid, "title": old.Title, "nzbUrl": f.downloadURL,
+		"bookId": 0, "mediaType": models.MediaTypeEbook, "protocol": "usenet"}
+	rec := queueVariantGrab(t, f.queue, auth.WithUserRole(auth.WithUserID(f.ctx, f.bob), auth.RoleUser), payload)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("zero bookId retry without variant = %d: %s; want 400", rec.Code, rec.Body.String())
+	}
+	if f.adds.Load() != 0 {
+		t.Fatal("retry without a variant reached the download client")
+	}
+	got, err := f.downloads.GetByID(f.ctx, old.ID)
+	if err != nil || got == nil || got.Status != models.StateFailed || got.VariantID == nil || *got.VariantID != copies[0].ID {
+		t.Fatalf("refused retry changed existing row: %+v, %v", got, err)
+	}
+}
+
 func TestQueueVariantGrabWrongLanguageAndMissingSelectionRefused(t *testing.T) {
 	defer httpsec.AllowLoopbackForTests()()
 	rec, srv := newCategoryRecorder(t)

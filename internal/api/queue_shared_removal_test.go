@@ -160,6 +160,110 @@ func deleteQueueItemAs(t *testing.T, h *QueueHandler, uid, id int64, suffix stri
 	}
 }
 
+// mamRemovalFixture uses only an in-process qBittorrent stand-in. Its category
+// is the configured Bindery destination, not a live tracker or client.
+func mamRemovalFixture(t *testing.T, category, audioCategory string) (*QueueHandler, *db.DownloadRepo, *db.BookVariantRepo, *removalStub, int64, int64, int64) {
+	t.Helper()
+	h, database, downloads, clients, books, ctx := queueFixture(t)
+	stub := newRemovalStub(t, "qbittorrent")
+	host, port := testServerHostPort(t, stub.URL)
+	client := &models.DownloadClient{Name: "test-qbit", Type: "qbittorrent", Host: host, Port: port,
+		Category: category, CategoryAudiobook: audioCategory, Enabled: true}
+	if err := clients.Create(ctx, client); err != nil {
+		t.Fatal(err)
+	}
+	book := regrabBook(t, database, books, "mam-forget")
+	book.MediaType = models.MediaTypeEbook
+	if err := books.Update(ctx, book); err != nil {
+		t.Fatal(err)
+	}
+	variants := books.VariantRepo()
+	copies, err := variants.EnsureWanted(ctx, book.ID, models.MediaTypeEbook, []string{"rum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "0123456789abcdef0123456789abcdef01234567"
+	dl := &models.Download{GUID: "mam-release", BookID: &book.ID, VariantID: &copies[0].ID,
+		DownloadClientID: &client.ID, Title: "Book [ROM / EPUB]", NZBURL: "magnet:?xt=urn:btih:" + id,
+		Status: models.StateDownloading, Protocol: "torrent", TorrentID: &id}
+	if err := downloads.Create(ctx, dl); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := variants.MarkDownloading(ctx, copies[0].ID); err != nil || !ok {
+		t.Fatalf("mark downloading: %v, %v", ok, err)
+	}
+	return h, downloads, variants, stub, dl.ID, book.ID, copies[0].ID
+}
+
+func TestQueueDeleteMamRefusesClientOrFileRemovalBeforeDBDelete(t *testing.T) {
+	for _, tc := range []struct{ name, category, audioCategory, suffix string }{
+		{"default", "mam", "", ""},
+		{"delete files", "mam", "", "?deleteFiles=true"},
+		{"audiobook category", "books", "MAM", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, downloads, variants, stub, id, bookID, variantID := mamRemovalFixture(t, tc.category, tc.audioCategory)
+			path := "/api/v1/queue/" + strconv.FormatInt(id, 10) + tc.suffix
+			rec := httptest.NewRecorder()
+			h.Delete(rec, withURLParam(httptest.NewRequest(http.MethodDelete, path, nil), "id", strconv.FormatInt(id, 10)))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("protected mam deletion = %d: %s; want 400", rec.Code, rec.Body.String())
+			}
+			if got, err := downloads.GetByID(context.Background(), id); err != nil || got == nil {
+				t.Fatalf("refusal lost download row: %+v, %v", got, err)
+			}
+			rows, err := variants.ListByBook(context.Background(), bookID)
+			if err != nil || len(rows) != 1 || rows[0].ID != variantID || rows[0].Status != models.VariantDownloading {
+				t.Fatalf("refusal changed variant: %+v, %v", rows, err)
+			}
+			if req, removed := stub.counts(); req != 0 || removed != 0 {
+				t.Fatalf("qbit contacted on refusal: requests=%d removals=%d", req, removed)
+			}
+		})
+	}
+}
+
+func TestQueueBulkDeleteMamRequiresExplicitForget(t *testing.T) {
+	h, downloads, variants, stub, id, bookID, _ := mamRemovalFixture(t, "mam", "")
+	path := "/api/v1/queue/bulk-delete"
+	body := `{"ids":[` + strconv.FormatInt(id, 10) + `]}`
+	rec := httptest.NewRecorder()
+	h.BulkDelete(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "removeFromClient=false") {
+		t.Fatalf("bulk mam refusal = %d: %s", rec.Code, rec.Body.String())
+	}
+	if got, err := downloads.GetByID(context.Background(), id); err != nil || got == nil {
+		t.Fatalf("bulk refusal lost download row: %+v, %v", got, err)
+	}
+	if req, removed := stub.counts(); req != 0 || removed != 0 {
+		t.Fatalf("qbit contacted on bulk refusal: requests=%d removals=%d", req, removed)
+	}
+
+	body = `{"ids":[` + strconv.FormatInt(id, 10) + `],"removeFromClient":false}`
+	rec = httptest.NewRecorder()
+	h.BulkDelete(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bulk Bindery-only forget = %d: %s", rec.Code, rec.Body.String())
+	}
+	var response bulkResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.Results[strconv.FormatInt(id, 10)].OK {
+		t.Fatalf("bulk Bindery-only forget refused: %+v", response.Results)
+	}
+	if got, err := downloads.GetByID(context.Background(), id); err != nil || got != nil {
+		t.Fatalf("forgotten row: %+v, %v", got, err)
+	}
+	rows, err := variants.ListByBook(context.Background(), bookID)
+	if err != nil || len(rows) != 1 || rows[0].Status != models.VariantWanted {
+		t.Fatalf("forgotten variant: %+v, %v; want wanted", rows, err)
+	}
+	if req, removed := stub.counts(); req != 0 || removed != 0 {
+		t.Fatalf("qbit contacted on Bindery-only forget: requests=%d removals=%d", req, removed)
+	}
+}
+
 // TestQueueDelete_KeepsDownloadAnotherQueueItemUses: under tenancy two users'
 // rows can name one torrent (or job). Removing one user's queue item, even
 // with deleteFiles, must not touch the client while the other row still uses

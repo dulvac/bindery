@@ -1019,8 +1019,28 @@ func (r *DownloadRepo) CountWedgedCompletedOverRetryLimit(ctx context.Context, r
 }
 
 func (r *DownloadRepo) Delete(ctx context.Context, id int64) error {
-	_, err := r.db.ExecContext(ctx, "DELETE FROM downloads WHERE id=?", id)
-	return err
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("delete download begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var variantID sql.NullInt64
+	if err := tx.QueryRowContext(ctx, "SELECT variant_id FROM downloads WHERE id=?", id).Scan(&variantID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("delete download lookup: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM downloads WHERE id=?", id); err != nil {
+		return fmt.Errorf("delete download: %w", err)
+	}
+	if err := reconcileVariantAfterDetach(ctx, tx, variantID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("delete download commit: %w", err)
+	}
+	return nil
 }
 
 // GetOwnerByID returns the owner_user_id of a download. The second return

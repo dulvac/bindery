@@ -100,6 +100,81 @@ func TestPendingGrabSendsStoredReleaseAndClearsRow(t *testing.T) {
 	}
 }
 
+// A held release needs an explicit owned variant, and its marked language
+// must agree with the selection before it reaches the download client.
+func TestPendingVariantGrabSelectsOwnedMatchingLanguage(t *testing.T) {
+	auth.SetEnforceTenancyForTests(t, true)
+	f := covQNewPendingGrab(t, models.MediaTypeEbook)
+	ctx := context.Background()
+	alice, bob := regrabUsers(t, f.database)
+	f.book.OwnerUserID = bob
+	f.book.MediaType = models.MediaTypeBoth
+	if err := f.h.books.Update(ctx, f.book); err != nil {
+		t.Fatal(err)
+	}
+	copies, err := f.h.books.VariantRepo().EnsureWanted(ctx, f.book.ID, models.MediaTypeEbook, []string{"eng", "rum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := regrabOwnedBook(t, f.database, f.h.books, "foreign-pending-variant", alice)
+	other.MediaType = models.MediaTypeEbook
+	if err := f.h.books.Update(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := f.h.books.VariantRepo().EnsureWanted(ctx, other.ID, models.MediaTypeEbook, []string{"rum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr, err := f.pending.GetByID(ctx, f.prID)
+	if err != nil || pr == nil {
+		t.Fatalf("read pending release: %+v, %v", pr, err)
+	}
+	var release map[string]any
+	if err := json.Unmarshal([]byte(pr.ReleaseJSON), &release); err != nil {
+		t.Fatal(err)
+	}
+	release["title"] = "Pending Book [ROM / EPUB]"
+	blob, err := json.Marshal(release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.database.ExecContext(ctx, "UPDATE pending_releases SET title=?, release_json=? WHERE id=?",
+		release["title"], string(blob), f.prID); err != nil {
+		t.Fatal(err)
+	}
+	grab := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		id := strconv.FormatInt(f.prID, 10)
+		r := withURLParam(httptest.NewRequest(http.MethodPost, "/api/v1/pending/"+id+"/grab", strings.NewReader(body)), "id", id)
+		return f.grab(t, covQAsUser(r, bob))
+	}
+	if rec := grab(``); rec.Code != http.StatusBadRequest {
+		t.Fatalf("variant book with no selection = %d: %s; want 400", rec.Code, rec.Body.String())
+	}
+	if rec := grab(`{"variantId":` + strconv.FormatInt(foreign[0].ID, 10) + `}`); rec.Code != http.StatusNotFound {
+		t.Fatalf("foreign selected variant = %d: %s; want opaque 404", rec.Code, rec.Body.String())
+	}
+	if rec := grab(`{"variantId":` + strconv.FormatInt(copies[0].ID, 10) + `}`); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "release language") {
+		t.Fatalf("ROM tagged release for English = %d: %s; want language refusal", rec.Code, rec.Body.String())
+	}
+	if f.adds.calls != 0 {
+		t.Fatalf("refused pending grabs reached client %d times", f.adds.calls)
+	}
+	if rec := grab(`{"variantId":` + strconv.FormatInt(copies[1].ID, 10) + `}`); rec.Code != http.StatusCreated {
+		t.Fatalf("Romanian pending variant grab = %d: %s; want 201", rec.Code, rec.Body.String())
+	}
+	rows, err := f.downloads.List(ctx)
+	if err != nil || len(rows) != 1 || rows[0].VariantID == nil || *rows[0].VariantID != copies[1].ID {
+		t.Fatalf("pending download not linked to selected variant: %+v, %v", rows, err)
+	}
+	if f.adds.calls != 1 {
+		t.Fatalf("accepted pending grab sent %d times; want one", f.adds.calls)
+	}
+	if left, err := f.pending.List(ctx); err != nil || len(left) != 0 {
+		t.Fatalf("accepted pending release not cleared: %+v, %v", left, err)
+	}
+}
+
 // TestPendingGrabFallsBackToBookMediaType: an older pending row with no
 // usable format of its own takes the book's.
 func TestPendingGrabFallsBackToBookMediaType(t *testing.T) {

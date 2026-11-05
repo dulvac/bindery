@@ -48,6 +48,7 @@ const queueImportedVisibleFor = 7 * 24 * time.Hour
 
 var errAlreadyGrabbed = errors.New("already grabbed")
 var errGrabVariantInvalid = errors.New("invalid variant grab")
+var errQueueMAMRemoval = errors.New("mam category downloads require removeFromClient=false to forget only in Bindery")
 
 // errNoDownloadClient marks a grab or retry that no enabled download client
 // can take. It is a setup problem the user can fix, so the handlers answer 400
@@ -165,7 +166,8 @@ func queueItemMessage(ctx context.Context, err error) string {
 	case errors.As(err, &perr):
 		return pinnedMessage(ctx, perr)
 	case errors.Is(err, errNoDownloadClient), errors.Is(err, errAlreadyGrabbed),
-		errors.Is(err, errRetryNotResendable), errors.Is(err, errGrabBookNotFound):
+		errors.Is(err, errRetryNotResendable), errors.Is(err, errGrabBookNotFound),
+		errors.Is(err, errQueueMAMRemoval):
 		return err.Error()
 	case errors.Is(err, errSendFailed):
 		slog.Warn("bulk queue item: download client did not take the release", "error", err)
@@ -1586,6 +1588,10 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 	if req.Protocol == "" {
 		req.Protocol = "usenet"
 	}
+	// Normalize legacy zero IDs before either validation or row inheritance.
+	if req.BookID != nil && *req.BookID == 0 {
+		req.BookID = nil
+	}
 	// Reject cross-user and cross-book variant IDs before looking up the GUID:
 	// even a conflicting GUID must not reveal that someone else's row exists.
 	if req.BookID != nil || req.VariantID != nil {
@@ -1626,13 +1632,8 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 		forced = true
 	}
 
-	// Coerce zero-valued BookID/IndexerID to nil. A caller that JSON-decodes
-	// into an older int64-typed grabRequest, or writes an explicit {"bookId":0},
-	// would otherwise insert 0 into the FK column and violate the constraint.
+	// Coerce a zero-valued IndexerID to nil before writing the FK.
 	bookID := req.BookID
-	if bookID != nil && *bookID == 0 {
-		bookID = nil
-	}
 	indexerID := req.IndexerID
 	if indexerID != nil && *indexerID == 0 {
 		indexerID = nil
@@ -1666,9 +1667,9 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 		bookOwner = b.OwnerUserID
 	}
 
-	// Legacy retry/grab calls can inherit their book from a previous row;
-	// check those too before a missing variant ID becomes an unbound grab.
-	if req.BookID == nil && bookID != nil {
+	// Always validate the resolved pair before claiming a row, even when the
+	// caller posted a zero book ID and this grab inherited the existing book.
+	if bookID != nil {
 		req.BookID = bookID
 		if _, err := h.validateGrabVariant(ctx, req); err != nil {
 			return nil, err
@@ -1942,7 +1943,11 @@ func (h *QueueHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.removeQueueItem(r.Context(), target, opts); err != nil {
-		writeServerError(w, r, err)
+		if errors.Is(err, errQueueMAMRemoval) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		} else {
+			writeServerError(w, r, err)
+		}
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -1986,13 +1991,9 @@ func (o queueRemoveOptions) validate() error {
 // immediately re-grab it, the key to making a bulk "clear the queue" actually
 // stick after an accidental mass import (#Daize).
 //
-// The book's status is deliberately not touched. It never encoded the download
-// at all: a book with a grab in flight is still 'wanted' and monitored, and an
-// already-imported one is 'imported' because a file is on disk, so there is no
-// stuck state here to reset. Dropping the queue row therefore leaves exactly
-// the state the next wanted sweep should act on, and the only thing a user can
-// ask to change is the monitored flag (#2374). Pinned by
-// TestRemoveQueueItemLeavesBookState.
+// The book's status is deliberately not touched: it reflects library files,
+// not queue work (#2374). DownloadRepo.Delete does reconcile the associated
+// variant in its transaction so an unfilled copy can become wanted again.
 //
 // Everything other than the client call runs either way: the point of
 // RemoveFromClient=false is to forget the download, not to pretend it never
@@ -2009,18 +2010,28 @@ func (o queueRemoveOptions) validate() error {
 // the client, and leave the torrent behind with nothing tracking it. Deleting
 // first means whichever check runs last sees no other row and removes it.
 func (h *QueueHandler) removeQueueItem(ctx context.Context, target *models.Download, opts queueRemoveOptions) error {
+	var client *models.DownloadClient
+	if opts.RemoveFromClient && target.DownloadClientID != nil {
+		var err error
+		client, err = h.clients.GetByID(ctx, *target.DownloadClientID)
+		if err != nil {
+			return fmt.Errorf("load download client before queue removal: %w", err)
+		}
+		if client == nil {
+			return fmt.Errorf("download client %d missing before queue removal", *target.DownloadClientID)
+		}
+		if strings.EqualFold(strings.TrimSpace(client.Category), "mam") ||
+			strings.EqualFold(strings.TrimSpace(client.CategoryAudiobook), "mam") {
+			return errQueueMAMRemoval
+		}
+	}
 	if err := h.downloads.Delete(ctx, target.ID); err != nil {
 		return err
 	}
 
-	if opts.RemoveFromClient && target.DownloadClientID != nil {
-		client, err := h.clients.GetByID(ctx, *target.DownloadClientID)
-		if err == nil && client != nil {
-			if _, err := downloader.RemoveDownloadUnlessShared(ctx, h.downloads, client, target, opts.DeleteFiles, h.downloadPathRemap, "queue remove"); err != nil {
-				slog.Warn("failed to remove download from client", "download_id", target.ID, "client_id", client.ID, "error", err)
-			}
-		} else if err != nil {
-			slog.Warn("failed to load download client", "download_id", target.ID, "client_id", *target.DownloadClientID, "error", err)
+	if client != nil {
+		if _, err := downloader.RemoveDownloadUnlessShared(ctx, h.downloads, client, target, opts.DeleteFiles, h.downloadPathRemap, "queue remove"); err != nil {
+			slog.Warn("failed to remove download from client", "download_id", target.ID, "client_id", client.ID, "error", err)
 		}
 	}
 

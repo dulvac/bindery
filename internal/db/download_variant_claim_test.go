@@ -76,6 +76,67 @@ func TestVariantDownloadClaimGuardsDirectActiveCreate(t *testing.T) {
 	}
 }
 
+// Removing the only active download must release its variant, or later
+// scheduler sweeps cannot try another release for that language.
+func TestVariantDownloadDeleteReturnsUnfilledCopyToWanted(t *testing.T) {
+	database, _, book := openTestDB(t)
+	ctx := context.Background()
+	variants := NewBookVariantRepo(database)
+	copies, err := variants.EnsureWanted(ctx, book.ID, models.MediaTypeEbook, []string{"rum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	downloads := NewDownloadRepo(database)
+	dl := &models.Download{GUID: "drop-variant", BookID: &book.ID, VariantID: &copies[0].ID,
+		Title: "Sample Book [ROM / EPUB]", Protocol: "torrent", Status: models.StateDownloading}
+	if err := downloads.Create(ctx, dl); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := variants.MarkDownloading(ctx, copies[0].ID); err != nil || !ok {
+		t.Fatalf("mark downloading: %v, %v", ok, err)
+	}
+	if err := downloads.Delete(ctx, dl.ID); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := variants.ListByBook(ctx, book.ID)
+	if err != nil || len(rows) != 1 || rows[0].Status != models.VariantWanted {
+		t.Fatalf("variant after forgetting active download: %+v, %v; want wanted", rows, err)
+	}
+	if got, err := downloads.GetByID(ctx, dl.ID); err != nil || got != nil {
+		t.Fatalf("forgotten row: %+v, %v", got, err)
+	}
+}
+
+// A failed status reconciliation cannot commit the deletion independently.
+func TestVariantDownloadDeleteRollsBackWhenReconcileFails(t *testing.T) {
+	database, _, book := openTestDB(t)
+	ctx := context.Background()
+	variants := NewBookVariantRepo(database)
+	copies, err := variants.EnsureWanted(ctx, book.ID, models.MediaTypeEbook, []string{"rum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	downloads := NewDownloadRepo(database)
+	dl := &models.Download{GUID: "drop-rollback", BookID: &book.ID, VariantID: &copies[0].ID,
+		Title: "Sample Book [ROM / EPUB]", Protocol: "torrent", Status: models.StateDownloading}
+	if err := downloads.Create(ctx, dl); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := variants.MarkDownloading(ctx, copies[0].ID); err != nil || !ok {
+		t.Fatalf("mark downloading: %v, %v", ok, err)
+	}
+	if _, err := database.ExecContext(ctx, `CREATE TRIGGER reject_variant_reconcile BEFORE UPDATE OF status ON book_variants
+		BEGIN SELECT RAISE(ABORT, 'reconcile rejected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := downloads.Delete(ctx, dl.ID); err == nil {
+		t.Fatal("delete succeeded without reconciling the variant")
+	}
+	if got, err := downloads.GetByID(ctx, dl.ID); err != nil || got == nil {
+		t.Fatalf("failed reconciliation must retain the download: %+v, %v", got, err)
+	}
+}
+
 func TestVariantDownloadClaimRejectsAlreadyImportedVariant(t *testing.T) {
 	database, _, book := openTestDB(t)
 	ctx := context.Background()

@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 
@@ -196,6 +197,21 @@ func (h *PendingHandler) Grab(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Old clients post no body. A variant book needs a selection, which grab()
+	// validates against this pending row's book, format and release language.
+	var selection struct {
+		VariantID              *int64 `json:"variantId"`
+		LanguageOverrideReason string `json:"languageOverrideReason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&selection); err != nil && !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	// Never let an indexer's stored release blob choose a variant or supply an
+	// override: only the authenticated caller's selection can do that.
+	stored.VariantID = selection.VariantID
+	stored.LanguageOverrideReason = selection.LanguageOverrideReason
+
 	// The pending row is scoped to the format leg that found it, which is
 	// the release's own media type. Only an older row without one falls back
 	// to the book's, and grab() still resolves a dual-format "both" from the
@@ -214,8 +230,7 @@ func (h *PendingHandler) Grab(w http.ResponseWriter, r *http.Request) {
 
 	dl, err := h.queue.grab(r.Context(), stored)
 	if err != nil {
-		if errors.Is(err, errAlreadyGrabbed) {
-			// err carries alreadyGrabbedDetail's explanation (#1955).
+		if errors.Is(err, errAlreadyGrabbed) || errors.Is(err, db.ErrVariantUnavailable) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			return
 		}
