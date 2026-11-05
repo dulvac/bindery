@@ -635,7 +635,12 @@ func describeEpub(title, author string) string {
 // A wanted box set or omnibus is not compared, and the check does nothing when
 // the setting is off.
 func (s *Scanner) checkEbookContent(ctx context.Context, book *models.Book, author *models.Author, files []string) contentCheckResult {
-	mode := s.contentCheckMode(ctx, settingImportEbookContentCheck)
+	return s.checkEbookContentMode(ctx, book, author, files, s.contentCheckMode(ctx, settingImportEbookContentCheck))
+}
+
+// checkEbookContentMode lets variant evidence use the same bounded work-identity
+// check without allowing a legacy off/warn setting to bypass variant review.
+func (s *Scanner) checkEbookContentMode(ctx context.Context, book *models.Book, author *models.Author, files []string, mode string) contentCheckResult {
 	if mode == contentCheckOff || book == nil || bookIsCompilationBy(book.Title, authorName(author)) {
 		return contentCheckResult{}
 	}
