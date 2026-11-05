@@ -181,6 +181,8 @@ func TestAssessVariantEvidence_AudioIdentityAndUnknownLanguage(t *testing.T) {
 		{"biography album and author", "Dune", "Frank Herbert", "Dreamer of Dune: The Biography of Frank Herbert by Brian Herbert [ENG / M4B]", "Dreamer of Dune: The Biography of Frank Herbert", "Brian Herbert", false, true, false},
 		{"biography still wrong under override", "Dune", "Frank Herbert", "Dreamer of Dune: The Biography of Frank Herbert by Brian Herbert [ENG / M4B]", "Dreamer of Dune: The Biography of Frank Herbert", "Brian Herbert", true, true, false},
 		{"coherent album retitle cannot hide biography release", "Dune", "Frank Herbert", "Dreamer of Dune: The Biography of Frank Herbert by Brian Herbert [ENG / M4B]", "Dune", "Brian Herbert", true, true, false},
+		{"authorless release names another work corroborated by tag author", "Dune", "Frank Herbert", "Dreamer of Dune [ENG / M4B]", "Dune", "Brian Herbert", true, true, false},
+		{"retitled release with matching author is not wrong work", "Dune", "Frank Herbert", "Duna [ENG / M4B]", "Dune", "Frank Herbert", false, false, false},
 		{"clean release cannot hide wrong tagged work", "Dune", "Frank Herbert", "Dune by Frank Herbert [ENG / M4B]", "Dreamer of Dune: The Biography of Frank Herbert", "Brian Herbert", false, true, false},
 		{"matching title but release and tags agree on wrong author", "Dune", "Frank Herbert", "Dune by Brian Herbert [ENG / M4B]", "Dune", "Brian Herbert", true, true, false},
 		{"legitimate translation with matching author", "The Garden of Stars", "Ada Vale", "The Garden of Stars [ENG / M4B]", "Le Jardin des Étoiles", "Ada Vale", false, false, false},
@@ -201,6 +203,66 @@ func TestAssessVariantEvidence_AudioIdentityAndUnknownLanguage(t *testing.T) {
 			}
 			if tc.wrongWork && !strings.Contains(got.Reason, "work") {
 				t.Errorf("wrong work needs an explanation, got %q", got.Reason)
+			}
+		})
+	}
+}
+
+func TestAssessVariantEvidence_MixedSameAuthorAudioIsNotConfidentWrongWork(t *testing.T) {
+	// The legacy content check flags both mixed albums. Only conflicting
+	// authors on the other titles corroborate a different work.
+	for _, tc := range []struct {
+		name, otherAuthor string
+		wrongWork         bool
+	}{
+		{"same author can translate or retitle both tracks", "Frank Herbert", false},
+		{"other tracks name a different author", "Brian Herbert", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := []string{
+				writeVariantM4B(t, "Dune", "Frank Herbert"),
+				writeVariantM4B(t, "Duna", tc.otherAuthor),
+				writeVariantM4B(t, "Les Sables", tc.otherAuthor),
+			}
+			book := &models.Book{ID: 11, Title: "Dune"}
+			got, err := (&Scanner{}).AssessVariantEvidence(context.Background(),
+				&models.Download{ID: 42, Title: "Dune by Frank Herbert [ENG / M4B]"}, book,
+				&models.Author{Name: "Frank Herbert"},
+				&models.BookVariant{BookID: book.ID, MediaType: models.MediaTypeAudiobook, Language: "eng"}, files, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.WrongWork != tc.wrongWork || got.WrongLanguage || got.DetectedLanguage != "" || got.Verification != "unverified" {
+				t.Errorf("got %+v, want wrongWork=%t and unknown language", got, tc.wrongWork)
+			}
+		})
+	}
+}
+
+func TestAssessVariantEvidence_BracketedLanguageSurvivesCatalogueTitle(t *testing.T) {
+	book := &models.Book{ID: 11, Title: "English Garden"}
+	variant := &models.BookVariant{BookID: book.ID, MediaType: models.MediaTypeAudiobook, Language: "rum"}
+	for _, tc := range []struct {
+		name, release string
+		wrongLanguage bool
+	}{
+		{"bracketed English is an edition label", "English Garden [English] [M4B]", true},
+		{"title word without language label is not evidence", "English Garden [M4B]", false},
+		{"unknown bracket remains unverified", "English Garden [ZZZ] [M4B]", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeVariantM4B(t, "English Garden", "Ada Vale")
+			got, err := (&Scanner{}).AssessVariantEvidence(context.Background(),
+				&models.Download{ID: 42, Title: tc.release}, book, &models.Author{Name: "Ada Vale"},
+				variant, []string{path}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.WrongLanguage != tc.wrongLanguage || got.WrongWork || got.DetectedLanguage != "" || got.Verification != "unverified" {
+				t.Errorf("release %q: got %+v, want wrongLanguage=%t and unknown language", tc.release, got, tc.wrongLanguage)
+			}
+			if tc.wrongLanguage && !strings.Contains(got.Reason, "release language") {
+				t.Errorf("explicit language mismatch needs release evidence in reason, got %q", got.Reason)
 			}
 		})
 	}

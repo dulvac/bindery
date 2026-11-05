@@ -64,7 +64,8 @@ func (s *Scanner) AssessVariantEvidence(ctx context.Context, download *models.Do
 	case models.MediaTypeEbook:
 		s.assessEbookVariant(ctx, book, author, variant.Language, sourceFiles, &e)
 	case models.MediaTypeAudiobook:
-		s.assessAudiobookVariant(ctx, book, names, !releaseAuthorAgrees, sourceFiles, &e)
+		releaseTitleDiffers := usableWorkTitle(parsed.Title) && !equivalentWorkTitle(book.Title, parsed.Title)
+		s.assessAudiobookVariant(ctx, book, names, releaseTitleDiffers, !releaseAuthorAgrees, sourceFiles, &e)
 	}
 	if err := ctx.Err(); err != nil {
 		return VariantEvidence{Verification: "unverified"}, err
@@ -89,17 +90,30 @@ func (s *Scanner) AssessVariantEvidence(ctx context.Context, download *models.Do
 // the existing indexer parser on those isolated markers so ordinary title
 // words cannot create a spurious second language.
 var variantFormatMarker = regexp.MustCompile(`(?i)\[[a-z]{2,3}\s*/\s*(?:EPUB|AZW3|MOBI|PDF|M4B|MP3|FLAC)\]`)
+var variantLanguageLabel = regexp.MustCompile(`(?i)\[\s*([a-z]+)\s*\]`)
 
 func variantReleaseLanguages(title, bookTitle string) []string {
 	markers := variantFormatMarker.FindAllString(title, -1)
+	// A single language word in brackets is an edition label even when that
+	// word also appears in the catalogue title. Prose inside brackets is not.
+	var explicit []string
+	for _, label := range variantLanguageLabel.FindAllStringSubmatch(title, -1) {
+		for _, code := range indexer.ReleaseLanguages(label[1]) {
+			if !slices.Contains(explicit, code) {
+				explicit = append(explicit, code)
+			}
+		}
+	}
 	if len(markers) == 0 {
-		// A language word already present in the work's catalogue title is
-		// not an explicit edition marker in an otherwise unmarked release.
+		// An unmarked word already present in the catalogue title is not
+		// an edition label. Keep independently bracketed labels.
 		codes := indexer.ReleaseLanguages(title)
 		bookCodes := indexer.ReleaseLanguages(bookTitle)
-		return slices.DeleteFunc(codes, func(code string) bool { return slices.Contains(bookCodes, code) })
+		return slices.DeleteFunc(codes, func(code string) bool {
+			return slices.Contains(bookCodes, code) && !slices.Contains(explicit, code)
+		})
 	}
-	var codes []string
+	codes := explicit
 	for _, marker := range markers {
 		for _, code := range indexer.ReleaseLanguages(marker) {
 			if !slices.Contains(codes, code) {
@@ -219,7 +233,7 @@ func (s *Scanner) assessEbookVariant(ctx context.Context, book *models.Book, aut
 	}
 }
 
-func (s *Scanner) assessAudiobookVariant(ctx context.Context, book *models.Book, names []string, releaseAuthorConflict bool, files []string, e *VariantEvidence) {
+func (s *Scanner) assessAudiobookVariant(ctx context.Context, book *models.Book, names []string, releaseTitleDiffers, releaseAuthorConflict bool, files []string, e *VariantEvidence) {
 	var audio []string
 	for _, path := range files {
 		if IsAudioTagFile(path) {
@@ -255,11 +269,25 @@ func (s *Scanner) assessAudiobookVariant(ctx context.Context, book *models.Book,
 		return
 	}
 	res := evaluateAudiobookContent(book.Title, tags)
-	if !bookIsCompilation(book.Title) && (res.flagged || audioTagsNameAnotherWork(book.Title, names, tags) ||
-		releaseAuthorConflict && audioTagAuthorsConfirmConflict(names, tags)) {
+	if !bookIsCompilation(book.Title) && (res.flagged && (res.conflicts >= 2 || audioTagsIncludeDifferentWork(book.Title, names, tags)) ||
+		audioTagsNameAnotherWork(book.Title, names, tags) ||
+		(releaseTitleDiffers || releaseAuthorConflict) && audioTagAuthorsConfirmConflict(names, tags)) {
 		e.WrongWork = true
 		e.Reason = "audiobook work tags conflict with the requested book"
 	}
+}
+
+// Mixed album titles need an independently conflicting author before they
+// can identify another work; different titles by the same author may be retitles.
+func audioTagsIncludeDifferentWork(wanted string, names []string, tags []AudioTags) bool {
+	for _, tag := range tags {
+		album := strings.TrimSpace(tag.Album)
+		if usableWorkTitle(album) && !tagNamesNoWork(tag, album) &&
+			!equivalentWorkTitle(wanted, album) && audioTagAuthorsDisagree(names, tag) {
+			return true
+		}
+	}
+	return false
 }
 
 func audioTagsNameAnotherWork(wanted string, names []string, tags []AudioTags) bool {
@@ -280,9 +308,9 @@ func audioTagsNameAnotherWork(wanted string, names []string, tags []AudioTags) b
 	return differing
 }
 
-// A wrong author in both the release and the file is a work conflict even if
-// the album has been retitled to the wanted book. A matching or missing author
-// tag prevents this stronger conclusion from a partial set of tags.
+// A distinct release title or wrong release author, corroborated by the file's
+// wrong author, identifies a work conflict even if its album names the wanted
+// book. A matching or missing author tag prevents that conclusion.
 func audioTagAuthorsConfirmConflict(names []string, tags []AudioTags) bool {
 	if len(tags) == 0 {
 		return false
