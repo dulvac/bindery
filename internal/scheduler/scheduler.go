@@ -2324,39 +2324,22 @@ func (s *Scheduler) handleStalledDownload(ctx context.Context, dl *models.Downlo
 	}()
 }
 
-// removeStalledFromClient deletes a stalled release from the download client,
-// data included (#2367).
+// removeStalledFromClient deletes a stalled release from its download client.
 //
-// Until this existed the stall handler blocklisted the release, grabbed a
-// replacement, and wrote a "stalled release removed, re-searching" history
-// line, while the torrent stayed in the client indefinitely: the poller skips
-// failed rows, so nothing ever looked at it again. A user's queue filled with
-// dead torrents Bindery had already written off.
+// qBittorrent is interlocked (Task 7A): in this deployment it is treated as a
+// read-only MAM source, so scheduler stall handling must never ask it to
+// remove torrents or payload bytes, regardless of category drift or the
+// deleteFiles flag.
 //
-// For a client reported stall, files are deleted along with it. Only
-// qBittorrent's stalledDL and its equivalents reach here (see
-// downloader.GetStalledTorrents) — never a seeding torrent — so there is no
-// completed release to keep sharing, and the partial data belongs to a release
-// that has just been blocklisted and replaced. Per indexer seed-ratio
-// overrides (#883) apply to what a client does with a download it finished;
-// they have nothing to say about one that never started.
-//
-// A torrent that never resolved its metadata has no files at all, so it is
-// removed without asking the client to delete data (deleteFiles false), the
-// same way remove on import takes the entry and leaves the disk alone (#2046).
-// Asking for a data delete there could only ever hit something that is not
-// this torrent's, which on rTorrent means Bindery's own RemoveAll.
-//
-// A removal failure is logged and swallowed: the blocklist and the re-search
-// below are the recovery, and they must not be skipped because the client was
-// unreachable for a moment.
-//
-// While another download row still uses the torrent, the client is left alone
-// (downloader.ClientJobShared). This row is marked failed straight after, and
-// failed rows do not count as users, so the last row of a shared stalled
-// torrent is the one whose pass removes it.
+// Other clients keep their existing behavior. A removal failure is logged and
+// swallowed: the blocklist + re-search path is the recovery and must still run.
 func (s *Scheduler) removeStalledFromClient(ctx context.Context, dl *models.Download, client *models.DownloadClient, deleteFiles bool) {
 	if client == nil {
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(client.Type), "qbittorrent") {
+		slog.Info("stall: leaving qBittorrent torrent in place (MAM interlock)",
+			"download_id", dl.ID, "title", dl.Title, "client", client.Name, "delete_files", deleteFiles)
 		return
 	}
 	removed, err := downloader.RemoveDownloadUnlessShared(ctx, s.downloads, client, dl, deleteFiles, s.downloadPathRemap, "stall")

@@ -1283,20 +1283,27 @@ func (s *Scanner) tryImportQbittorrent(ctx context.Context, qb *qbittorrent.Clie
 	s.tryImportInternal(ctx, dl, downloadPath, "qbittorrent", safeRemoteID(dl.TorrentID), "", cleanup, explicitFiles)
 }
 
-// qbittorrentRemoveOnImportCleanup builds the post-import removal callback
+// qbittorrentRemoveOnImportCleanup is the qBittorrent remove-on-import hook
 // shared by tryImportQbittorrent and the "book already in library" shortcuts
-// in checkQbittorrentDownloads (issue #2046) — those shortcuts close out a
-// download without ever calling tryImportInternal, so they need the same
-// cleanup construction rather than only the normal import path getting it.
+// in checkQbittorrentDownloads (issue #2046).
 //
-// The torrent stays while another download row still uses it
-// (downloader.ClientJobShared): two grabs of one release share the torrent the
-// client adopted, and the other row may not have imported yet.
+// Task 7A's MAM interlock is absolute: qBittorrent in this deployment is a
+// read-only source and must never be asked to remove torrents or payload data,
+// even when RemoveOnImport is enabled or category config drifts.
 func (s *Scanner) qbittorrentRemoveOnImportCleanup(ctx context.Context, qb *qbittorrent.Client, client *models.DownloadClient, dl *models.Download) func() error {
-	if !client.RemoveOnImport || dl.TorrentID == nil {
+	if client == nil {
 		return nil
 	}
-	hash := *dl.TorrentID
+	if strings.EqualFold(strings.TrimSpace(client.Type), "qbittorrent") {
+		return nil
+	}
+	if qb == nil || !client.RemoveOnImport || dl == nil || dl.TorrentID == nil {
+		return nil
+	}
+	hash := strings.TrimSpace(*dl.TorrentID)
+	if hash == "" {
+		return nil
+	}
 	return func() error {
 		if downloader.ClientJobShared(ctx, s.downloads, client, dl, "remove on import") {
 			return nil

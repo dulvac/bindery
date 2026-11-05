@@ -1,11 +1,14 @@
 package scheduler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -307,18 +310,26 @@ func (r *stallDeleteRecorder) calls() ([]string, []string) {
 
 // TestCheckStalledDownloads_QBitStalledTorrent walks the full path: qBit
 // reports a stalledDL torrent whose hash matches an old download, so
-// handleStalledDownload fires: the torrent is removed from the client, the
-// download is marked failed, blocklisted, and a history event is recorded.
+// handleStalledDownload fires. The qBittorrent interlock keeps the torrent in
+// the client (no delete call), while the row is still failed, blocklisted and
+// recorded in history.
 func TestCheckStalledDownloads_QBitStalledTorrent(t *testing.T) {
 	deletes := &stallDeleteRecorder{}
+	sourceBytes := []byte("mam-stalled-payload")
+	sourceFile := filepath.Join(t.TempDir(), "stalled.epub")
+	if err := os.WriteFile(sourceFile, sourceBytes, 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v2/auth/login":
 			_, _ = w.Write([]byte("Ok."))
 		case "/api/v2/torrents/info":
 			_ = json.NewEncoder(w).Encode([]map[string]any{{
-				"hash":  "DEADBEEF",
-				"state": "stalledDL",
+				"hash":     "DEADBEEF",
+				"state":    "stalledDL",
+				"category": "books", // drift from configured "mam"
 			}})
 		case "/api/v2/torrents/delete":
 			deletes.record(r)
@@ -356,6 +367,7 @@ func TestCheckStalledDownloads_QBitStalledTorrent(t *testing.T) {
 	client := &models.DownloadClient{
 		Name: "qb", Type: "qbittorrent", Host: host, Port: port,
 		Username: "u", Password: "p", Enabled: true,
+		Category: "mam",
 	}
 	if err := clientsRepo.Create(ctx, client); err != nil {
 		t.Fatalf("create client: %v", err)
@@ -373,7 +385,7 @@ func TestCheckStalledDownloads_QBitStalledTorrent(t *testing.T) {
 		GUID: "g-stalled", Title: "Stalled Release", BookID: &book.ID,
 		IndexerID: &idx.ID, DownloadClientID: &client.ID,
 		Status: models.StateGrabbed, Protocol: "torrent",
-		TorrentID: &tid,
+		TorrentID: &tid, ImportPath: sourceFile,
 	}
 	if err := downloadsRepo.Create(ctx, dl); err != nil {
 		t.Fatalf("create download: %v", err)
@@ -405,15 +417,16 @@ func TestCheckStalledDownloads_QBitStalledTorrent(t *testing.T) {
 	}
 	s.checkStalledDownloads(ctx)
 
-	hashes, files := deletes.calls()
-	if len(hashes) != 1 {
-		t.Fatalf("expected 1 torrent delete call on the client, got %d", len(hashes))
+	hashes, _ := deletes.calls()
+	if len(hashes) != 0 {
+		t.Fatalf("qBittorrent interlock violated: expected 0 delete calls, got %d (%v)", len(hashes), hashes)
 	}
-	if hashes[0] != tid {
-		t.Errorf("deleted torrent hash: want %q, got %q", tid, hashes[0])
+	payload, err := os.ReadFile(sourceFile)
+	if err != nil {
+		t.Fatalf("read source after stall handling: %v", err)
 	}
-	if files[0] != "true" {
-		t.Errorf("deleteFiles: want %q, got %q", "true", files[0])
+	if !bytes.Equal(payload, sourceBytes) {
+		t.Fatalf("source bytes changed unexpectedly: got %q, want %q", payload, sourceBytes)
 	}
 
 	got, err := downloadsRepo.GetByGUID(ctx, "g-stalled")
@@ -542,26 +555,44 @@ func TestHandleStalledDownload_NilBlocklistRepo(t *testing.T) {
 	s.handleStalledDownload(ctx, dl, nil, downloader.StallClientReported)
 }
 
-// TestCheckStalledDownloads_RemovalFailureStillRecovers pins the fallback in
-// removeStalledFromClient (#2367): the client refusing the delete must not cost
-// the user the recovery. The row is still failed, the release is still
-// blocklisted, and the stall history event is still written.
+// TestCheckStalledDownloads_RemovalFailureStillRecovers keeps the non-qBit
+// behaviour pinned: when another client (Transmission here) refuses removal,
+// stall recovery still fails the row, blocklists the GUID and records history.
 func TestCheckStalledDownloads_RemovalFailureStillRecovers(t *testing.T) {
 	var deleteCalls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v2/auth/login":
-			_, _ = w.Write([]byte("Ok."))
-		case "/api/v2/torrents/info":
-			_ = json.NewEncoder(w).Encode([]map[string]any{{
-				"hash":  "BADDELETE",
-				"state": "stalledDL",
-			}})
-		case "/api/v2/torrents/delete":
-			deleteCalls.Add(1)
-			w.WriteHeader(http.StatusInternalServerError)
-		default:
+		if r.URL.Path != "/transmission/rpc" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var req struct {
+			Method    string         `json:"method"`
+			Arguments map[string]any `json:"arguments"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode rpc body: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		switch req.Method {
+		case "torrent-get":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"result": "success",
+				"arguments": map[string]any{"torrents": []map[string]any{{
+					"id":          7,
+					"hashString":  "BADDELETE",
+					"status":      0,
+					"errorString": "stalled forever",
+					"percentDone": 0.4,
+					"downloadDir": "/transmission/mam",
+				}}},
+			})
+		case "torrent-remove":
+			deleteCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"result": "torrent not found", "arguments": map[string]any{}})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{"result": "success", "arguments": map[string]any{}})
 		}
 	}))
 	defer srv.Close()
@@ -577,7 +608,7 @@ func TestCheckStalledDownloads_RemovalFailureStillRecovers(t *testing.T) {
 
 	clientsRepo := db.NewDownloadClientRepo(database)
 	client := &models.DownloadClient{
-		Name: "qb", Type: "qbittorrent", Host: host, Port: port,
+		Name: "tx", Type: "transmission", Host: host, Port: port,
 		Username: "u", Password: "p", Enabled: true,
 	}
 	if err := clientsRepo.Create(ctx, client); err != nil {
@@ -621,7 +652,7 @@ func TestCheckStalledDownloads_RemovalFailureStillRecovers(t *testing.T) {
 	s.checkStalledDownloads(ctx)
 
 	if n := deleteCalls.Load(); n != 1 {
-		t.Fatalf("expected 1 delete attempt, got %d", n)
+		t.Fatalf("expected 1 delete attempt for non-qBit client, got %d", n)
 	}
 	got, err := downloadsRepo.GetByGUID(ctx, "g-baddelete")
 	if err != nil {

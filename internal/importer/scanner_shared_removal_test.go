@@ -28,9 +28,9 @@ func (fx *removeOnImportFixture) createSibling(t *testing.T, client *models.Down
 	return dl
 }
 
-// siblingCases: a sibling that still uses the torrent keeps it in the client;
-// an imported sibling on a remove on import client does not, so the last
-// import removes it as before.
+// siblingCases for shared-torrent cleanup semantics. Transmission still drops
+// the torrent once the last non-terminal sibling imports; qBittorrent is
+// interlocked and keeps it regardless.
 var siblingCases = []struct {
 	name        string
 	status      models.DownloadState
@@ -63,11 +63,8 @@ func TestCheckQbittorrentDownloads_RemoveOnImportKeepsSharedTorrent(t *testing.T
 					t.Fatalf("sibling status changed to %q", got.Status)
 				}
 				reqs := fake.deleteRequests()
-				if sib.wantRemoval && len(reqs) != 1 {
-					t.Fatalf("delete requests = %d, want 1", len(reqs))
-				}
-				if !sib.wantRemoval && len(reqs) != 0 {
-					t.Fatalf("the torrent was removed while another download still uses it: %v", reqs)
+				if len(reqs) != 0 {
+					t.Fatalf("qBittorrent interlock violated: torrent was removed: %v", reqs)
 				}
 			})
 		}

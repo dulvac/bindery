@@ -20,16 +20,18 @@ import (
 	"github.com/vavallee/bindery/internal/models"
 )
 
-// These tests cover "remove torrent after import" (#2046) end to end against
-// fake qBittorrent and Transmission daemons. The contract they pin:
+// These tests cover post-import cleanup (#2046) end to end against fake
+// qBittorrent and Transmission daemons. The contract they pin:
 //
-//   - the client is asked to remove the torrent only once the download row is
-//     imported and the book is in the library;
-//   - the client is never asked to delete the payload (qBittorrent
-//     deleteFiles=false, Transmission without delete-local-data);
+//   - qBittorrent is interlocked: Bindery must never ask it to remove a
+//     torrent after import, even when RemoveOnImport is true;
+//   - Transmission keeps the old remove-on-import behaviour: when enabled,
+//     removal is requested only once the download row is imported and the book
+//     is in the library, and without delete-local-data;
 //   - nothing is asked of the client when the toggle is off, when the import
 //     failed, or when the stored id is a legacy Transmission number;
-//   - a removal the client refuses is logged and does not unwind the import.
+//   - a non-qBittorrent removal the client refuses is logged and does not
+//     unwind the import.
 
 const removeOnImportHash = "2046204620462046204620462046204620462046"
 
@@ -290,61 +292,44 @@ var qbitRemoveOnImportScenarios = []qbitScenario{
 	},
 }
 
-// TestCheckQbittorrentDownloads_RemoveOnImport covers the toggle ON on every
-// path that marks a qBittorrent download imported: exactly one delete for the
-// torrent's hash, deleteFiles=false, sent after the row is imported.
+// TestCheckQbittorrentDownloads_RemoveOnImport keeps the source torrent in
+// qBittorrent on every imported path, even with RemoveOnImport enabled and
+// category drift (configured mam, torrent reported as books).
 func TestCheckQbittorrentDownloads_RemoveOnImport(t *testing.T) {
 	for _, sc := range qbitRemoveOnImportScenarios {
-		t.Run(sc.name, func(t *testing.T) {
-			fx := newRemoveOnImportFixture(t)
-			torrent, files, status := sc.setup(t, fx)
+		for _, torrentCategory := range []string{"mam", "books"} {
+			t.Run(sc.name+"/category="+torrentCategory, func(t *testing.T) {
+				fx := newRemoveOnImportFixture(t)
+				torrent, files, status := sc.setup(t, fx)
+				torrent["category"] = torrentCategory
+				fake := &fakeQbit{t: t, torrent: torrent, files: files}
+				srv := httptest.NewServer(fake)
+				defer srv.Close()
 
-			var mu sync.Mutex
-			var seen []removalState
-			fake := &fakeQbit{t: t, torrent: torrent, files: files}
-			srv := httptest.NewServer(fake)
-			defer srv.Close()
+				client := fx.createClient(t, srv, "qbittorrent", true)
+				client.Category = "mam"
+				dl := fx.createDownload(t, client, status, removeOnImportHash)
 
-			client := fx.createClient(t, srv, "qbittorrent", true)
-			dl := fx.createDownload(t, client, status, removeOnImportHash)
-			fake.onDelete = fx.snapshotAtRemoval(t, dl.GUID, &seen, &mu)
+				fx.s.checkQbittorrentDownloads(fx.ctx, client)
 
-			fx.s.checkQbittorrentDownloads(fx.ctx, client)
-
-			if got := fx.status(t, dl.GUID); got.Status != models.StateImported {
-				t.Fatalf("download status = %q (%s), want imported", got.Status, got.ErrorMessage)
-			}
-
-			reqs := fake.deleteRequests()
-			if len(reqs) != 1 {
-				t.Fatalf("delete requests = %d, want exactly 1: %v", len(reqs), reqs)
-			}
-			if got := reqs[0].Get("hashes"); got != removeOnImportHash {
-				t.Errorf("delete hashes = %q, want %q", got, removeOnImportHash)
-			}
-			if got := reqs[0].Get("deleteFiles"); got != "false" {
-				t.Errorf("deleteFiles = %q, want \"false\": Bindery must never ask the client to delete the payload", got)
-			}
-
-			mu.Lock()
-			defer mu.Unlock()
-			if len(seen) != 1 || seen[0].status != models.StateImported {
-				t.Errorf("at the moment of removal the download was %+v, want status imported", seen)
-			}
-			if sc.wantLibraryCopy {
-				if seen[0].libraryFiles != 1 {
-					t.Errorf("at the moment of removal the library held %d imported file(s), want 1", seen[0].libraryFiles)
+				if got := fx.status(t, dl.GUID); got.Status != models.StateImported {
+					t.Fatalf("download status = %q (%s), want imported", got.Status, got.ErrorMessage)
 				}
-				if n := len(fx.libraryEbooks(t)); n != 1 {
-					t.Errorf("library holds %d imported file(s), want 1", n)
+				if reqs := fake.deleteRequests(); len(reqs) != 0 {
+					t.Fatalf("qBittorrent interlock violated: got %d delete request(s): %v", len(reqs), reqs)
 				}
-				// Default import mode is auto: hardlink or copy, never move,
-				// so the file the client is seeding is untouched.
-				if _, err := os.Stat(fx.sourceFile); err != nil {
-					t.Errorf("source file gone after import with remove on import: %v", err)
+				if sc.wantLibraryCopy {
+					if n := len(fx.libraryEbooks(t)); n != 1 {
+						t.Errorf("library holds %d imported file(s), want 1", n)
+					}
+					// Default import mode is auto: hardlink or copy, never move,
+					// so the file the client is seeding is untouched.
+					if _, err := os.Stat(fx.sourceFile); err != nil {
+						t.Errorf("source file gone after import with remove on import: %v", err)
+					}
 				}
-			}
-		})
+			})
+		}
 	}
 }
 
@@ -375,43 +360,45 @@ func TestCheckQbittorrentDownloads_RemoveOnImportOff(t *testing.T) {
 	}
 }
 
-// TestCheckQbittorrentDownloads_RemoveOnImportFailureKeepsImport has the
-// client answer the delete with HTTP 500. The import has already committed,
-// so it must stay imported, the book stays in the library, and the failure
-// is logged.
+// TestCheckQbittorrentDownloads_RemoveOnImportFailureKeepsImport proves the
+// interlock runs before any delete attempt: even when the fake delete endpoint
+// is wired to fail, no delete is sent and no cleanup-failed warning is logged.
 func TestCheckQbittorrentDownloads_RemoveOnImportFailureKeepsImport(t *testing.T) {
 	for _, sc := range qbitRemoveOnImportScenarios {
-		t.Run(sc.name, func(t *testing.T) {
-			fx := newRemoveOnImportFixture(t)
-			torrent, files, status := sc.setup(t, fx)
-			fake := &fakeQbit{t: t, torrent: torrent, files: files, deleteStatus: http.StatusInternalServerError}
-			srv := httptest.NewServer(fake)
-			defer srv.Close()
+		for _, torrentCategory := range []string{"mam", "books"} {
+			t.Run(sc.name+"/category="+torrentCategory, func(t *testing.T) {
+				fx := newRemoveOnImportFixture(t)
+				torrent, files, status := sc.setup(t, fx)
+				torrent["category"] = torrentCategory
+				fake := &fakeQbit{t: t, torrent: torrent, files: files, deleteStatus: http.StatusInternalServerError}
+				srv := httptest.NewServer(fake)
+				defer srv.Close()
 
-			client := fx.createClient(t, srv, "qbittorrent", true)
-			dl := fx.createDownload(t, client, status, removeOnImportHash)
-			logBuf := captureRemoveOnImportLog(t)
+				client := fx.createClient(t, srv, "qbittorrent", true)
+				client.Category = "mam"
+				dl := fx.createDownload(t, client, status, removeOnImportHash)
+				logBuf := captureRemoveOnImportLog(t)
 
-			fx.s.checkQbittorrentDownloads(fx.ctx, client)
+				fx.s.checkQbittorrentDownloads(fx.ctx, client)
 
-			got := fx.status(t, dl.GUID)
-			if got.Status != models.StateImported {
-				t.Fatalf("a refused removal unwound the import: status = %q (%s), want imported", got.Status, got.ErrorMessage)
-			}
-			if got.ErrorMessage != "" {
-				t.Errorf("a refused removal wrote an error onto the download: %q", got.ErrorMessage)
-			}
-			if len(fake.deleteRequests()) != 1 {
-				t.Errorf("delete requests = %d, want 1", len(fake.deleteRequests()))
-			}
-			if sc.wantLibraryCopy && len(fx.libraryEbooks(t)) != 1 {
-				t.Errorf("imported file missing from the library after a refused removal")
-			}
-			lines := cleanupFailedLines(logBuf.String())
-			if !strings.Contains(lines, "remove torrent "+removeOnImportHash) || !strings.Contains(lines, "HTTP 500") {
-				t.Errorf("expected a cleanup failed warning naming the torrent and the HTTP 500, got:\n%s", lines)
-			}
-		})
+				got := fx.status(t, dl.GUID)
+				if got.Status != models.StateImported {
+					t.Fatalf("interlock must not unwind import: status = %q (%s), want imported", got.Status, got.ErrorMessage)
+				}
+				if got.ErrorMessage != "" {
+					t.Errorf("unexpected error on download: %q", got.ErrorMessage)
+				}
+				if reqs := fake.deleteRequests(); len(reqs) != 0 {
+					t.Errorf("qBittorrent interlock violated: got %d delete request(s): %v", len(reqs), reqs)
+				}
+				if sc.wantLibraryCopy && len(fx.libraryEbooks(t)) != 1 {
+					t.Errorf("imported file missing from the library")
+				}
+				if lines := cleanupFailedLines(logBuf.String()); lines != "" {
+					t.Errorf("cleanup failed warning logged even though no delete was attempted:\n%s", lines)
+				}
+			})
+		}
 	}
 }
 

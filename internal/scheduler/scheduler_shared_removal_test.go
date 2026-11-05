@@ -17,7 +17,8 @@ import (
 // one torrent (the client adopted it for the second grab). Only the older row
 // is past the stall timeout. Its stall must not remove the torrent, and its
 // data, out from under the newer row, which is still within its own window.
-// When the newer row stalls later, it is the last user and removes it.
+// When the newer row stalls later, qBittorrent is still interlocked: no
+// client-side removal happens there either.
 func TestCheckStalledDownloads_KeepsTorrentAnotherDownloadUses(t *testing.T) {
 	const hash = "deadbeef"
 	deletes := &stallDeleteRecorder{}
@@ -95,14 +96,14 @@ func TestCheckStalledDownloads_KeepsTorrentAnotherDownloadUses(t *testing.T) {
 	}
 
 	// The newer row ages past the timeout. The older row is failed now and no
-	// longer holds the torrent, so this stall removes it, data included.
+	// longer holds the torrent, but qBittorrent remains interlocked.
 	if _, err := database.ExecContext(ctx, "UPDATE downloads SET grabbed_at=? WHERE id=?",
 		time.Now().UTC().Add(-3*time.Hour), newer.ID); err != nil {
 		t.Fatalf("backdate newer: %v", err)
 	}
 	s.checkStalledDownloads(ctx)
 	hashes, files := deletes.calls()
-	if len(hashes) != 1 || hashes[0] != hash || files[0] != "true" {
-		t.Fatalf("expected one delete of %s with its data once no other row uses it, got %v %v", hash, hashes, files)
+	if len(hashes) != 0 || len(files) != 0 {
+		t.Fatalf("qBittorrent interlock violated: expected no delete calls, got hashes=%v deleteFiles=%v", hashes, files)
 	}
 }
