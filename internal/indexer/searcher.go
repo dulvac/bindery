@@ -1489,10 +1489,10 @@ func scoreResult(r newznab.SearchResult, c MatchCriteria, ranks *profileRanks) f
 		score += 250
 	}
 
-	// Known matches get a modest preference within a comparable format;
-	// unknown releases remain eligible and a better format still wins.
+	// A known match wins close calls, but not a better edition year (up to
+	// 25 points apart) or a substantially more popular unmarked release.
 	if c.RequestedLanguage != "" && slices.Equal(ReleaseLanguages(r.Title), []string{models.NormalizeLanguageCode(c.RequestedLanguage)}) {
-		score += 25
+		score += 10
 	}
 
 	// Indexer priority: each priority point adds directly to the score so a

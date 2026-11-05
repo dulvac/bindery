@@ -660,6 +660,7 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 	}
 	requestedByFormat := make(map[string]string)
 	var selectedLanguage string
+	selectedFound := false
 	if raw, present := r.URL.Query()["language"]; present {
 		if len(raw) != 1 {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "choose one requested language"})
@@ -678,12 +679,10 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 			if v.MediaType != format {
 				continue
 			}
-			if selectedLanguage != "" {
-				if v.Language == selectedLanguage {
-					requestedByFormat[format] = v.Language
-					break
-				}
-				continue
+			if selectedLanguage != "" && v.Language == selectedLanguage {
+				requestedByFormat[format] = v.Language
+				selectedFound = true
+				break
 			}
 			// Prefer a wanted copy, English first when more than one is
 			// wanted. Otherwise default to English among imported copies.
@@ -696,10 +695,13 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 				requestedByFormat[format] = v.Language
 			}
 		}
-		if selectedLanguage != "" && requestedByFormat[format] == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "language not requested for this book format"})
-			return
-		}
+	}
+	// A language selection can belong to just one leg of a dual-format
+	// book. Other legs use their own wanted (or imported) variant, as when
+	// no language is selected. Reject only a language absent from the book.
+	if selectedLanguage != "" && !selectedFound {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "language not requested for this book"})
+		return
 	}
 
 	idxs, err := h.indexers.List(r.Context())
@@ -883,13 +885,16 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 					group = append(group, res)
 				}
 			}
-			kept, dropped := indexer.SplitForRequestedLanguage(group, requestedByFormat[format])
+			formatCrit := crit
+			formatCrit.MediaType = format
+			formatCrit.RequestedLanguage = requestedByFormat[format]
+			kept, dropped := indexer.SplitForRequestedLanguage(group, requestedByFormat[format], formatCrit)
 			matched = append(matched, kept...)
 			variantDropped = append(variantDropped, dropped...)
 		}
 		results = matched
 	} else {
-		results, variantDropped = indexer.SplitForRequestedLanguage(results, requestedByFormat[book.MediaType])
+		results, variantDropped = indexer.SplitForRequestedLanguage(results, requestedByFormat[book.MediaType], crit)
 	}
 	if dbg != nil {
 		for _, dropped := range variantDropped {

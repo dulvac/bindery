@@ -210,6 +210,13 @@ func isKnownLanguageCode(code string) bool {
 	return false
 }
 
+// IsKnownLanguageCode reports whether a two- or three-letter code is in the
+// language vocabulary, without treating an unrecognized code as evidence.
+// NormalizeLanguageCode deliberately passes unknown codes through unchanged.
+func IsKnownLanguageCode(code string) bool {
+	return isKnownLanguageCode(strings.ToLower(strings.TrimSpace(code)))
+}
+
 // NormalizeLanguageCodeRev is the revision of NormalizeLanguageCode's output.
 // Bump it whenever a change here would give an already-stored language a
 // different value; the startup backfill gated on this marker then

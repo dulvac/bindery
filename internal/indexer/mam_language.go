@@ -27,9 +27,9 @@ func ReleaseLanguages(title string) []string {
 			code = "rum"
 		}
 		code = models.NormalizeLanguageCode(code)
-		// Restrict short codes to the existing release-language vocabulary;
-		// an arbitrary group name in brackets is not language evidence.
-		if releaseLanguageCodeSet[code] || code == "rum" {
+		// A format-qualified marker can use any recognized language code,
+		// even one without a legacy word tag. Arbitrary group names stay unknown.
+		if releaseLanguageCodeSet[code] || models.IsKnownLanguageCode(code) {
 			codes = append(codes, code)
 		}
 	}
@@ -37,9 +37,9 @@ func ReleaseLanguages(title string) []string {
 	return codes
 }
 
-// ForRequestedLanguage removes explicit mismatches and puts a known match
-// before unknown releases of the same format. It leaves the existing order
-// between formats untouched, so format/profile quality stays in control.
+// ForRequestedLanguage removes explicit mismatches and gives a known match
+// a bounded preference over comparable unknown releases. Different formats,
+// editions and stronger scored evidence keep their original ordering.
 func ForRequestedLanguage(results []newznab.SearchResult, language string) (kept []newznab.SearchResult) {
 	kept, _ = SplitForRequestedLanguage(results, language)
 	return kept
@@ -47,7 +47,7 @@ func ForRequestedLanguage(results []newznab.SearchResult, language string) (kept
 
 // SplitForRequestedLanguage also returns per-release reasons for interactive
 // search's filtered section and debug panel. Unknown titles remain eligible.
-func SplitForRequestedLanguage(results []newznab.SearchResult, language string) (kept []newznab.SearchResult, dropped []DroppedRelease) {
+func SplitForRequestedLanguage(results []newznab.SearchResult, language string, criteria ...MatchCriteria) (kept []newznab.SearchResult, dropped []DroppedRelease) {
 	if language == "" {
 		return results, nil
 	}
@@ -72,37 +72,50 @@ func SplitForRequestedLanguage(results []newznab.SearchResult, language string) 
 		}
 	}
 
-	// Only re-order comparable candidates. A release with multiple format
-	// tokens, a retail/unabridged edition or an ISBN/ASIN can earn a larger
-	// ranking boost than the language match, as can an indexer priority.
+	// Only re-order comparable candidates by the same composite score the
+	// searcher uses. Preserve ties and the order between different formats,
+	// editions, years and identifiers. Callers with a book should provide its
+	// search criteria; for standalone filtering, separate release years cannot
+	// safely be compared without knowing the book's year.
+	c := MatchCriteria{RequestedLanguage: language}
+	if len(criteria) > 0 {
+		c = criteria[0]
+		c.RequestedLanguage = language
+	}
+	ranks := newProfileRanks(c.Profile)
 	positions := make(map[string][]int)
 	for i, r := range kept {
 		parsed := ParseRelease(r.Title)
 		quality := strings.Join(ReleaseFormats(r.Title), ",") + "|" +
 			strconv.FormatBool(parsed.Retail) + "|" + strconv.FormatBool(parsed.Unabridged) + "|" +
 			strconv.FormatBool(parsed.Abridged) + "|" + parsed.ISBN + "|" + parsed.ASIN + "|" +
-			strconv.Itoa(r.IndexerPriority)
+			strconv.Itoa(parsed.Year) + "|" + strconv.Itoa(r.IndexerPriority)
 		positions[quality] = append(positions[quality], i)
 	}
 	for _, indices := range positions {
-		group := make([]newznab.SearchResult, len(indices))
-		for j, i := range indices {
-			group[j] = kept[i]
+		if len(indices) < 2 {
+			continue
 		}
-		slices.SortStableFunc(group, func(a, b newznab.SearchResult) int {
-			matchA := slices.Equal(ReleaseLanguages(a.Title), []string{language})
-			matchB := slices.Equal(ReleaseLanguages(b.Title), []string{language})
+		type scored struct {
+			result newznab.SearchResult
+			score  float64
+		}
+		group := make([]scored, len(indices))
+		for j, i := range indices {
+			group[j] = scored{kept[i], scoreResult(kept[i], c, ranks)}
+		}
+		slices.SortStableFunc(group, func(a, b scored) int {
 			switch {
-			case matchA && !matchB:
+			case a.score > b.score:
 				return -1
-			case matchB && !matchA:
+			case a.score < b.score:
 				return 1
 			default:
 				return 0
 			}
 		})
 		for j, i := range indices {
-			kept[i] = group[j]
+			kept[i] = group[j].result
 		}
 	}
 	return kept, dropped

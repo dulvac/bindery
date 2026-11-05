@@ -167,6 +167,58 @@ func TestMAMLanguageInteractiveDebugExplainsWrongVariantBeforeProfile(t *testing
 	}
 }
 
+// Selecting a valid ebook variant must not require the audiobook leg to
+// request the same language; that leg uses its own wanted copy instead.
+func TestMAMLanguageDualFormatSelectionFallsBackToOtherLegWantedVariant(t *testing.T) {
+	f := newGrabSecFixture(t)
+	book := regrabOwnedBook(t, f.database, f.books, "mam-asymmetric", f.bob)
+	if _, err := f.database.ExecContext(f.ctx, "UPDATE books SET media_type=? WHERE id=?", models.MediaTypeBoth, book.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.books.VariantRepo().EnsureWanted(f.ctx, book.ID, models.MediaTypeEbook, []string{"rum"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.books.VariantRepo().EnsureWanted(f.ctx, book.ID, models.MediaTypeAudiobook, []string{"eng"}); err != nil {
+		t.Fatal(err)
+	}
+	s := droppedSearcher{results: map[string][]newznab.SearchResult{
+		models.MediaTypeEbook: {
+			{GUID: "ebook-ro", Title: "Some Book [ROM / EPUB]"},
+			{GUID: "ebook-en", Title: "Some Book [ENG / EPUB]"},
+		},
+		models.MediaTypeAudiobook: {
+			{GUID: "audio-en", Title: "Some Book [ENG / M4B]"},
+			{GUID: "audio-ro", Title: "Some Book [ROM / M4B]"},
+		},
+	}}
+	h := NewIndexerHandler(db.NewIndexerRepo(f.database), f.books, db.NewAuthorRepo(f.database),
+		nil, s, db.NewSettingsRepo(f.database), db.NewBlocklistRepo(f.database)).WithSearchResults(f.queue.searchResults)
+	rec := httptest.NewRecorder()
+	req := withURLParam(httptest.NewRequest(http.MethodGet, "/indexer/book/1/search?language=rum", nil), "id", strconv.FormatInt(book.ID, 10))
+	h.SearchBook(rec, asRole(req, f.bob, auth.RoleUser))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("search of valid Romanian ebook with English audio = %d: %s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Results []struct {
+			GUID, MediaType string
+		} `json:"results"`
+		Filtered []struct {
+			GUID string
+		} `json:"filtered"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 2 || response.Results[0].GUID != "ebook-ro" || response.Results[0].MediaType != models.MediaTypeEbook ||
+		response.Results[1].GUID != "audio-en" || response.Results[1].MediaType != models.MediaTypeAudiobook {
+		t.Errorf("results = %+v; want Romanian ebook and English audiobook", response.Results)
+	}
+	if len(response.Filtered) != 2 || response.Filtered[0].GUID != "ebook-en" || response.Filtered[1].GUID != "audio-ro" {
+		t.Errorf("filtered = %+v; want wrong language excluded from each leg", response.Filtered)
+	}
+}
+
 func TestMAMLanguageInteractiveSearchRejectsUnrequestedVariant(t *testing.T) {
 	f := newGrabSecFixture(t)
 	book := regrabOwnedBook(t, f.database, f.books, "mam-invalid-language", f.bob)

@@ -1310,7 +1310,7 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 			Title:  "(" + strconv.Itoa(rawResults-len(results)) + " result(s) dropped)",
 		})
 	}
-	results, variantDropped := indexer.SplitForRequestedLanguage(results, requestedLanguage)
+	results, variantDropped := indexer.SplitForRequestedLanguage(results, requestedLanguage, crit)
 	if dbg != nil {
 		dbg.Query.RequestedLanguage = requestedLanguage
 		for _, drop := range variantDropped {
