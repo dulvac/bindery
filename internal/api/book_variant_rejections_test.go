@@ -131,12 +131,23 @@ func newRejectSourceFixture(t *testing.T) *rejectSourceFixture {
 	return f
 }
 
-func (f *rejectSourceFixture) route() { f.routeWithRemap("") }
+func (f *rejectSourceFixture) route() { f.routeWithOptions("", filepath.Dir(f.library)) }
 
 func (f *rejectSourceFixture) routeWithRemap(remap string) {
+	f.routeWithOptions(remap, filepath.Dir(f.library))
+}
+
+func (f *rejectSourceFixture) routeWithLibraryRoots(roots ...string) {
+	f.routeWithOptions("", roots...)
+}
+
+func (f *rejectSourceFixture) routeWithOptions(remap string, libraryRoots ...string) {
+	if len(libraryRoots) == 0 {
+		libraryRoots = []string{filepath.Dir(f.library)}
+	}
 	h := NewBookHandler(f.database, nil, nil, nil).
 		WithDownloads(db.NewDownloadRepo(f.conn)).
-		WithRoots(NewLibraryRoots(nil, filepath.Dir(f.library))).
+		WithRoots(NewLibraryRoots(nil, libraryRoots...)).
 		WithVariantRejections(f.rejected, f.root).
 		WithRejectionTorrentSource(db.NewDownloadClientRepo(f.conn), remap)
 	h.rejectionTorrentReader = func(*models.DownloadClient) rejectionTorrentReader { return f.qbit }
@@ -496,6 +507,46 @@ func newRejectSourceAudioFixture(t *testing.T) (*rejectSourceFixture, int64, int
 	return f, audioVariants[0].ID, audioFile.ID, sourceDir, libraryDir
 }
 
+func newRejectSourceAudioOverlapFixture(t *testing.T) (*rejectSourceFixture, int64, int64, string, string) {
+	t.Helper()
+	f := newRejectSourceFixture(t)
+	audioVariants, err := f.database.VariantRepo().EnsureWanted(f.ctx, f.book.ID, models.MediaTypeAudiobook, []string{"rum"})
+	if err != nil || len(audioVariants) != 1 {
+		t.Fatalf("audio variant: %+v %v", audioVariants, err)
+	}
+	if _, err := f.conn.ExecContext(f.ctx, `UPDATE downloads SET variant_id = ?, import_path = '' WHERE id = ?`, audioVariants[0].ID, f.download.ID); err != nil {
+		t.Fatal(err)
+	}
+	sourceDir := filepath.Join(f.root, "mam", "recording")
+	sourceTrack := filepath.Join(sourceDir, "01.m4b")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sourceTrack, []byte("source audiobook"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.database.AddBookFile(f.ctx, f.book.ID, models.MediaTypeAudiobook, sourceDir); err != nil {
+		t.Fatal(err)
+	}
+	files, err := f.database.ListBookFiles(f.ctx, f.book.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var audioFile models.BookFile
+	for _, file := range files {
+		if file.Path == sourceDir {
+			audioFile = file
+		}
+	}
+	if audioFile.ID == 0 {
+		t.Fatalf("audiobook overlap folder not tracked: %+v", files)
+	}
+	f.qbit.torrents[0].ContentPath = "/qbit/data/recording/01.m4b"
+	f.qbit.files = []qbittorrent.File{{Name: "recording/01.m4b", Size: int64(len("source audiobook"))}}
+	f.routeWithLibraryRoots(f.root)
+	return f, audioVariants[0].ID, audioFile.ID, sourceDir, sourceTrack
+}
+
 func TestRejectSourceAudiobookTrackedFolder(t *testing.T) {
 	f, variantID, audioFileID, sourceDir, _ := newRejectSourceAudioFixture(t)
 	body := map[string]any{"downloadId": f.download.ID, "bookFileId": audioFileID, "reason": "wrong language"}
@@ -506,6 +557,42 @@ func TestRejectSourceAudiobookTrackedFolder(t *testing.T) {
 	if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, sourceDir); err != nil || !rejected {
 		t.Fatalf("audiobook source folder not rejected: %t %v", rejected, err)
 	}
+}
+
+func TestRejectSourceAudiobookRefusesSourceInsideTrackedFolder(t *testing.T) {
+	t.Run("single-file torrent source", func(t *testing.T) {
+		f, variantID, audioFileID, _, sourceTrack := newRejectSourceAudioOverlapFixture(t)
+		body := map[string]any{"downloadId": f.download.ID, "bookFileId": audioFileID, "reason": "wrong language"}
+		rec := f.post(t, f.book.ID, variantID, body, auth.RoleAdmin)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("single-file overlap: %d %s; want 409", rec.Code, rec.Body.String())
+		}
+		if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, sourceTrack); err != nil || rejected {
+			t.Fatalf("single-file overlap was rejected: %t %v", rejected, err)
+		}
+	})
+
+	t.Run("nested torrent folder", func(t *testing.T) {
+		f, variantID, audioFileID, sourceDir, sourceTrack := newRejectSourceAudioOverlapFixture(t)
+		nestedDir := filepath.Join(sourceDir, "nested")
+		nestedTrack := filepath.Join(nestedDir, filepath.Base(sourceTrack))
+		if err := os.MkdirAll(nestedDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(sourceTrack, nestedTrack); err != nil {
+			t.Fatal(err)
+		}
+		f.qbit.torrents[0].ContentPath = "/qbit/data/recording/nested"
+		f.qbit.files = []qbittorrent.File{{Name: "recording/nested/01.m4b", Size: int64(len("source audiobook"))}}
+		body := map[string]any{"downloadId": f.download.ID, "bookFileId": audioFileID, "reason": "wrong language"}
+		rec := f.post(t, f.book.ID, variantID, body, auth.RoleAdmin)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("nested overlap: %d %s; want 409", rec.Code, rec.Body.String())
+		}
+		if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, nestedDir); err != nil || rejected {
+			t.Fatalf("nested overlap was rejected: %t %v", rejected, err)
+		}
+	})
 }
 
 func TestRejectSourceAudiobookRequiresEveryMediaMember(t *testing.T) {

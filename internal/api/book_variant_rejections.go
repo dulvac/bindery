@@ -315,7 +315,7 @@ func proveRejectedSourceFromTorrent(torrent qbittorrent.Torrent, files []qbittor
 		}
 		var sourceMedia map[string]os.FileInfo
 		if contentInfo.IsDir() {
-			if contentPath == savePath || !rejectionPathInRoots(contentPath, roots, false) || contentPath == tracked.Path {
+			if contentPath == savePath || !rejectionPathInRoots(contentPath, roots, false) || rejectionAtOrUnder(contentPath, tracked.Path) {
 				return "", errors.New("audiobook has no distinct torrent folder")
 			}
 			sourceMedia, err = rejectionAudioMembers(contentPath)
@@ -323,6 +323,9 @@ func proveRejectedSourceFromTorrent(torrent qbittorrent.Torrent, files []qbittor
 				return "", err
 			}
 		} else {
+			if rejectionAtOrUnder(contentPath, tracked.Path) {
+				return "", errors.New("audiobook source is inside tracked library folder")
+			}
 			sourceMedia = map[string]os.FileInfo{contentPath: contentInfo}
 		}
 		listedAudio := make(map[string]os.FileInfo)
@@ -335,7 +338,7 @@ func proveRejectedSourceFromTorrent(torrent qbittorrent.Torrent, files []qbittor
 			return "", errors.New("audiobook media membership incomplete")
 		}
 		for source, info := range listedAudio {
-			if source == tracked.Path || sourceMedia[source] == nil {
+			if rejectionAtOrUnder(source, tracked.Path) || sourceMedia[source] == nil {
 				return "", errors.New("unlisted or self-referential audiobook source")
 			}
 			matches := 0
