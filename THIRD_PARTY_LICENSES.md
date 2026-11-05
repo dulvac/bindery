@@ -36,7 +36,7 @@ its type definitions) is listed anyway, and modules that only build on one of
 the three release platforms are listed for all of them. Omitting something that
 does ship is the failure that matters.
 
-26 Go modules, 13 npm packages.
+29 Go modules, 13 npm packages.
 
 ## Go modules
 
@@ -53,13 +53,16 @@ does ship is the failure that matters.
 | [github.com/mattn/go-isatty](https://github.com/mattn/go-isatty/blob/v0.0.24/LICENSE) | v0.0.24 | MIT | — |
 | [github.com/munnerz/goautoneg](https://github.com/munnerz/goautoneg/blob/a7dc8b61c822/LICENSE) | v0.0.0-20191010083416-a7dc8b61c822 | BSD-3-Clause | — |
 | [github.com/ncruces/go-strftime](https://github.com/ncruces/go-strftime/blob/v1.0.0/LICENSE) | v1.0.0 | MIT | — |
+| [github.com/pemistahl/lingua-go](https://github.com/pemistahl/lingua-go/blob/v1.4.0/LICENSE) | v1.4.0 | Apache-2.0 | — |
 | [github.com/prometheus/client_golang](https://github.com/prometheus/client_golang/blob/v1.25.0/LICENSE) | v1.25.0 | Apache-2.0 | yes |
 | [github.com/prometheus/client_model](https://github.com/prometheus/client_model/blob/v0.6.3/LICENSE) | v0.6.3 | Apache-2.0 | yes |
 | [github.com/prometheus/common](https://github.com/prometheus/common/blob/v0.72.0/LICENSE) | v0.72.0 | Apache-2.0 | yes |
 | [github.com/prometheus/procfs](https://github.com/prometheus/procfs/blob/v0.22.0/LICENSE) | v0.22.0 | Apache-2.0 | yes |
 | [github.com/remyoudompheng/bigfft](https://github.com/remyoudompheng/bigfft/blob/24d4a6f8daec/LICENSE) | v0.0.0-20230129092748-24d4a6f8daec | BSD-3-Clause | — |
 | [github.com/robfig/cron/v3](https://github.com/robfig/cron/blob/v3.0.1/LICENSE) | v3.0.1 | MIT | — |
+| [github.com/shopspring/decimal](https://github.com/shopspring/decimal/blob/v1.3.1/LICENSE) | v1.3.1 | MIT | — |
 | [golang.org/x/crypto](https://cs.opensource.google/go/x/crypto/+/v0.58.0:LICENSE) | v0.58.0 | BSD-3-Clause | — |
+| [golang.org/x/exp](https://cs.opensource.google/go/x/exp/+/f9659909:LICENSE) | v0.0.0-20221106115401-f9659909a136 | BSD-3-Clause | — |
 | [golang.org/x/oauth2](https://cs.opensource.google/go/x/oauth2/+/v0.37.0:LICENSE) | v0.37.0 | BSD-3-Clause | — |
 | [golang.org/x/sys](https://cs.opensource.google/go/x/sys/+/v0.49.0:LICENSE) | v0.49.0 | BSD-3-Clause | — |
 | [golang.org/x/text](https://cs.opensource.google/go/x/text/+/v0.43.0:LICENSE) | v0.43.0 | BSD-3-Clause | — |
@@ -619,11 +622,12 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 4. Apache-2.0 — github.com/prometheus/client_golang@v1.25.0 (LICENSE)
+### 4. Apache-2.0 — github.com/pemistahl/lingua-go@v1.4.0 (LICENSE)
 
 <details>
-<summary>Applies to 4 dependencies</summary>
+<summary>Applies to 5 dependencies</summary>
 
+- github.com/pemistahl/lingua-go@v1.4.0 (LICENSE)
 - github.com/prometheus/client_golang@v1.25.0 (LICENSE)
 - github.com/prometheus/client_model@v0.6.3 (LICENSE)
 - github.com/prometheus/common@v0.72.0 (LICENSE)
@@ -1065,7 +1069,47 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 11. BSD-3-Clause — google.golang.org/protobuf@v1.36.12 (LICENSE)
+### 11. BSD-3-Clause — golang.org/x/exp@v0.0.0-20221106115401-f9659909a136 (LICENSE)
+
+<details>
+<summary>Applies to 2 dependencies</summary>
+
+- golang.org/x/exp@v0.0.0-20221106115401-f9659909a136 (LICENSE)
+- modernc.org/memory@v1.12.1 (LICENSE-GO)
+
+</details>
+
+```
+Copyright (c) 2009 The Go Authors. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * Neither the name of Google Inc. nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+### 12. BSD-3-Clause — google.golang.org/protobuf@v1.36.12 (LICENSE)
 
 ```
 Copyright (c) 2018 The Go Authors. All rights reserved.
@@ -1097,7 +1141,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 12. BSD-3-Clause — modernc.org/libc@v1.77.1 (LICENSE)
+### 13. BSD-3-Clause — modernc.org/libc@v1.77.1 (LICENSE)
 
 ```
 Copyright (c) 2017 The Libc Authors. All rights reserved.
@@ -1129,7 +1173,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 13. BSD-3-Clause — modernc.org/libc@v1.77.1 (LICENSE-3RD-PARTY.md)
+### 14. BSD-3-Clause — modernc.org/libc@v1.77.1 (LICENSE-3RD-PARTY.md)
 
 ```
 # Third-Party Software Notices
@@ -1439,7 +1483,7 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 14. BSD-3-Clause — modernc.org/mathutil@v1.7.1 (LICENSE)
+### 15. BSD-3-Clause — modernc.org/mathutil@v1.7.1 (LICENSE)
 
 ```
 Copyright (c) 2014 The mathutil Authors. All rights reserved.
@@ -1455,38 +1499,6 @@ copyright notice, this list of conditions and the following disclaimer
 in the documentation and/or other materials provided with the
 distribution.
    * Neither the names of the authors nor the names of the
-contributors may be used to endorse or promote products derived from
-this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-```
-
-### 15. BSD-3-Clause — modernc.org/memory@v1.12.1 (LICENSE-GO)
-
-```
-Copyright (c) 2009 The Go Authors. All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are
-met:
-
-   * Redistributions of source code must retain the above copyright
-notice, this list of conditions and the following disclaimer.
-   * Redistributions in binary form must reproduce the above
-copyright notice, this list of conditions and the following disclaimer
-in the documentation and/or other materials provided with the
-distribution.
-   * Neither the name of Google Inc. nor the names of its
 contributors may be used to endorse or promote products derived from
 this software without specific prior written permission.
 
@@ -1703,7 +1715,57 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 24. MIT — npm:@babel/runtime@7.29.7 (LICENSE)
+### 24. MIT — github.com/shopspring/decimal@v1.3.1 (LICENSE)
+
+```
+The MIT License (MIT)
+
+Copyright (c) 2015 Spring, Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+- Based on https://github.com/oguzbilgic/fpd, which has the following license:
+"""
+The MIT License (MIT)
+
+Copyright (c) 2013 Oguz Bilgic
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+"""
+```
+
+### 25. MIT — npm:@babel/runtime@7.29.7 (LICENSE)
 
 ```
 MIT License
@@ -1730,7 +1792,7 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 25. MIT — npm:@remix-run/route-pattern@0.22.1 (LICENSE)
+### 26. MIT — npm:@remix-run/route-pattern@0.22.1 (LICENSE)
 
 ```
 MIT License
@@ -1756,7 +1818,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 26. MIT — npm:cookie-es@3.1.1 (LICENSE)
+### 27. MIT — npm:cookie-es@3.1.1 (LICENSE)
 
 ```
 MIT License
@@ -1789,7 +1851,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 27. MIT — npm:html-parse-stringify@4.0.1 (LICENSE)
+### 28. MIT — npm:html-parse-stringify@4.0.1 (LICENSE)
 
 ```
 MIT License
@@ -1816,7 +1878,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 28. MIT — npm:i18next-browser-languagedetector@8.2.1 (LICENSE)
+### 29. MIT — npm:i18next-browser-languagedetector@8.2.1 (LICENSE)
 
 ```
 The MIT License (MIT)
@@ -1842,7 +1904,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 29. MIT — npm:i18next@26.4.6 (LICENSE)
+### 30. MIT — npm:i18next@26.4.6 (LICENSE)
 
 ```
 The MIT License (MIT)
@@ -1868,7 +1930,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 30. MIT — npm:react-i18next@17.0.18 (LICENSE)
+### 31. MIT — npm:react-i18next@17.0.18 (LICENSE)
 
 ```
 The MIT License (MIT)
@@ -1894,7 +1956,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 31. MIT — npm:react-router@8.4.0 (LICENSE.md)
+### 32. MIT — npm:react-router@8.4.0 (LICENSE.md)
 
 ```
 MIT License
@@ -1922,7 +1984,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 32. MIT — npm:react-dom@19.3.1 (LICENSE)
+### 33. MIT — npm:react-dom@19.3.1 (LICENSE)
 
 <details>
 <summary>Applies to 4 dependencies</summary>
