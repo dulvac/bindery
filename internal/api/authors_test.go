@@ -9295,6 +9295,11 @@ func TestAddBook_RefusesBookAlreadyOwned(t *testing.T) {
 	if err := bookRepo.Create(ctx, owned); err != nil {
 		t.Fatal(err)
 	}
+	// The owner has already requested this exact language/format. A legacy
+	// imported row without a verified variant may gain a missing language.
+	if _, err := db.NewBookVariantRepo(database).EnsureWanted(ctx, owned.ID, models.MediaTypeEbook, []string{"eng"}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Buffered so the stub's non-blocking send lands when GetBook is entered;
 	// an empty channel after the request proves no upstream fetch happened.

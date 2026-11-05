@@ -17,6 +17,12 @@ func NewBookVariantRepo(db *sql.DB) *BookVariantRepo {
 	return &BookVariantRepo{db: db}
 }
 
+// VariantRepo shares a book repository's database, so every book-add path
+// records its variants even when no separate repository is wired by its caller.
+func (r *BookRepo) VariantRepo() *BookVariantRepo {
+	return NewBookVariantRepo(r.db)
+}
+
 // EnsureWanted creates missing variants without changing the status of rows
 // already present. The returned rows contain only the requested languages and
 // are ordered by canonical language code.

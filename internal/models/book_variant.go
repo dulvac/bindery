@@ -22,6 +22,21 @@ type BookVariant struct {
 	Status    string `json:"status"`
 }
 
+// RequestedMediaTypes expands a book's format into the individual formats
+// whose language variants are tracked separately.
+func RequestedMediaTypes(mediaType string) []string {
+	switch mediaType {
+	case MediaTypeEbook:
+		return []string{MediaTypeEbook}
+	case MediaTypeAudiobook:
+		return []string{MediaTypeAudiobook}
+	case MediaTypeBoth:
+		return []string{MediaTypeEbook, MediaTypeAudiobook}
+	default:
+		return nil
+	}
+}
+
 // NormalizeRequestLanguages returns unique, canonical request languages in
 // lexical order. Only an absent selection defaults to English; an explicit
 // empty or unsupported selection is an error.

@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -61,9 +63,9 @@ var (
 const RequestClaimTTL = 5 * time.Minute
 
 const requestColumns = `r.id, r.owner_user_id, COALESCE(u.username, ''), r.kind, r.foreign_id, r.media_type,
-	r.title, r.author_name, r.payload_json, r.status, r.decline_reason, r.decided_by,
+	r.title, r.author_name, r.payload_json, r.languages_json, r.status, r.decline_reason, r.decided_by,
 	r.result_book_id, r.result_author_id, r.created_at, r.updated_at, r.decided_at,
-	COALESCE(b.status, ''), r.created_via, r.created_by_user_id, COALESCE(cu.username, '')`
+	COALESCE(b.status, ''), COALESCE(b.media_type, ''), r.created_via, r.created_by_user_id, COALESCE(cu.username, '')`
 
 const requestJoins = `FROM requests r
 	LEFT JOIN users u ON u.id = r.owner_user_id
@@ -78,10 +80,15 @@ func scanRequest(s scanner) (*models.LibraryRequest, error) {
 		decidedAt                           sql.NullTime
 	)
 	if err := s.Scan(&req.ID, &req.OwnerUserID, &req.OwnerUsername, &req.Kind, &req.ForeignID, &req.MediaType,
-		&req.Title, &req.AuthorName, &req.PayloadJSON, &req.Status, &req.DeclineReason, &decidedBy,
+		&req.Title, &req.AuthorName, &req.PayloadJSON, &req.LanguagesJSON, &req.Status, &req.DeclineReason, &decidedBy,
 		&resultBook, &resultAuthor, &req.CreatedAt, &req.UpdatedAt, &decidedAt, &req.BookStatus,
-		&req.CreatedVia, &createdBy, &req.CreatedByUsername); err != nil {
+		&req.BookMediaType, &req.CreatedVia, &createdBy, &req.CreatedByUsername); err != nil {
 		return nil, err
+	}
+	if req.Kind == models.RequestKindBook {
+		if err := json.Unmarshal([]byte(req.LanguagesJSON), &req.Languages); err != nil {
+			return nil, fmt.Errorf("decode request languages: %w", err)
+		}
 	}
 	if decidedBy.Valid {
 		req.DecidedBy = &decidedBy.Int64
@@ -114,17 +121,30 @@ const pendingBelowCap = `(SELECT COUNT(*) FROM requests WHERE owner_user_id = ? 
 // nothing and returns ErrRequestCapReached. req.CreatedVia and
 // req.CreatedByUserID record who asked on the owner's behalf, if anyone.
 func (r *RequestRepo) Create(ctx context.Context, req *models.LibraryRequest, maxPending int) error {
+	languages := []string{}
+	if req.Kind == models.RequestKindBook {
+		var err error
+		languages, err = models.NormalizeRequestLanguages(req.Languages)
+		if err != nil {
+			return err
+		}
+		req.Languages = languages
+	}
+	languagesJSON, err := json.Marshal(languages)
+	if err != nil {
+		return err
+	}
 	if maxPending <= 0 {
 		maxPending = int(^uint32(0) >> 1)
 	}
 	now := time.Now().UTC()
 	res, err := r.db.ExecContext(ctx, `
 		INSERT INTO requests (owner_user_id, kind, foreign_id, media_type, title, author_name,
-		                      payload_json, status, created_at, updated_at, created_via, created_by_user_id)
-		SELECT ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?
+		                      payload_json, languages_json, status, created_at, updated_at, created_via, created_by_user_id)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?
 		WHERE `+pendingBelowCap,
 		req.OwnerUserID, req.Kind, req.ForeignID, req.MediaType, req.Title, req.AuthorName,
-		req.PayloadJSON, now, now, req.CreatedVia, req.CreatedByUserID, req.OwnerUserID, maxPending)
+		req.PayloadJSON, string(languagesJSON), now, now, req.CreatedVia, req.CreatedByUserID, req.OwnerUserID, maxPending)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
 			return ErrRequestExists
@@ -141,6 +161,7 @@ func (r *RequestRepo) Create(ctx context.Context, req *models.LibraryRequest, ma
 		return fmt.Errorf("create request id: %w", err)
 	}
 	req.ID = id
+	req.LanguagesJSON = string(languagesJSON)
 	req.Status = models.RequestStatusPending
 	req.CreatedAt, req.UpdatedAt = now, now
 	return nil
@@ -225,6 +246,9 @@ func (r *RequestRepo) list(ctx context.Context, where string, args []any, limit,
 	if err := r.fillAuthorProgress(ctx, out, authorIDs); err != nil {
 		return nil, 0, err
 	}
+	if err := r.fillBookProgress(ctx, out); err != nil {
+		return nil, 0, err
+	}
 	return out, total, nil
 }
 
@@ -268,6 +292,75 @@ func (r *RequestRepo) fillAuthorProgress(ctx context.Context, page []models.Libr
 		}
 		p := byAuthor[*page[i].ResultAuthorID]
 		page[i].AuthorBooks, page[i].AuthorBooksImported = p.total, p.imported
+	}
+	return nil
+}
+
+// fillBookProgress checks the complete requested variant set with one query
+// per page. A book-level imported status cannot attest to a language: legacy
+// files are unverified until they are explicitly linked to a variant.
+func (r *RequestRepo) fillBookProgress(ctx context.Context, page []models.LibraryRequest) error {
+	seen := make(map[int64]bool)
+	ids := make([]int64, 0)
+	for _, req := range page {
+		if req.Kind == models.RequestKindBook && req.Status == models.RequestStatusApproved && req.ResultBookID != nil && !seen[*req.ResultBookID] {
+			id := *req.ResultBookID
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	// #nosec G202 -- placeholders consists only of question marks from the number of books on this page.
+	rows, err := r.db.QueryContext(ctx, `SELECT book_id, media_type, language, status FROM book_variants WHERE book_id IN (`+placeholders+`)`, args...)
+	if err != nil {
+		return fmt.Errorf("load request variants: %w", err)
+	}
+	byBook := make(map[int64]map[string]string, len(ids))
+	for rows.Next() {
+		var id int64
+		var mediaType, language, status string
+		if err := rows.Scan(&id, &mediaType, &language, &status); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if byBook[id] == nil {
+			byBook[id] = make(map[string]string)
+		}
+		byBook[id][mediaType+"/"+language] = status
+	}
+	err = rows.Err()
+	_ = rows.Close()
+	if err != nil {
+		return err
+	}
+	for i := range page {
+		req := &page[i]
+		if req.Kind != models.RequestKindBook || req.Status != models.RequestStatusApproved || req.ResultBookID == nil {
+			continue
+		}
+		mediaType := req.MediaType
+		if mediaType == "" {
+			mediaType = req.BookMediaType
+		}
+		formats := models.RequestedMediaTypes(mediaType)
+		if len(formats) == 0 || len(req.Languages) == 0 {
+			continue
+		}
+		req.BookFulfilled = true
+		for _, format := range formats {
+			for _, language := range req.Languages {
+				if byBook[*req.ResultBookID][format+"/"+language] != models.VariantImported {
+					req.BookFulfilled = false
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -398,12 +491,18 @@ func (r *RequestRepo) RenewClaim(ctx context.Context, id int64, token string) er
 
 // Complete marks a request this approval still holds approved with what the
 // approval created.
-func (r *RequestRepo) Complete(ctx context.Context, id int64, token string, bookID, authorID *int64) error {
+func (r *RequestRepo) Complete(ctx context.Context, id int64, token string, bookID, authorID *int64, approvedMediaType ...string) error {
+	var mediaType any
+	if len(approvedMediaType) > 0 {
+		mediaType = approvedMediaType[0]
+	}
 	now := time.Now().UTC()
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE requests SET status = 'approved', result_book_id = ?, result_author_id = ?,
+		       media_type = COALESCE(?, media_type),
+		       payload_json = CASE WHEN ? IS NULL THEN payload_json ELSE json_set(payload_json, '$.mediaType', ?) END,
 		       decided_at = ?, updated_at = ?, claimed_at = NULL, claim_token = NULL
-		WHERE id = ? AND status = 'approving' AND claim_token = ?`, bookID, authorID, now, now, id, token)
+		WHERE id = ? AND status = 'approving' AND claim_token = ?`, bookID, authorID, mediaType, mediaType, mediaType, now, now, id, token)
 	if err != nil {
 		return fmt.Errorf("complete request: %w", err)
 	}
@@ -437,23 +536,95 @@ func (r *RequestRepo) Decline(ctx context.Context, id, adminID int64, reason str
 	return nil
 }
 
+// MergePending adds missing languages/formats to the owner's pending book
+// request. Its compare-and-swap updates both the row and its approval payload
+// together. A concurrent merge retries against the newly saved selection;
+// an approval claim cannot be changed while it is running.
+func (r *RequestRepo) MergePending(ctx context.Context, id, ownerID int64, mediaType string, languages []string) (*models.LibraryRequest, error) {
+	for {
+		row := r.db.QueryRowContext(ctx, `SELECT `+requestColumns+` `+requestJoins+`
+			WHERE r.id = ? AND r.owner_user_id = ?`, id, ownerID)
+		current, err := scanRequest(row)
+		if err != nil {
+			return nil, fmt.Errorf("read pending request: %w", err)
+		}
+		if current.Kind != models.RequestKindBook || current.Status != models.RequestStatusPending {
+			return nil, ErrRequestNotPending
+		}
+		joined := append(slices.Clone(current.Languages), languages...)
+		merged, err := models.NormalizeRequestLanguages(joined)
+		if err != nil {
+			return nil, err
+		}
+		mergedMedia := current.MediaType
+		if mergedMedia == "" {
+			mergedMedia = mediaType
+		} else if mediaType != "" && mergedMedia != mediaType {
+			mergedMedia = models.MediaTypeBoth
+		}
+		if slices.Equal(merged, current.Languages) && mergedMedia == current.MediaType {
+			return nil, ErrRequestExists
+		}
+		langJSON, _ := json.Marshal(merged)
+		var payload map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(current.PayloadJSON), &payload); err != nil || payload == nil {
+			return nil, fmt.Errorf("decode pending request payload: %v", err)
+		}
+		payload["languages"] = langJSON
+		payload["mediaType"], _ = json.Marshal(mergedMedia)
+		payloadJSON, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		result, err := r.db.ExecContext(ctx, `UPDATE requests SET media_type = ?, languages_json = ?, payload_json = ?, updated_at = ?
+			WHERE id = ? AND owner_user_id = ? AND status = 'pending'
+			AND media_type = ? AND languages_json = ? AND payload_json = ?`,
+			mergedMedia, string(langJSON), string(payloadJSON), time.Now().UTC(), id, ownerID,
+			current.MediaType, current.LanguagesJSON, current.PayloadJSON)
+		if err != nil {
+			return nil, fmt.Errorf("merge pending request: %w", err)
+		}
+		if n, _ := result.RowsAffected(); n == 1 {
+			return r.GetByID(ctx, id)
+		}
+		// Another merge or a claim won the race. Reload to decide which.
+	}
+}
+
 // Reopen puts ownerID's approved request back to pending, for when what it
 // added has since left the library and the requester asks again. It keeps
 // the row, so the (owner, kind, foreign id) uniqueness still holds. The cap
 // check is part of the same UPDATE, as in Create. createdVia and createdBy
 // replace who made the request, as Create records them: a reopen is a new
 // ask, made by whoever asked this time.
-func (r *RequestRepo) Reopen(ctx context.Context, id, ownerID int64, mediaType, payload, createdVia string, createdBy *int64, maxPending int) error {
+func (r *RequestRepo) Reopen(ctx context.Context, id, ownerID int64, mediaType, payload, createdVia string, createdBy *int64, maxPending int, selection ...[]string) error {
+	languages := []string{"eng"} // callers before language variants reopen a legacy book
+	if len(selection) > 0 {
+		languages = selection[0]
+		if languages == nil {
+			languages = []string{} // author requests have no language selection
+		} else {
+			var err error
+			languages, err = models.NormalizeRequestLanguages(languages)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	langJSON, err := json.Marshal(languages)
+	if err != nil {
+		return err
+	}
 	if maxPending <= 0 {
 		maxPending = int(^uint32(0) >> 1)
 	}
 	now := time.Now().UTC()
 	res, err := r.db.ExecContext(ctx, `
-		UPDATE requests SET status = 'pending', media_type = ?, payload_json = ?, decided_by = NULL,
+		UPDATE requests SET status = 'pending', media_type = ?, payload_json = ?, languages_json = ?, decided_by = NULL,
 		       decided_at = NULL, result_book_id = NULL, result_author_id = NULL,
 		       decline_reason = '', created_at = ?, updated_at = ?, created_via = ?, created_by_user_id = ?
 		WHERE id = ? AND owner_user_id = ? AND status = 'approved' AND `+pendingBelowCap,
-		mediaType, payload, now, now, createdVia, createdBy, id, ownerID, ownerID, maxPending)
+		mediaType, payload, string(langJSON), now, now, createdVia, createdBy, id, ownerID, ownerID, maxPending)
 	if err != nil {
 		return fmt.Errorf("reopen request: %w", err)
 	}

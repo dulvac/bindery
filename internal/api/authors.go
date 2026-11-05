@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -82,6 +83,7 @@ type AuthorHandler struct {
 	authors                     *db.AuthorRepo
 	aliases                     *db.AuthorAliasRepo
 	books                       *db.BookRepo
+	variants                    *db.BookVariantRepo
 	series                      *db.SeriesRepo
 	meta                        *metadata.Aggregator
 	settings                    *db.SettingsRepo
@@ -127,7 +129,11 @@ type AuthorHandler struct {
 }
 
 func NewAuthorHandler(authors *db.AuthorRepo, aliases *db.AuthorAliasRepo, books *db.BookRepo, series *db.SeriesRepo, meta *metadata.Aggregator, settings *db.SettingsRepo, profiles *db.MetadataProfileRepo, searcher BookSearcher) *AuthorHandler {
-	return &AuthorHandler{authors: authors, aliases: aliases, books: books, series: series, meta: meta, settings: settings, profiles: profiles, searcher: searcher}
+	h := &AuthorHandler{authors: authors, aliases: aliases, books: books, series: series, meta: meta, settings: settings, profiles: profiles, searcher: searcher}
+	if books != nil {
+		h.variants = books.VariantRepo()
+	}
+	return h
 }
 
 // WithJobs registers the process-wide background-jobs group so the async
@@ -3526,10 +3532,27 @@ func (h *AuthorHandler) AddBook(w http.ResponseWriter, r *http.Request) {
 		// MediaType optionally forces ebook/audiobook/both for the added book
 		// (#1397). Empty keeps the provider's media type, falling back to the
 		// default.media_type setting — the pre-selector behaviour.
-		MediaType string `json:"mediaType"`
+		MediaType string          `json:"mediaType"`
+		Languages json.RawMessage `json:"languages"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if bytes.Equal(bytes.TrimSpace(req.Languages), []byte("null")) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "languages cannot be null"})
+		return
+	}
+	var languages []string
+	if req.Languages != nil {
+		if err := json.Unmarshal(req.Languages, &languages); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid languages"})
+			return
+		}
+	}
+	languages, err := models.NormalizeRequestLanguages(languages)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 	res, err := h.addBookCore(r.Context(), addBookParams{
@@ -3538,6 +3561,7 @@ func (h *AuthorHandler) AddBook(w http.ResponseWriter, r *http.Request) {
 		AuthorName:      req.AuthorName,
 		SearchOnAdd:     req.SearchOnAdd,
 		MediaType:       req.MediaType,
+		Languages:       languages,
 	})
 	if err != nil {
 		h.writeAddBookError(w, r, err)

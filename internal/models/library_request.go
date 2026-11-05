@@ -34,6 +34,12 @@ type LibraryRequest struct {
 	Kind          string
 	ForeignID     string
 	MediaType     string
+	// Languages are the normalized languages requested for a book. Author
+	// requests have no language selection.
+	Languages []string
+	// LanguagesJSON is the exact stored text, retained for compare-and-swap
+	// updates to a pending request even if old JSON contains whitespace.
+	LanguagesJSON string
 	// Title is the book title, or the author's name for an author request,
 	// as the metadata provider reported it when the request was made.
 	Title      string
@@ -62,6 +68,8 @@ type LibraryRequest struct {
 	// the status of the book the approval created. For an author request,
 	// AuthorBooks and AuthorBooksImported count that author's books.
 	BookStatus          string
+	BookMediaType       string
+	BookFulfilled       bool
 	AuthorBooks         int
 	AuthorBooksImported int
 }

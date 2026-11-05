@@ -183,8 +183,8 @@ func TestRequestsCreate_ServerBuildsPayload(t *testing.T) {
 	if err := json.Unmarshal([]byte(row.PayloadJSON), &p); err != nil {
 		t.Fatal(err)
 	}
-	want := requestPayload{Kind: "book", ForeignID: "OL27482W", ForeignAuthorID: "OL39307A", AuthorName: "H. G. Wells", MediaType: "audiobook"}
-	if p != want {
+	want := requestPayload{Kind: "book", ForeignID: "OL27482W", ForeignAuthorID: "OL39307A", AuthorName: "H. G. Wells", MediaType: "audiobook", Languages: []string{"eng"}}
+	if !reflect.DeepEqual(p, want) {
 		t.Fatalf("stored payload = %+v, want %+v", p, want)
 	}
 	if got.Username != "" || got.ResultBookID != nil {
@@ -346,6 +346,13 @@ func TestRequestsApprove_CreatesRowsOwnedByRequester(t *testing.T) {
 	// Once imported, the requester sees it fulfilled.
 	book.Status = models.BookStatusImported
 	if err := f.books.Update(ctx, book); err != nil {
+		t.Fatal(err)
+	}
+	variants, err := db.NewBookVariantRepo(f.database).ListByBook(ctx, book.ID)
+	if err != nil || len(variants) != 1 {
+		t.Fatalf("expected the requested variant: %+v %v", variants, err)
+	}
+	if err := db.NewBookVariantRepo(f.database).SetStatus(ctx, variants[0].ID, models.VariantImported); err != nil {
 		t.Fatal(err)
 	}
 	rec = httptest.NewRecorder()

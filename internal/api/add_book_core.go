@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -27,6 +28,9 @@ type addBookParams struct {
 	// book (#1397). Empty keeps the provider's media type, falling back to
 	// the default.media_type setting.
 	MediaType string
+	// Languages applies to each requested format. Nil means the legacy
+	// English default; an explicit empty selection is invalid.
+	Languages []string
 	// Monitored overrides the monitored flag step 3 sets on the book. Nil
 	// keeps the handler's behaviour, which always marks the book monitored.
 	Monitored *bool
@@ -176,6 +180,11 @@ func (h *AuthorHandler) refuseBookHeldByAnotherUser(ctx context.Context, foreign
 // monitored. It is AddBook without the HTTP layer; see addBookParams for
 // the inputs and the error types above for its refusals.
 func (h *AuthorHandler) addBookCore(ctx context.Context, req addBookParams) (addBookResult, error) {
+	var err error
+	req.Languages, err = models.NormalizeRequestLanguages(req.Languages)
+	if err != nil {
+		return addBookResult{}, err
+	}
 	if req.ForeignBookID == "" {
 		return addBookResult{}, errAddBookForeignBookIDRequired
 	}
@@ -220,7 +229,7 @@ func (h *AuthorHandler) addBookCore(ctx context.Context, req addBookParams) (add
 	if existing, err := h.books.GetByForeignIDVisibleTo(ctx, req.ForeignBookID, scopeID); err != nil {
 		return addBookResult{}, err
 	} else if existing != nil {
-		return addBookResult{}, &bookInLibraryError{Book: existing}
+		return h.extendOwnedBook(ctx, req, existing)
 	}
 	if err := h.refuseBookHeldByAnotherUser(ctx, req.ForeignBookID, scopeID); err != nil {
 		return addBookResult{}, err
@@ -257,7 +266,7 @@ func (h *AuthorHandler) addBookCore(ctx context.Context, req addBookParams) (add
 			if existing, err := h.books.GetByForeignIDVisibleTo(ctx, req.ForeignBookID, scopeID); err != nil {
 				return addBookResult{}, err
 			} else if existing != nil {
-				return addBookResult{}, &bookInLibraryError{Book: existing}
+				return h.extendOwnedBook(ctx, req, existing)
 			}
 			if err := h.refuseBookHeldByAnotherUser(ctx, req.ForeignBookID, scopeID); err != nil {
 				return addBookResult{}, err
@@ -592,6 +601,9 @@ func (h *AuthorHandler) addBookCore(ctx context.Context, req addBookParams) (add
 	if err := h.books.Update(ctx, book); err != nil {
 		return addBookResult{}, err
 	}
+	if err := h.ensureBookLanguages(ctx, book, req.MediaType, req.Languages); err != nil {
+		return addBookResult{}, err
+	}
 
 	// 3b. Say so when this add went past the strict media-type policy (#1759).
 	//
@@ -625,4 +637,94 @@ func (h *AuthorHandler) addBookCore(ctx context.Context, req addBookParams) (add
 		Author:        author,
 		AuthorCreated: authorWasJustCreated,
 	}, nil
+}
+
+func (h *AuthorHandler) ensureBookLanguages(ctx context.Context, book *models.Book, requestedMediaType string, languages []string) error {
+	if requestedMediaType == "" {
+		requestedMediaType = book.MediaType
+	}
+	formats := models.RequestedMediaTypes(requestedMediaType)
+	if len(formats) == 0 {
+		return fmt.Errorf("book %d has no requested media format", book.ID)
+	}
+	for _, format := range formats {
+		if _, err := h.variants.EnsureWanted(ctx, book.ID, format, languages); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// extendOwnedBook refuses a repeat selection or another owner's row before
+// touching either the book or its author. A missing variant of the caller's
+// own book uses the same book id and keeps every existing file association.
+func (h *AuthorHandler) extendOwnedBook(ctx context.Context, req addBookParams, book *models.Book) (addBookResult, error) {
+	userID := auth.UserIDFromContext(ctx)
+	if book.OwnerUserID != 0 && userID != 0 && book.OwnerUserID != userID {
+		if auth.UserRoleFromContext(ctx) == auth.RoleAdmin {
+			// An admin could already see this row in the library, so keep
+			// the existing conflict with its id. Requester approvals run as
+			// requesters and never disclose another owner's book here.
+			return addBookResult{}, &bookInLibraryError{Book: book}
+		}
+		return addBookResult{}, errAddBookHeldByAnotherUser
+	}
+	if userID == 0 || book.OwnerUserID != userID {
+		return addBookResult{}, &bookInLibraryError{Book: book}
+	}
+	mediaType := book.MediaType
+	if mediaType == "" {
+		mediaType = req.MediaType
+	} else if req.MediaType != "" && req.MediaType != mediaType {
+		mediaType = models.MediaTypeBoth
+	}
+	requestedMediaType := req.MediaType
+	if requestedMediaType == "" {
+		requestedMediaType = mediaType
+	}
+	formats := models.RequestedMediaTypes(requestedMediaType)
+	if len(formats) == 0 {
+		return addBookResult{}, errAddBookInvalidMediaType
+	}
+	variants, err := h.variants.ListByBook(ctx, book.ID)
+	if err != nil {
+		return addBookResult{}, err
+	}
+	have := make(map[string]bool, len(variants))
+	for _, variant := range variants {
+		have[variant.MediaType+"/"+variant.Language] = true
+	}
+	missing := false
+	for _, format := range formats {
+		for _, language := range req.Languages {
+			if !have[format+"/"+language] {
+				missing = true
+			}
+		}
+	}
+	if !missing {
+		return addBookResult{}, &bookInLibraryError{Book: book}
+	}
+	book.Monitored = true
+	if req.Monitored != nil {
+		book.Monitored = *req.Monitored
+	}
+	if book.MediaType != mediaType {
+		book.MediaType = mediaType
+		reevaluateBookStatus(book)
+	}
+	if err := h.books.Update(ctx, book); err != nil {
+		return addBookResult{}, err
+	}
+	if err := h.ensureBookLanguages(ctx, book, req.MediaType, req.Languages); err != nil {
+		return addBookResult{}, err
+	}
+	author, err := h.authors.GetByID(ctx, book.AuthorID)
+	if err != nil || author == nil {
+		return addBookResult{}, fmt.Errorf("get author for book %d: %v", book.ID, err)
+	}
+	if req.SearchOnAdd && h.searcher != nil {
+		go h.searcher.SearchAndGrabBook(indexer.WithSearchOrigin(h.bgCtx(), indexer.OriginAdd), *book) // #nosec G118 -- intentional: search must outlive the request
+	}
+	return addBookResult{Book: book, Author: author}, nil
 }

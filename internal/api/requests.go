@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,11 +65,12 @@ type requestMetadata interface {
 // the kind, the foreign id and the media type. Approval revalidates it against
 // the row before use.
 type requestPayload struct {
-	Kind            string `json:"kind"`
-	ForeignID       string `json:"foreignId"`
-	ForeignAuthorID string `json:"foreignAuthorId,omitempty"`
-	AuthorName      string `json:"authorName,omitempty"`
-	MediaType       string `json:"mediaType,omitempty"`
+	Kind            string   `json:"kind"`
+	ForeignID       string   `json:"foreignId"`
+	ForeignAuthorID string   `json:"foreignAuthorId,omitempty"`
+	AuthorName      string   `json:"authorName,omitempty"`
+	MediaType       string   `json:"mediaType,omitempty"`
+	Languages       []string `json:"languages,omitempty"`
 }
 
 // RequestHandler serves /requests: a requester's own requests and the read
@@ -76,6 +78,7 @@ type requestPayload struct {
 type RequestHandler struct {
 	requests *db.RequestRepo
 	books    *db.BookRepo
+	variants *db.BookVariantRepo
 	authors  *db.AuthorRepo
 	settings *db.SettingsRepo
 	meta     requestMetadata
@@ -278,7 +281,7 @@ func (h *RequestHandler) notifyCreated(ctx context.Context, req models.LibraryRe
 // reads per-account auto approval from.
 func NewRequestHandler(requests *db.RequestRepo, books *db.BookRepo, authors *db.AuthorRepo, settings *db.SettingsRepo, users *db.UserRepo, meta requestMetadata, adder requestAdder) *RequestHandler {
 	return &RequestHandler{
-		requests: requests, books: books, authors: authors, settings: settings, users: users, meta: meta, adder: adder,
+		requests: requests, books: books, variants: books.VariantRepo(), authors: authors, settings: settings, users: users, meta: meta, adder: adder,
 		providerLimit: auth.DefaultRequesterProviderLimiter(),
 		notified:      newRecentKeys(requestNotifyWindow, requestNotifyMaxKeys),
 		ownerNotifies: newOwnerBudget(requestNotifyPerOwner, requestNotifyWindow, requestNotifyMaxKeys),
@@ -292,6 +295,7 @@ type requestResponse struct {
 	Kind          string     `json:"kind"`
 	ForeignID     string     `json:"foreignId"`
 	MediaType     string     `json:"mediaType"`
+	Languages     []string   `json:"languages,omitempty"`
 	Title         string     `json:"title"`
 	AuthorName    string     `json:"authorName"`
 	Status        string     `json:"status"`
@@ -341,10 +345,13 @@ func toRequestResponse(req models.LibraryRequest, admin bool) requestResponse {
 		CreatedAt:     req.CreatedAt,
 		DecidedAt:     req.DecidedAt,
 	}
+	if req.Kind == models.RequestKindBook {
+		out.Languages = req.Languages
+	}
 	if req.Status == models.RequestStatusApproved {
 		switch req.Kind {
 		case models.RequestKindBook:
-			out.Fulfilled = req.BookStatus == models.BookStatusImported
+			out.Fulfilled = req.BookFulfilled
 		case models.RequestKindAuthor:
 			out.BooksTotal, out.BooksImported = req.AuthorBooks, req.AuthorBooksImported
 			out.Fulfilled = req.AuthorBooksImported > 0
@@ -455,6 +462,8 @@ func (h *RequestHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Kind      string `json:"kind"`
 		ForeignID string `json:"foreignId"`
 		MediaType string `json:"mediaType"`
+		// Raw bytes preserve the distinction between omission and JSON null.
+		Languages json.RawMessage `json:"languages"`
 		// ForUser is kept raw so that its presence is what counts: a
 		// non-admin sending it is refused whatever its value, null included.
 		ForUser json.RawMessage `json:"forUser"`
@@ -512,6 +521,29 @@ func (h *RequestHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "mediaType must be ebook, audiobook, both or empty.")
 		return
 	}
+	if body.Kind != models.RequestKindBook && body.Languages != nil {
+		writeErr(w, http.StatusBadRequest, "author requests do not take languages")
+		return
+	}
+	var languages []string
+	if body.Kind == models.RequestKindBook {
+		if bytes.Equal(bytes.TrimSpace(body.Languages), []byte("null")) {
+			writeErr(w, http.StatusBadRequest, "languages cannot be null")
+			return
+		}
+		if body.Languages != nil {
+			if err := json.Unmarshal(body.Languages, &languages); err != nil {
+				writeErr(w, http.StatusBadRequest, "invalid languages")
+				return
+			}
+		}
+		var err error
+		languages, err = models.NormalizeRequestLanguages(languages)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 
 	existing, err := h.requests.GetForOwner(ctx, owner, body.Kind, body.ForeignID)
 	if err != nil {
@@ -521,7 +553,27 @@ func (h *RequestHandler) Create(w http.ResponseWriter, r *http.Request) {
 	reopen := false
 	if existing != nil {
 		switch existing.Status {
-		case models.RequestStatusPending, models.RequestStatusApproving:
+		case models.RequestStatusPending:
+			if body.Kind == models.RequestKindBook {
+				if msg, err := h.alreadyInLibrary(ctx, body.Kind, body.ForeignID, owner, body.MediaType, languages); err != nil {
+					writeServerError(w, r, err)
+					return
+				} else if msg != "" {
+					writeErr(w, http.StatusConflict, msg)
+					return
+				}
+				merged, err := h.requests.MergePending(ctx, existing.ID, owner, body.MediaType, languages)
+				if err == nil {
+					h.writeCreated(ctx, w, *merged, owner)
+					return
+				}
+				if !errors.Is(err, db.ErrRequestExists) && !errors.Is(err, db.ErrRequestNotPending) {
+					writeServerError(w, r, err)
+					return
+				}
+			}
+			fallthrough
+		case models.RequestStatusApproving:
 			writeErr(w, http.StatusConflict, requestSentence(forOther,
 				"You have already requested this. It is waiting for an admin.",
 				"This user has already requested this. It is waiting for an admin."))
@@ -536,7 +588,7 @@ func (h *RequestHandler) Create(w http.ResponseWriter, r *http.Request) {
 		// left the library; the in library check below answers otherwise.
 		reopen = true
 	}
-	if msg, err := h.alreadyInLibrary(ctx, body.Kind, body.ForeignID); err != nil {
+	if msg, err := h.alreadyInLibrary(ctx, body.Kind, body.ForeignID, owner, body.MediaType, languages); err != nil {
 		writeServerError(w, r, err)
 		return
 	} else if msg != "" {
@@ -560,7 +612,7 @@ func (h *RequestHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req, status, msg := h.buildRequest(ctx, owner, body.Kind, body.ForeignID, body.MediaType)
+	req, status, msg := h.buildRequest(ctx, owner, body.Kind, body.ForeignID, body.MediaType, languages)
 	if req == nil {
 		writeErr(w, status, msg)
 		return
@@ -569,7 +621,7 @@ func (h *RequestHandler) Create(w http.ResponseWriter, r *http.Request) {
 	// The provider may answer with a canonical record whose id differs from
 	// the one asked for, and that record may be in the library already.
 	if req.resolvedID != "" && req.resolvedID != body.ForeignID {
-		if msg, err := h.alreadyInLibrary(ctx, req.Kind, req.resolvedID); err != nil {
+		if msg, err := h.alreadyInLibrary(ctx, req.Kind, req.resolvedID, owner, req.MediaType, req.Languages); err != nil {
 			writeServerError(w, r, err)
 			return
 		} else if msg != "" {
@@ -579,7 +631,7 @@ func (h *RequestHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if reopen {
-		if err := h.requests.Reopen(ctx, existing.ID, owner, req.MediaType, req.PayloadJSON, createdVia, createdBy, limit); err != nil {
+		if err := h.requests.Reopen(ctx, existing.ID, owner, req.MediaType, req.PayloadJSON, createdVia, createdBy, limit, req.Languages); err != nil {
 			if errors.Is(err, db.ErrRequestCapReached) {
 				capReached()
 				return
@@ -605,6 +657,19 @@ func (h *RequestHandler) Create(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, db.ErrRequestExists) {
+			if req.Kind == models.RequestKindBook {
+				merged, mergeErr := h.requests.GetForOwner(ctx, owner, req.Kind, req.ForeignID)
+				if mergeErr == nil && merged != nil && merged.Status == models.RequestStatusPending {
+					if merged, mergeErr = h.requests.MergePending(ctx, merged.ID, owner, req.MediaType, req.Languages); mergeErr == nil {
+						h.writeCreated(ctx, w, *merged, owner)
+						return
+					}
+				}
+				if mergeErr != nil && !errors.Is(mergeErr, db.ErrRequestExists) && !errors.Is(mergeErr, db.ErrRequestNotPending) {
+					writeServerError(w, r, mergeErr)
+					return
+				}
+			}
 			writeErr(w, http.StatusConflict, requestSentence(forOther, "You have already requested this.", "This user has already requested this."))
 			return
 		}
@@ -733,7 +798,7 @@ type builtRequest struct {
 
 // buildRequest looks the item up at the provider and builds the row and its
 // payload. On failure it returns nil with the status and sentence to answer.
-func (h *RequestHandler) buildRequest(ctx context.Context, owner int64, kind, foreignID, mediaType string) (*builtRequest, int, string) {
+func (h *RequestHandler) buildRequest(ctx context.Context, owner int64, kind, foreignID, mediaType string, languages []string) (*builtRequest, int, string) {
 	if h.meta == nil {
 		return nil, http.StatusServiceUnavailable, "Metadata lookups are not available right now."
 	}
@@ -746,6 +811,8 @@ func (h *RequestHandler) buildRequest(ctx context.Context, owner int64, kind, fo
 
 	switch kind {
 	case models.RequestKindBook:
+		out.Languages = languages
+		out.payload.Languages = languages
 		book, err := h.meta.GetBook(ctx, foreignID)
 		if err != nil {
 			slog.Warn("requests: book lookup failed", "error", err)
@@ -793,7 +860,7 @@ func (h *RequestHandler) buildRequest(ctx context.Context, owner int64, kind, fo
 // the library, or "". The check is global, not scoped to the requester:
 // books.foreign_id is unique across users, so an item another user holds
 // cannot be added again either.
-func (h *RequestHandler) alreadyInLibrary(ctx context.Context, kind, foreignID string) (string, error) {
+func (h *RequestHandler) alreadyInLibrary(ctx context.Context, kind, foreignID string, owner int64, mediaType string, languages []string) (string, error) {
 	switch kind {
 	case models.RequestKindBook:
 		b, err := h.books.GetByForeignID(ctx, foreignID)
@@ -801,6 +868,34 @@ func (h *RequestHandler) alreadyInLibrary(ctx context.Context, kind, foreignID s
 			return "", err
 		}
 		if b != nil {
+			// An unowned legacy row is not a requester's book to extend. Never
+			// disclose who owns a different user's row.
+			if b.OwnerUserID == 0 || b.OwnerUserID != owner {
+				return "This book is already in the library.", nil
+			}
+			requested := mediaType
+			if requested == "" {
+				requested = b.MediaType
+			}
+			formats := models.RequestedMediaTypes(requested)
+			if len(formats) == 0 {
+				return "This book is already in the library.", nil
+			}
+			variants, err := h.variants.ListByBook(ctx, b.ID)
+			if err != nil {
+				return "", err
+			}
+			have := make(map[string]bool, len(variants))
+			for _, v := range variants {
+				have[v.MediaType+"/"+v.Language] = true
+			}
+			for _, format := range formats {
+				for _, language := range languages {
+					if !have[format+"/"+language] {
+						return "", nil
+					}
+				}
+			}
 			return "This book is already in the library.", nil
 		}
 	case models.RequestKindAuthor:
@@ -1012,7 +1107,11 @@ func (h *RequestHandler) runClaimedApproval(ctx context.Context, req *models.Lib
 		}
 		return nil, status, msg, err
 	}
-	if err := h.requests.Complete(ctx, req.ID, req.ClaimToken, bookID, authorID); err != nil {
+	var approvedMedia []string
+	if body.MediaType != nil {
+		approvedMedia = []string{*body.MediaType}
+	}
+	if err := h.requests.Complete(ctx, req.ID, req.ClaimToken, bookID, authorID, approvedMedia...); err != nil {
 		if errors.Is(err, db.ErrRequestNotPending) {
 			// The claim was lost despite renewal (the database was
 			// unreachable for longer than the TTL). The add has happened;
@@ -1068,12 +1167,33 @@ func (h *RequestHandler) renewClaim(id int64, token string) (stop func()) {
 // created ids, or a status and sentence for a refusal, or an error.
 func (h *RequestHandler) runApproval(ctx context.Context, req *models.LibraryRequest, body approveBody) (bookID, authorID *int64, status int, msg string, err error) {
 	var p requestPayload
-	if jerr := json.Unmarshal([]byte(req.PayloadJSON), &p); jerr != nil ||
-		p.Kind != req.Kind || p.ForeignID != req.ForeignID || !validForeignID(p.ForeignID) ||
-		(p.ForeignAuthorID != "" && !validForeignID(p.ForeignAuthorID)) || !validRequestMediaType(p.MediaType) {
+	invalidPayload := func() (*int64, *int64, int, string, error) {
 		return nil, nil, http.StatusUnprocessableEntity, "This request's stored details are not valid. Decline it and ask for it again.", nil
 	}
-	if inLib, lerr := h.alreadyInLibrary(ctx, p.Kind, p.ForeignID); lerr != nil {
+	if jerr := json.Unmarshal([]byte(req.PayloadJSON), &p); jerr != nil ||
+		p.Kind != req.Kind || p.ForeignID != req.ForeignID || !validForeignID(p.ForeignID) ||
+		(p.ForeignAuthorID != "" && !validForeignID(p.ForeignAuthorID)) || !validRequestMediaType(p.MediaType) || p.MediaType != req.MediaType {
+		return invalidPayload()
+	}
+	if p.Kind == models.RequestKindBook {
+		if p.Languages == nil {
+			// Payloads written before language variants have no field. Migration
+			// 115 defaults their row to English, but never claims an old file
+			// is an English variant.
+			p.Languages = []string{"eng"}
+		}
+		canonical, err := models.NormalizeRequestLanguages(p.Languages)
+		if err != nil || !slices.Equal(canonical, p.Languages) || !slices.Equal(canonical, req.Languages) {
+			return invalidPayload()
+		}
+	} else if p.Languages != nil {
+		return invalidPayload()
+	}
+	mediaType := p.MediaType
+	if body.MediaType != nil {
+		mediaType = *body.MediaType
+	}
+	if inLib, lerr := h.alreadyInLibrary(ctx, p.Kind, p.ForeignID, req.OwnerUserID, mediaType, p.Languages); lerr != nil {
 		return nil, nil, 0, "", lerr
 	} else if inLib != "" {
 		return nil, nil, http.StatusConflict, inLib, nil
@@ -1082,10 +1202,6 @@ func (h *RequestHandler) runApproval(ctx context.Context, req *models.LibraryReq
 		return nil, nil, http.StatusServiceUnavailable, "Adding is not available right now.", nil
 	}
 
-	mediaType := p.MediaType
-	if body.MediaType != nil {
-		mediaType = *body.MediaType
-	}
 	searchOnAdd := body.SearchOnAdd != nil && *body.SearchOnAdd
 
 	// The requester owns what the approval creates. Their role goes with
@@ -1101,6 +1217,7 @@ func (h *RequestHandler) runApproval(ctx context.Context, req *models.LibraryReq
 			AuthorName:      p.AuthorName,
 			SearchOnAdd:     searchOnAdd,
 			MediaType:       mediaType,
+			Languages:       req.Languages,
 		})
 		if aerr != nil {
 			status, msg, err := approvalErrorResponse(aerr)
