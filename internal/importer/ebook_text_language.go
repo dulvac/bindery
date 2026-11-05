@@ -20,12 +20,13 @@ import (
 )
 
 const (
-	maxTextZIPEntries   = 2000
-	maxTextChapterBytes = 256 << 10
-	maxTextTotalBytes   = 2 << 20
-	maxTextChapters     = 8
-	minTextChapterRunes = 1200
-	minTextConfidence   = 0.85
+	maxTextZIPEntries        = 2000
+	maxTextZIPDirectoryBytes = 8 << 20
+	maxTextChapterBytes      = 256 << 10
+	maxTextTotalBytes        = 2 << 20
+	maxTextChapters          = 8
+	minTextChapterRunes      = 1200
+	minTextConfidence        = 0.85
 )
 
 // The detector compares against other Latin-script languages, not merely the
@@ -74,7 +75,8 @@ func DetectEbookTextLanguage(filename string) (language string, confident bool, 
 			Properties string `xml:"properties,attr"`
 		} `xml:"manifest>item"`
 		Spine []struct {
-			IDRef string `xml:"idref,attr"`
+			IDRef  string `xml:"idref,attr"`
+			Linear string `xml:"linear,attr"`
 		} `xml:"spine>itemref"`
 	}
 	parseErr := xml.NewDecoder(r).Decode(&pkg)
@@ -103,14 +105,19 @@ func DetectEbookTextLanguage(filename string) (language string, confident bool, 
 
 	var sampled, qualified, bytesRead int
 	var agreed string
+	sampledPaths := make(map[string]bool)
 	for _, ref := range pkg.Spine {
+		if strings.EqualFold(strings.TrimSpace(ref.Linear), "no") {
+			continue
+		}
 		chapterPath, eligible := manifest[ref.IDRef]
-		if !eligible {
+		if !eligible || sampledPaths[chapterPath] {
 			continue
 		}
 		if sampled == maxTextChapters {
 			break
 		}
+		sampledPaths[chapterPath] = true
 		sampled++
 		chapter := findZipFile(&zr.Reader, chapterPath)
 		if chapter == nil {
@@ -191,6 +198,11 @@ func checkTextZIPDirectory(filename string) error {
 		return fmt.Errorf("ebook language: zip exceeds %d entries", maxTextZIPEntries)
 	}
 	dirSize := binary.LittleEndian.Uint32(record[12:16])
+	// Entries can each carry long names, extras, and comments. Cap the
+	// directory bytes before archive/zip allocates for its records.
+	if dirSize > maxTextZIPDirectoryBytes {
+		return fmt.Errorf("ebook language: zip directory exceeds %d bytes", maxTextZIPDirectoryBytes)
+	}
 	dirOffset := binary.LittleEndian.Uint32(record[16:20])
 	endOffset := size - int64(len(tail)) + int64(end)
 	if binary.LittleEndian.Uint16(record[4:6]) != 0 || binary.LittleEndian.Uint16(record[6:8]) != 0 ||

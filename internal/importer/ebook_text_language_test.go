@@ -3,6 +3,7 @@ package importer
 import (
 	"archive/zip"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -59,6 +60,43 @@ func TestDetectEbookTextLanguage_ShortChaptersAndFrontMatterDoNotQualify(t *test
 	}
 }
 
+func TestDetectEbookTextLanguage_NonLinearAuxiliaryPagesDoNotQualify(t *testing.T) {
+	// Two long page1/page2 files marked non-linear are not interior chapters.
+	path := rewriteLanguageEPUB(t, "english.epub", func(entries map[string][]byte) {
+		opf := string(entries["OEBPS/content.opf"])
+		for i := 1; i <= 2; i++ {
+			chapter := fmt.Sprintf("chapter%d.xhtml", i)
+			page := fmt.Sprintf("page%d.xhtml", i)
+			entries["OEBPS/"+page] = entries["OEBPS/"+chapter]
+			delete(entries, "OEBPS/"+chapter)
+			opf = strings.Replace(opf, "href='"+chapter+"'", "href='"+page+"'", 1)
+			ref := fmt.Sprintf("<itemref idref='chapter%d'/>", i)
+			opf = strings.Replace(opf, ref, fmt.Sprintf("<itemref idref='chapter%d' linear='no'/>", i), 1)
+		}
+		entries["OEBPS/content.opf"] = []byte(opf)
+	})
+	assertUnknownLanguage(t, path)
+}
+
+func TestDetectEbookTextLanguage_NonLinearAuxiliaryPagesDoNotOverrideChapters(t *testing.T) {
+	// French auxiliary pages must not contradict two English linear chapters.
+	path := rewriteLanguageEPUB(t, "english.epub", func(entries map[string][]byte) {
+		opf := string(entries["OEBPS/content.opf"])
+		for i := 1; i <= 2; i++ {
+			page := fmt.Sprintf("page%d.xhtml", i)
+			id := fmt.Sprintf("page%d", i)
+			entries["OEBPS/"+page] = readFixtureChapter(t, "french.epub", fmt.Sprintf("chapter%d.xhtml", i))
+			opf = strings.Replace(opf, "</manifest>", fmt.Sprintf("<item id='%s' href='%s' media-type='application/xhtml+xml'/></manifest>", id, page), 1)
+			opf = strings.Replace(opf, "</spine>", fmt.Sprintf("<itemref idref='%s' linear='no'/></spine>", id), 1)
+		}
+		entries["OEBPS/content.opf"] = []byte(opf)
+	})
+	language, confident, err := DetectEbookTextLanguage(path)
+	if err != nil || !confident || language != "eng" {
+		t.Fatalf("got (%q, %t, %v); want (eng, true, nil)", language, confident, err)
+	}
+}
+
 func TestDetectEbookTextLanguage_LongMarkupIsNotPlainText(t *testing.T) {
 	// Catches counting XHTML attribute or tag runes toward the 1200-rune
 	// minimum when each chapter has only a few visible words.
@@ -110,6 +148,64 @@ func TestDetectEbookTextLanguage_TooManyZIPEntriesNeverClaimsLanguage(t *testing
 	assertUnknownLanguage(t, path)
 }
 
+func TestDetectEbookTextLanguage_LargeZIPDirectoryIsRejectedBeforeParsing(t *testing.T) {
+	// Fewer than 2000 records can still consume megabytes of names and comments.
+	source, err := zip.OpenReader(filepath.Join("testdata", "english.epub"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	path := filepath.Join(t.TempDir(), "large-directory.epub")
+	out, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(out)
+	for _, entry := range source.File {
+		if err := zw.Copy(entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	comment := strings.Repeat("x", 60_000)
+	for i := 0; i < 150; i++ {
+		_, err := zw.CreateHeader(&zip.FileHeader{Name: fmt.Sprintf("noise/%03d.txt", i), Comment: comment, Method: zip.Store})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := out.Close(); err != nil {
+		t.Fatal(err)
+	}
+	language, confident, err := DetectEbookTextLanguage(path)
+	if language != "" || confident || err == nil || !strings.Contains(err.Error(), "zip directory exceeds") {
+		t.Fatalf("got (%q, %t, %v); want a preflight directory-byte-limit error", language, confident, err)
+	}
+}
+
+func TestDetectEbookTextLanguage_ForgedLargeZIPDirectoryIsRejectedBeforeParsing(t *testing.T) {
+	// Reject a claimed huge directory even when the archive cannot hold it.
+	path := rewriteLanguageEPUB(t, "english.epub", func(map[string][]byte) {})
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eocd := strings.LastIndex(string(data), "PK\x05\x06")
+	if eocd < 0 {
+		t.Fatal("fixture ZIP has no end-of-central-directory record")
+	}
+	binary.LittleEndian.PutUint32(data[eocd+12:eocd+16], 9<<20)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	language, confident, err := DetectEbookTextLanguage(path)
+	if language != "" || confident || err == nil || !strings.Contains(err.Error(), "zip directory exceeds") {
+		t.Fatalf("got (%q, %t, %v); want a preflight directory-byte-limit error", language, confident, err)
+	}
+}
+
 func TestDetectEbookTextLanguage_LyingZIPEntryCountIsRejectedBeforeParsing(t *testing.T) {
 	// archive/zip loads every central-directory record even if the EOCD count
 	// claims otherwise. Reject the actual 2001+ records before it allocates.
@@ -135,6 +231,34 @@ func TestDetectEbookTextLanguage_LyingZIPEntryCountIsRejectedBeforeParsing(t *te
 	if language != "" || confident || err == nil || !strings.Contains(err.Error(), "exceeds 2000 entries") {
 		t.Fatalf("got (%q, %t, %v); want a preflight entry-limit error", language, confident, err)
 	}
+}
+
+func TestDetectEbookTextLanguage_RepeatedSpineIDRefIsOneChapter(t *testing.T) {
+	// Repeating an idref must not turn one long XHTML file into two chapters.
+	path := rewriteLanguageEPUB(t, "english.epub", func(entries map[string][]byte) {
+		opf := string(entries["OEBPS/content.opf"])
+		entries["OEBPS/content.opf"] = []byte(strings.Replace(opf, "<itemref idref='chapter2'/>", "<itemref idref='chapter1'/>", 1))
+	})
+	assertUnknownLanguage(t, path)
+}
+
+func TestDetectEbookTextLanguage_ManifestAliasesAreOneChapter(t *testing.T) {
+	// Separate manifest IDs that resolve to the same file are not independent evidence.
+	path := rewriteLanguageEPUB(t, "english.epub", func(entries map[string][]byte) {
+		opf := string(entries["OEBPS/content.opf"])
+		entries["OEBPS/content.opf"] = []byte(strings.Replace(opf, "href='chapter2.xhtml'", "href='chapter1.xhtml'", 1))
+	})
+	assertUnknownLanguage(t, path)
+}
+
+func TestDetectEbookTextLanguage_RepeatedRefsDoNotHideLaterDisagreement(t *testing.T) {
+	// Repeated paths cannot consume the eight distinct-chapter sample slots.
+	path := rewriteLanguageEPUB(t, "english.epub", func(entries map[string][]byte) {
+		entries["OEBPS/chapter2.xhtml"] = readFixtureChapter(t, "romanian.epub", "chapter1.xhtml")
+		opf := string(entries["OEBPS/content.opf"])
+		entries["OEBPS/content.opf"] = []byte(strings.Replace(opf, "<itemref idref='chapter2'/>", strings.Repeat("<itemref idref='chapter1'/>", 8)+"<itemref idref='chapter2'/>", 1))
+	})
+	assertUnknownLanguage(t, path)
 }
 
 func TestDetectEbookTextLanguage_LaterDisagreeingChapterIsUnknown(t *testing.T) {
