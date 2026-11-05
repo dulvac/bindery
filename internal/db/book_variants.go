@@ -91,7 +91,8 @@ func reconcileVariantAfterDetach(ctx context.Context, tx *sql.Tx, variantID sql.
 	_, err := tx.ExecContext(ctx, `UPDATE book_variants SET status = CASE
 		WHEN EXISTS (SELECT 1 FROM book_files f
 			WHERE f.variant_id = book_variants.id AND f.book_id = book_variants.book_id
-			AND f.format = book_variants.media_type AND f.verification = 'verified') THEN 'imported'
+			AND f.format = book_variants.media_type AND f.language = book_variants.language
+			AND f.verification = 'verified') THEN 'imported'
 		WHEN EXISTS (SELECT 1 FROM downloads d
 			WHERE d.variant_id = book_variants.id AND d.book_id = book_variants.book_id
 			AND d.status IN (?, ?, ?, ?, ?, ?, ?, ?)) THEN 'downloading'

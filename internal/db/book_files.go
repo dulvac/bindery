@@ -190,8 +190,9 @@ func (r *BookFileRepo) Add(ctx context.Context, bookID int64, format, path strin
 }
 
 // SetVariant records a file's checked language claim. A non-nil variant must
-// belong to the file's current book and format; replacing a claim reconciles
-// the former variant in the same transaction.
+// belong to the file's current book and format, and a verified claim must
+// match its language. Replacing or un-verifying a claim reconciles the former
+// variant in the same transaction.
 func (r *BookFileRepo) SetVariant(ctx context.Context, path string, variantID *int64, language, verification string) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -200,7 +201,8 @@ func (r *BookFileRepo) SetVariant(ctx context.Context, path string, variantID *i
 	defer func() { _ = tx.Rollback() }()
 
 	var oldVariant sql.NullInt64
-	if err := tx.QueryRowContext(ctx, `SELECT variant_id FROM book_files WHERE path = ?`, path).Scan(&oldVariant); err != nil {
+	var oldVerification string
+	if err := tx.QueryRowContext(ctx, `SELECT variant_id, verification FROM book_files WHERE path = ?`, path).Scan(&oldVariant, &oldVerification); err != nil {
 		return fmt.Errorf("book_files set variant lookup: %w", err)
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE book_files
@@ -208,7 +210,8 @@ func (r *BookFileRepo) SetVariant(ctx context.Context, path string, variantID *i
 		WHERE path = ? AND (? IS NULL OR EXISTS (
 			SELECT 1 FROM book_variants v
 			WHERE v.id = ? AND v.book_id = book_files.book_id AND v.media_type = book_files.format
-		))`, variantID, language, verification, path, variantID, variantID)
+			AND (? != 'verified' OR v.language = ?)
+		))`, variantID, language, verification, path, variantID, variantID, verification, language)
 	if err != nil {
 		return fmt.Errorf("book_files set variant: %w", err)
 	}
@@ -217,9 +220,9 @@ func (r *BookFileRepo) SetVariant(ctx context.Context, path string, variantID *i
 		return fmt.Errorf("book_files set variant rows: %w", err)
 	}
 	if count == 0 {
-		return fmt.Errorf("book_files set variant: path %q missing or variant does not match its book and format", path)
+		return fmt.Errorf("book_files set variant: path %q missing or variant does not match its book, format, or verified language", path)
 	}
-	if oldVariant.Valid && (variantID == nil || oldVariant.Int64 != *variantID) {
+	if oldVariant.Valid && (variantID == nil || oldVariant.Int64 != *variantID || oldVerification == "verified" && verification != "verified") {
 		if err := reconcileVariantAfterDetach(ctx, tx, oldVariant); err != nil {
 			return err
 		}

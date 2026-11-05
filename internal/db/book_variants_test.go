@@ -521,6 +521,107 @@ func TestDownloadRepoRetryFailedRejectsVariantFromAnotherBook(t *testing.T) {
 	}
 }
 
+// A verified file in another language cannot satisfy a variant, whether
+// the file has no claim yet or is already verified for that variant.
+func TestBookFileRepoSetVariantRejectsVerifiedLanguageMismatch(t *testing.T) {
+	for _, claimed := range []bool{false, true} {
+		name := "unclaimed"
+		if claimed {
+			name = "already verified"
+		}
+		t.Run(name, func(t *testing.T) {
+			database, _, book := openTestDB(t)
+			ctx := context.Background()
+			variants := NewBookVariantRepo(database)
+			rows, err := variants.EnsureWanted(ctx, book.ID, "ebook", []string{"rum"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := rows[0].ID
+			files := NewBookFileRepo(database)
+			const path = "/lib/language-mismatch.epub"
+			if err := files.Add(ctx, book.ID, "ebook", path); err != nil {
+				t.Fatal(err)
+			}
+			wantLanguage, wantVerification, wantStatus := "", "unverified", models.VariantWanted
+			if claimed {
+				if err := files.SetVariant(ctx, path, &id, "rum", "verified"); err != nil {
+					t.Fatal(err)
+				}
+				if err := variants.SetStatus(ctx, id, models.VariantImported); err != nil {
+					t.Fatal(err)
+				}
+				wantLanguage, wantVerification, wantStatus = "rum", "verified", models.VariantImported
+			}
+			if err := files.SetVariant(ctx, path, &id, "eng", "verified"); err == nil {
+				t.Fatal("SetVariant accepted English verification for a Romanian variant")
+			}
+			file, err := files.GetByPath(ctx, path)
+			if err != nil || file == nil || file.Language != wantLanguage || file.Verification != wantVerification || (file.VariantID != nil) != claimed || (claimed && *file.VariantID != id) {
+				t.Fatalf("rejected claim changed file: %#v, %v", file, err)
+			}
+			got, err := variants.ListByBook(ctx, book.ID)
+			if err != nil || len(got) != 1 || got[0].Status != wantStatus {
+				t.Fatalf("rejected claim changed variant: %#v, %v; want %s", got, err, wantStatus)
+			}
+			wanted, err := variants.ListWanted(ctx)
+			wantCount := 1
+			if claimed {
+				wantCount = 0
+			}
+			if err != nil || len(wanted) != wantCount || (!claimed && wanted[0].ID != id) {
+				t.Fatalf("wanted after rejected claim = %#v, %v", wanted, err)
+			}
+		})
+	}
+}
+
+// If an older writer left a mismatched verified claim, removing the only
+// correctly verified file must not keep that variant marked imported.
+func TestVariantReconciliationIgnoresMismatchedVerifiedFile(t *testing.T) {
+	database, author, book := openTestDB(t)
+	ctx := context.Background()
+	other := &models.Book{ForeignID: "mismatch-new-owner", AuthorID: author.ID, Title: "Other", SortTitle: "Other", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted}
+	if err := NewBookRepo(database).Create(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+	variants := NewBookVariantRepo(database)
+	rows, err := variants.EnsureWanted(ctx, book.ID, "ebook", []string{"rum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := rows[0].ID
+	files := NewBookFileRepo(database)
+	const matching = "/lib/matching-rum.epub"
+	const mismatched = "/lib/mismatched-eng.epub"
+	for _, path := range []string{matching, mismatched} {
+		if err := files.Add(ctx, book.ID, "ebook", path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := files.SetVariant(ctx, matching, &id, "rum", "verified"); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a bad claim written before SetVariant checked language.
+	if _, err := database.ExecContext(ctx, `UPDATE book_files SET variant_id = ?, language = 'eng', verification = 'verified' WHERE path = ?`, id, mismatched); err != nil {
+		t.Fatal(err)
+	}
+	if err := variants.SetStatus(ctx, id, models.VariantImported); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := files.MoveToBook(ctx, other.ID, "ebook", matching); err != nil {
+		t.Fatal(err)
+	}
+	got, err := variants.ListByBook(ctx, book.ID)
+	if err != nil || len(got) != 1 || got[0].Status != models.VariantWanted {
+		t.Fatalf("variant with only mismatched verified file = %#v, %v; want wanted", got, err)
+	}
+	wanted, err := variants.ListWanted(ctx)
+	if err != nil || len(wanted) != 1 || wanted[0].ID != id {
+		t.Fatalf("wanted after removing matching file = %#v, %v", wanted, err)
+	}
+}
+
 // Attaching a language claim to a tracked file must match both its book and
 // its format. A rejected write leaves the file's metadata untouched.
 func TestBookFileRepoSetVariantRejectsWrongBookAndFormat(t *testing.T) {
@@ -793,6 +894,45 @@ func TestDownloadBookReassignmentKeepsOtherVariantClaims(t *testing.T) {
 				t.Fatalf("variant with remaining %s = %#v, %v; want %s", tc.name, got, err, tc.wantStatus)
 			}
 		})
+	}
+}
+
+// Losing verification on the only file must reopen the variant even when
+// the file keeps the same variant ID.
+func TestBookFileRepoSetVariantReopensUnverifiedClaim(t *testing.T) {
+	database, _, book := openTestDB(t)
+	ctx := context.Background()
+	variants := NewBookVariantRepo(database)
+	rows, err := variants.EnsureWanted(ctx, book.ID, "ebook", []string{"rum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := rows[0].ID
+	files := NewBookFileRepo(database)
+	const path = "/lib/lost-verification.epub"
+	if err := files.Add(ctx, book.ID, "ebook", path); err != nil {
+		t.Fatal(err)
+	}
+	if err := files.SetVariant(ctx, path, &id, "rum", "verified"); err != nil {
+		t.Fatal(err)
+	}
+	if err := variants.SetStatus(ctx, id, models.VariantImported); err != nil {
+		t.Fatal(err)
+	}
+	if err := files.SetVariant(ctx, path, &id, "rum", "unverified"); err != nil {
+		t.Fatal(err)
+	}
+	file, err := files.GetByPath(ctx, path)
+	if err != nil || file == nil || file.VariantID == nil || *file.VariantID != id || file.Language != "rum" || file.Verification != "unverified" {
+		t.Fatalf("file after losing verification = %#v, %v", file, err)
+	}
+	got, err := variants.ListByBook(ctx, book.ID)
+	if err != nil || len(got) != 1 || got[0].Status != models.VariantWanted {
+		t.Fatalf("variant after losing verification = %#v, %v; want wanted", got, err)
+	}
+	wanted, err := variants.ListWanted(ctx)
+	if err != nil || len(wanted) != 1 || wanted[0].ID != id {
+		t.Fatalf("wanted after losing verification = %#v, %v", wanted, err)
 	}
 }
 
