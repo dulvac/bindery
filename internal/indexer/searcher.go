@@ -732,7 +732,6 @@ func byCreditForTitle(toks []relTok, titleIdx, wantAuthorToks int, authorToks []
 	if limit > len(toks) {
 		limit = len(toks)
 	}
-	seenBy, matched := false, false
 	for i := titleIdx + 1; i < limit; i++ {
 		if toks[i].text != "by" {
 			continue
@@ -744,16 +743,7 @@ func byCreditForTitle(toks []relTok, titleIdx, wantAuthorToks int, authorToks []
 		if len(credit) == 0 {
 			continue
 		}
-		seenBy = true
-		if byCreditTokensMatchAuthor(credit, authorToks) {
-			matched = true
-		}
-	}
-	if matched {
-		return true, true
-	}
-	if seenBy {
-		return false, true
+		return byCreditTokensMatchAuthor(credit, authorToks), true
 	}
 	return true, false
 }
@@ -767,14 +757,26 @@ func leadingByCreditTokens(toks []relTok, want int) []string {
 		return nil
 	}
 	out := make([]string, 0, want)
+	skippedNonInitial := false
 	for _, tok := range toks {
 		if attributionStopToken(tok.text) || tok.text == "by" {
 			break
 		}
-		if len(out) > 0 && punctBefore(tok) {
-			break
+		if punctBefore(tok) {
+			if len(out) > 0 {
+				break
+			}
+			// "by" can be part of the title itself ("Stand by Me, ..."). If we
+			// skipped non-initial filler before this punctuation, the clause ended
+			// before any author-like token appeared, so this "by" is not a credit.
+			if skippedNonInitial {
+				break
+			}
 		}
 		if len(newznab.SigWords(tok.text)) == 0 {
+			if len(tok.text) != 1 {
+				skippedNonInitial = true
+			}
 			continue
 		}
 		out = append(out, tok.text)

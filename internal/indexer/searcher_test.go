@@ -1004,6 +1004,11 @@ func TestSingleWordAnchor(t *testing.T) {
 			release: "Dune by Brian Herbert - The Biography of Frank Herbert [ENG / EPUB]",
 			want:    false,
 		},
+		{
+			name:    "first by-credit is decisive when later by-credit matches",
+			release: "Dune by Brian Herbert - Essays by Frank Herbert [ENG / EPUB]",
+			want:    false,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
