@@ -99,9 +99,8 @@ func TestVariantImport_RejectedSourcesStayRejectedAcrossQbitRetries(t *testing.T
 	}
 }
 
-// A verified qBittorrent source remains in the client and can be retried
-// manually after Task 8 supplies private staging and safe final promotion.
-func TestVariantImport_ValidQbitSourceWaitsForTask8AcrossRetries(t *testing.T) {
+// A verified qBittorrent source imports without a client mutation.
+func TestVariantImport_ValidQbitSourceStaysSeedingAfterImport(t *testing.T) {
 	f := newVariantReviewFixture(t, "English catalogue label", "Sample Author", models.MediaTypeEbook, "eng")
 	file := variantEPUBSource(t, f.sources, "English catalogue label.epub", "english.epub")
 	const hash = "abcdef1234567890abcdef1234567890abcdef12"
@@ -129,21 +128,87 @@ func TestVariantImport_ValidQbitSourceWaitsForTask8AcrossRetries(t *testing.T) {
 	if _, err := f.database.ExecContext(f.ctx, `UPDATE downloads SET download_client_id=?, torrent_id=? WHERE id=?`, client.ID, hash, dl.ID); err != nil {
 		t.Fatal(err)
 	}
-	for attempt := 0; attempt < 2; attempt++ {
-		if attempt > 0 {
-			ok, found, err := f.downloads.ResetImportRetry(f.ctx, dl.ID)
-			if err != nil || !ok || !found {
-				t.Fatalf("manual retry not available: %t %t %v", ok, found, err)
-			}
-		}
-		f.scanner.checkQbittorrentDownloads(f.ctx, client)
-		f.assertPendingPlacement(t, dl)
-		if _, err := os.Stat(file); err != nil {
-			t.Fatalf("qBittorrent source removed: %v", err)
-		}
+	f.scanner.checkQbittorrentDownloads(f.ctx, client)
+	f.assertVariantPlaced(t, dl)
+	if _, err := os.Stat(file); err != nil {
+		t.Fatalf("qBittorrent source removed: %v", err)
 	}
 	if mutators != 0 {
 		t.Fatalf("qBittorrent mutator/unexpected calls: %d", mutators)
+	}
+}
+
+func TestVariantRetry_ReviewedVariantNeedsExactAdminOverrideOrWantedTransition(t *testing.T) {
+	for _, approve := range []bool{false, true} {
+		t.Run(map[bool]string{false: "no approval", true: "exact admin approval"}[approve], func(t *testing.T) {
+			f := newVariantReviewFixture(t, "English catalogue label", "Sample Author", models.MediaTypeEbook, "eng")
+			source := variantEPUBSource(t, f.sources, "English catalogue label.epub", "english.epub")
+			dl := f.addDownload(t, "English catalogue label [ENG / EPUB]")
+			if err := f.books.VariantRepo().SetStatus(f.ctx, f.variant.ID, models.VariantReview); err != nil {
+				t.Fatal(err)
+			}
+			if approve {
+				payload, _ := json.Marshal(map[string]any{"actorUserId": int64(42), "variantId": f.variant.ID, "downloadId": dl.ID, "reason": "owner approved this retry"})
+				if err := f.history.Create(f.ctx, &models.HistoryEvent{BookID: &f.book.ID, EventType: "variantLanguageOverride", Data: string(payload)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.importSource(t, dl, source)
+			if approve {
+				f.assertVariantPlaced(t, dl)
+			} else {
+				variantBlocked(t, f, dl, "in review")
+				f.assertLibraryFiles(t, 0)
+			}
+		})
+	}
+}
+
+func TestVariantRetry_TrackedLinkBeforeDownloadStatusIsIdempotent(t *testing.T) {
+	f := newVariantReviewFixture(t, "English catalogue label", "Sample Author", models.MediaTypeEbook, "eng")
+	source := variantEPUBSource(t, f.sources, "English catalogue label.epub", "english.epub")
+	dl := f.addDownload(t, "English catalogue label [ENG / EPUB]")
+	f.importSource(t, dl, source)
+	f.assertVariantPlaced(t, dl)
+	first := variantImportedFiles(t, f, 1)[0]
+	before, err := os.Lstat(first.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a crash after the book_file transaction but before the
+	// download's terminal transition is durable.
+	if _, err := f.database.ExecContext(f.ctx, `UPDATE downloads SET status='completed' WHERE id=?`, dl.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.importSource(t, dl, source)
+	variantImportedDownload(t, f, dl.ID)
+	rows := variantImportedFiles(t, f, 1)
+	after, err := os.Lstat(rows[0].Path)
+	if err != nil || rows[0].ID != first.ID || !os.SameFile(before, after) {
+		t.Fatalf("retry created or replaced tracked link: %+v %v", rows, err)
+	}
+}
+
+func TestVariantRetry_TrackedAudioFolderBeforeDownloadStatusIsIdempotent(t *testing.T) {
+	f := newVariantReviewFixture(t, "Dune", "Frank Herbert", models.MediaTypeAudiobook, "eng")
+	folder, files := variantAudioSources(t, f)
+	dl := f.addDownload(t, "Dune by Frank Herbert [ENG / M4B]")
+	f.scanner.tryImportInternal(withTorrentOwnFolder(f.ctx, true), dl, folder, "qbittorrent", "hash", "", nil, files)
+	f.assertVariantPlaced(t, dl)
+	first := variantImportedFiles(t, f, 1)[0]
+	before, err := os.Lstat(first.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.database.ExecContext(f.ctx, `UPDATE downloads SET status='completed' WHERE id=?`, dl.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.scanner.tryImportInternal(withTorrentOwnFolder(f.ctx, true), dl, folder, "qbittorrent", "hash", "", nil, files)
+	variantImportedDownload(t, f, dl.ID)
+	rows := variantImportedFiles(t, f, 1)
+	after, err := os.Lstat(rows[0].Path)
+	if err != nil || rows[0].ID != first.ID || !os.SameFile(before, after) {
+		t.Fatalf("retry created or replaced audio folder: %+v %v", rows, err)
 	}
 }
 
@@ -332,7 +397,7 @@ func TestVariantImport_RejectionWriteFailureLeavesNoLibraryLink(t *testing.T) {
 	}
 }
 
-func TestVariantImport_MixedFormatsSelectsEbookWithoutPublicLink(t *testing.T) {
+func TestVariantImport_MixedFormatsSelectsEbookWithoutAudioLink(t *testing.T) {
 	f := newVariantReviewFixture(t, "English catalogue label", "Sample Author", models.MediaTypeEbook, "eng")
 	epub := variantEPUBSource(t, f.sources, "English catalogue label.epub", "english.epub")
 	other := filepath.Join(f.sources, "bonus.m4b")
@@ -349,7 +414,7 @@ func TestVariantImport_MixedFormatsSelectsEbookWithoutPublicLink(t *testing.T) {
 		t.Fatalf("ebook selection included audiobook: %+v reviewed=%t reason=%q err=%v", selected, reviewed, reason, err)
 	}
 	f.scanner.tryImportInternal(f.ctx, dl, f.sources, "qbittorrent", "test-hash", models.MediaTypeEbook, nil, []string{epub, other})
-	f.assertPendingPlacement(t, dl)
+	f.assertVariantPlaced(t, dl)
 	for _, source := range []string{epub, other} {
 		if _, err := os.Stat(source); err != nil {
 			t.Fatalf("torrent source changed: %s: %v", source, err)
@@ -412,11 +477,12 @@ func TestVariantImport_DoesNotOverwriteExistingLibraryPath(t *testing.T) {
 	f.importSource(t, dl, source)
 	content, err := os.ReadFile(dest)
 	if err != nil || string(content) != string(sentinel) {
-		t.Fatalf("existing library file overwritten (length %d): %v", len(content), err)
+		t.Fatalf("existing legacy library file overwritten (length %d): %v", len(content), err)
 	}
-	rows, err := f.books.ListFiles(f.ctx, f.book.ID)
-	if err != nil || len(rows) != 0 {
-		t.Fatalf("overwritten or claimed existing path: %+v %v", rows, err)
+	variantImportedDownload(t, f, dl.ID)
+	rows := variantImportedFiles(t, f, 1)
+	if rows[0].Path == dest || !strings.Contains(rows[0].Path, " [eng].epub") {
+		t.Fatalf("variant took legacy filename: %+v", rows[0])
 	}
 	if _, err := os.Stat(source); err != nil {
 		t.Fatalf("torrent source changed: %v", err)

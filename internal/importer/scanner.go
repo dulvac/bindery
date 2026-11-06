@@ -1846,23 +1846,33 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 			s.failImport(ctx, dl, models.StateImportBlocked, reason)
 			return
 		}
-		if len(selected) == 0 {
-			s.failImport(ctx, dl, models.StateImportBlocked, "no eligible variant source; Task 8 cannot place this download")
+		if err := s.importTorrentVariant(importCtx, dl, book, author, detectedFormat, downloadPath, bookFiles, selected); err != nil {
+			s.failImport(ctx, dl, models.StateImportBlocked, fmt.Sprintf("variant placement refused: %v", err))
 			return
 		}
-		// The current placement paths publish links before they can prove
-		// ownership of the destination. A post-link mismatch rollback could
-		// unlink another writer's replacement. Task 8 owns private staging,
-		// atomic no-replace promotion and the verified book_file association.
-		// StateImportBlocked is visible and manually retryable; never claim an
-		// import or run client cleanup while those pieces are absent.
-		for _, source := range selected {
-			if source.verification != "verified" {
-				s.failImport(ctx, dl, models.StateImportBlocked, "variant language remains unverified; Task 8 must stage and promote this source before import")
-				return
+		variants, err := s.books.VariantRepo().ListByBook(ctx, book.ID)
+		if err != nil {
+			s.failImport(ctx, dl, models.StateImportBlocked, fmt.Sprintf("variant placed but status could not be checked: %v", err))
+			return
+		}
+		primaryImported := false
+		for _, v := range variants {
+			if dl.VariantID != nil && v.ID == *dl.VariantID && v.Status == models.VariantImported {
+				primaryImported = true
 			}
 		}
-		s.failImport(ctx, dl, models.StateImportBlocked, "variant evidence verified; Task 8 must stage and promote this source before import")
+		if !primaryImported {
+			s.failImport(ctx, dl, models.StateImportBlocked, "verified sibling placed but requested variant remains wanted; review its unverified file before retrying")
+			return
+		}
+		s.updateDownloadStatus(ctx, dl.ID, models.StateImported)
+		if detectedFormat == models.MediaTypeAudiobook {
+			s.pushToABS(ctx) // only after TrackVariant committed
+		}
+		s.createHistoryEvent(ctx, models.HistoryEventBookImported, dl.Title, dl.BookID, map[string]string{"format": detectedFormat})
+		s.notify(ctx, notifierEventBookImported, importedPayload(book, dl, detectedFormat, "", nil))
+		// A variant torrent is seeding. Never call cleanupFunc or change its
+		// source, even if a download client is configured to remove on import.
 		return
 	}
 

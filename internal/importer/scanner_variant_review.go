@@ -12,12 +12,14 @@ import (
 	"github.com/vavallee/bindery/internal/models"
 )
 
-// checkedVariantSource stays local to the importer: Task 8 owns persisted
-// book-file associations and language-bearing destinations.
+// checkedVariantSource carries each reviewed file's identity and language
+// evidence into private staging. It is never a claim based on the book title.
 type checkedVariantSource struct {
-	path         string
-	assessed     os.FileInfo
-	verification string
+	path             string
+	assessed         os.FileInfo
+	verification     string
+	detectedLanguage string
+	adminOverride    bool
 }
 
 // A successful hardlink must still identify the regular file whose evidence
@@ -37,8 +39,8 @@ func variantSourceChanged(phase, source string, cause error) error {
 
 // reviewVariantImport reads source evidence and persists review decisions
 // before placement. It never trusts a caller-supplied variant: the download
-// and selected variant are reloaded from the database. Task 8 will consume the
-// selected files for private staging; this task must not place them publicly.
+// and selected variant are reloaded from the database. The selected files
+// remain private until the placement code verifies and promotes them.
 func (s *Scanner) reviewVariantImport(ctx context.Context, dl *models.Download, book *models.Book, author *models.Author,
 	format, downloadPath string, files []string) ([]checkedVariantSource, bool, string, error) {
 	if s.books == nil || s.downloads == nil || s.history == nil || dl == nil || book == nil {
@@ -171,7 +173,7 @@ func (s *Scanner) reviewVariantImport(ctx context.Context, dl *models.Download, 
 			wrongWork = true
 			reason = e.Reason
 		}
-		candidate := checkedVariantSource{path: source, assessed: assessed, verification: "unverified"}
+		candidate := checkedVariantSource{path: source, assessed: assessed, verification: "unverified", adminOverride: override}
 		switch {
 		case e.WrongLanguage:
 			mismatched = append(mismatched, candidate)
@@ -180,6 +182,7 @@ func (s *Scanner) reviewVariantImport(ctx context.Context, dl *models.Download, 
 			}
 		case e.Verification == "verified" && e.DetectedLanguage == variant.Language:
 			candidate.verification = "verified"
+			candidate.detectedLanguage = e.DetectedLanguage
 			matching = append(matching, candidate)
 		default:
 			uncertain = append(uncertain, candidate)
@@ -228,7 +231,7 @@ func (s *Scanner) reviewVariantImport(ctx context.Context, dl *models.Download, 
 	}
 	// If one file is confidently the requested copy, an uncertain sibling
 	// cannot take its place or claim a second file slot. Without a verified
-	// match, the selected source remains unverified for Task 8.
+	// match, the selected source stays unverified in its book-file row.
 	selected := uncertain
 	if len(matching) > 0 {
 		selected = matching

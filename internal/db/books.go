@@ -997,6 +997,12 @@ func (r *BookRepo) AddBookFile(ctx context.Context, bookID int64, format, path s
 	return err
 }
 
+// TrackVariantFile records a safely promoted file with its own evidence and
+// variant state. It does not change the catalogue's book-level language.
+func (r *BookRepo) TrackVariantFile(ctx context.Context, bookID, variantID int64, format, path, language, verification string) error {
+	return r.files.TrackVariant(ctx, bookID, variantID, format, path, language, verification)
+}
+
 // AddBookFileIfMissing records a new on-disk file and reports whether this call
 // made the row the book's, refreshing the book's aggregate status either way.
 // See BookFileRepo.AddIfMissing for why the caller needs to know (#1635). A
