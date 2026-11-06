@@ -20,6 +20,10 @@ type DownloadRepo struct {
 // moved out of wanted before this grab could reserve it.
 var ErrVariantUnavailable = errors.New("book variant is not available for a grab")
 
+// ImportRetryLimit is shared with the scanner so an importFailed row whose
+// automatic retry budget is spent enters review on the same DB transition.
+const ImportRetryLimit = 5
+
 // The reservation and status reconciliation must agree about what still fills
 // a variant. A failed or imported download alone does not fill it.
 const variantActiveSQL = `status IN ('grabbed', 'downloading', 'completed', 'importPending', 'importing', 'importExternal', 'importHeld', 'importFailed')`
@@ -793,21 +797,22 @@ func (r *DownloadRepo) releaseFailedVariant(ctx context.Context, downloadID int6
 // persists the error message. Use this for import failures (StateImportFailed,
 // StateImportBlocked) so the user can see why an import didn't complete.
 func (r *DownloadRepo) SetErrorWithStatus(ctx context.Context, id int64, status models.DownloadState, errMsg string) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin import failure transition: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
 	var current models.DownloadState
-	if err := r.db.QueryRowContext(ctx, "SELECT status FROM downloads WHERE id=?", id).Scan(&current); err != nil {
+	var retries int
+	if err := tx.QueryRowContext(ctx, "SELECT status, import_retry_count FROM downloads WHERE id=?", id).Scan(&current, &retries); err != nil {
 		return fmt.Errorf("lookup current state: %w", err)
 	}
 	if current != status && !current.CanTransitionTo(status) {
 		return models.ErrInvalidTransition{From: current, To: status}
 	}
-	// Guard on status=current so the validated transition is applied
-	// atomically: a concurrent writer that moved the row on between our read
-	// and write matches zero rows and we report the transition as invalid
-	// rather than stamping a failure onto whatever state it landed in.
-	// dead_at is stamped when status is one the row cannot leave on its own
-	// (importBlocked), and cleared when it is not (importFailed), so the stamp
-	// always describes the attempt the row currently holds (#2710).
-	result, err := r.db.ExecContext(ctx,
+	// The guarded write and variant reconciliation commit together. A lost
+	// status race or a failed variant write rolls back both rows.
+	result, err := tx.ExecContext(ctx,
 		"UPDATE downloads SET status=?, error_message=?, dead_at=? WHERE id=? AND status=?",
 		status, errMsg, deadStamp(status, time.Now().UTC()), id, current)
 	if err != nil {
@@ -819,6 +824,32 @@ func (r *DownloadRepo) SetErrorWithStatus(ctx context.Context, id int64, status 
 	}
 	if affected == 0 {
 		return models.ErrInvalidTransition{From: current, To: status}
+	}
+	// A retryable importFailed still owns the variant; the scanner can retry
+	// that same torrent without another grab. Once blocked or out of retries,
+	// keep the existing download in the queue and put a fileless variant in
+	// review. Review is a manual hold, not a new wanted search. An imported
+	// file wins, another live download stays downloading, and an existing
+	// review decision is never overwritten.
+	if status == models.StateImportBlocked || status == models.StateImportFailed && retries >= ImportRetryLimit {
+		_, err := tx.ExecContext(ctx, `UPDATE book_variants SET status = CASE
+			WHEN EXISTS (SELECT 1 FROM book_files f WHERE f.variant_id = book_variants.id
+				AND f.book_id = book_variants.book_id AND f.format = book_variants.media_type
+				AND (f.verification = 'verified' AND f.language = book_variants.language
+					OR f.verification = 'unverified')) THEN 'imported'
+			WHEN EXISTS (SELECT 1 FROM downloads d WHERE d.variant_id = book_variants.id
+				AND d.book_id = book_variants.book_id AND d.id != ? AND `+variantActiveSQL+`
+				AND NOT (d.status = 'importFailed' AND d.import_retry_count >= ?)) THEN 'downloading'
+			ELSE 'review' END
+			WHERE id = (SELECT variant_id FROM downloads WHERE id = ?)
+				AND status IN ('wanted', 'downloading')`,
+			id, ImportRetryLimit, id)
+		if err != nil {
+			return fmt.Errorf("reconcile terminal import variant: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit import failure transition: %w", err)
 	}
 	return nil
 }

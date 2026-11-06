@@ -142,6 +142,52 @@ func TestVariantGrabEachWantedLanguageAndFormatOnce(t *testing.T) {
 	}
 }
 
+// A failed torrent still exists in the client's queue. Terminal import
+// review must not make a new MAM grab on the very next wanted sweep.
+func TestVariantTerminalImportReviewDoesNotTriggerDuplicateGrab(t *testing.T) {
+	s, search, downloads, book, sends := variantGrabFixture(t)
+	ctx := context.Background()
+	copies, err := s.books.VariantRepo().EnsureWanted(ctx, book.ID, models.MediaTypeEbook, []string{"eng"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dl := &models.Download{GUID: "terminal-grab", Title: "Dune [ENG / EPUB]", BookID: &book.ID,
+		VariantID: &copies[0].ID, Protocol: "torrent", Status: models.StateGrabbed}
+	if err := downloads.Create(ctx, dl); err != nil {
+		t.Fatal(err)
+	}
+	if err := downloads.SetTorrentID(ctx, dl.ID, "still-seeding"); err != nil {
+		t.Fatal(err)
+	}
+	if err := downloads.UpdateStatus(ctx, dl.ID, models.StateDownloading); err != nil {
+		t.Fatal(err)
+	}
+	if marked, err := s.books.VariantRepo().MarkDownloading(ctx, copies[0].ID); err != nil || !marked {
+		t.Fatalf("mark real grab downloading: %t %v", marked, err)
+	}
+	for _, next := range []models.DownloadState{models.StateCompleted, models.StateImportPending, models.StateImporting} {
+		if err := downloads.UpdateStatus(ctx, dl.ID, next); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := downloads.SetErrorWithStatus(ctx, dl.ID, models.StateImportBlocked, "cannot place file"); err != nil {
+		t.Fatal(err)
+	}
+	variants, err := s.books.VariantRepo().ListByBook(ctx, book.ID)
+	if err != nil || len(variants) != 1 || variants[0].Status != models.VariantReview {
+		t.Fatalf("blocked torrent needs review, not a stranded downloading variant: %+v %v", variants, err)
+	}
+	if queue := s.wantedSearchQueue(ctx); len(queue) != 0 {
+		t.Fatalf("blocked torrent queued another grab: %+v", queue)
+	}
+	s.SearchAndGrabBook(ctx, *book)
+	rows, err := downloads.List(ctx)
+	if err != nil || len(rows) != 1 || rows[0].Status != models.StateImportBlocked || rows[0].TorrentID == nil || *rows[0].TorrentID != "still-seeding" ||
+		len(search.calls) != 0 || *sends != 0 {
+		t.Fatalf("duplicate search/grab after blocked torrent: rows=%+v calls=%d sends=%d err=%v", rows, len(search.calls), *sends, err)
+	}
+}
+
 func TestVariantGrabImportedEnglishStillSearchesMissingRomanian(t *testing.T) {
 	s, search, downloads, book, sends := variantGrabFixture(t)
 	ctx := context.Background()

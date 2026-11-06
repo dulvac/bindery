@@ -562,7 +562,7 @@ func (s *Scanner) WithSettings(sr *db.SettingsRepo) *Scanner {
 // import fail", not a wall-clock deadline. Raised from 3 with #1884: three
 // attempts at the 15 s poll cadence gave a transient filesystem hiccup a
 // 45-second window to clear before the download was terminally blocked.
-const importRetryLimit = 5
+const importRetryLimit = db.ImportRetryLimit
 
 // importSkipLimit bounds how many CONSECUTIVE poll cycles a StateImportFailed
 // download may decline its retry (importSourcePresent found nothing on this
@@ -932,6 +932,7 @@ func (s *Scanner) failImport(ctx context.Context, dl *models.Download, status mo
 func (s *Scanner) failImportWithCheck(ctx context.Context, dl *models.Download, status models.DownloadState, reason string, contentCheck map[string]any) {
 	if err := s.downloads.SetErrorWithStatus(ctx, dl.ID, status, reason); err != nil {
 		slog.Warn("failed to persist import error", "download_id", dl.ID, "status", status, "error", err)
+		return // do not announce a terminal failure whose DB transition rolled back
 	}
 	data := map[string]any{
 		"guid":    dl.GUID,
@@ -1564,14 +1565,15 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 		s.testImportHook(dl, downloadPath, cleanupClientType, explicitFiles)
 		return
 	}
+	s.updateDownloadStatus(ctx, dl.ID, models.StateImportPending)
 	if s.libraryDir == "" {
 		slog.Warn("no library directory configured, skipping import")
-		// Not writable/configured — needs user action before import can proceed.
+		// Walk through importing before blocking: completed/importPending
+		// cannot transition directly to importBlocked.
+		s.updateDownloadStatus(ctx, dl.ID, models.StateImporting)
 		s.failImport(ctx, dl, models.StateImportBlocked, "no library directory configured — set one in Settings")
 		return
 	}
-
-	s.updateDownloadStatus(ctx, dl.ID, models.StateImportPending)
 
 	// A caller can hold a stale Download object. Decide whether this is a
 	// variant import from the persisted row before the external handoff or
@@ -1894,7 +1896,7 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 			}
 		}
 		if !primaryImported {
-			s.failImport(ctx, dl, models.StateImportBlocked, "verified sibling placed but requested variant remains wanted; review its unverified file before retrying")
+			s.failImport(ctx, dl, models.StateImportBlocked, "verified sibling placed but requested variant remains unfilled; review its unverified file before retrying")
 			return
 		}
 		s.updateDownloadStatus(ctx, dl.ID, models.StateImported)

@@ -334,8 +334,8 @@ func TestVariantRetry_SecondFileDBFailureRollsBackWholeBundle(t *testing.T) {
 	variantBlocked(t, f, dl, "stranded")
 	variantBlocked(t, f, dl, "second bundle file rejected")
 	variantImportedFiles(t, f, 0)
-	if got := twoKindleVariantStatus(t, f); got != models.VariantWanted {
-		t.Fatalf("partially committed variant status = %q", got)
+	if got := twoKindleVariantStatus(t, f); got != models.VariantReview {
+		t.Fatalf("stranded public links must hold variant in review, got %q", got)
 	}
 	for _, source := range files {
 		public := variantEbookTarget(t, f, source)
@@ -349,6 +349,10 @@ func TestVariantRetry_SecondFileDBFailureRollsBackWholeBundle(t *testing.T) {
 	// retry must neither adopt an unverified path nor unlink either entry.
 	if _, err := f.database.ExecContext(f.ctx, `DROP TRIGGER refuse_second_variant_file`); err != nil {
 		t.Fatal(err)
+	}
+	approved, err := f.books.VariantRepo().RetryReviewed(f.ctx, f.book.ID, f.variant.ID, 42, "retry after staging failure")
+	if err != nil || !approved {
+		t.Fatalf("manual review retry: %t %v", approved, err)
 	}
 	if _, err := f.database.ExecContext(f.ctx, `UPDATE downloads SET status='completed' WHERE id=?`, dl.ID); err != nil {
 		t.Fatal(err)

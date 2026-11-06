@@ -181,7 +181,7 @@ func TestVariantHardlink_VerifiedSiblingDoesNotCompleteUnverifiedPrimary(t *test
 	romanian := variantEPUBSource(t, f.sources, "English catalogue label (Romanian).epub", "romanian-en-opf.epub")
 	dl := f.addDownload(t, "English catalogue label [EPUB]")
 	f.scanner.tryImportInternal(f.ctx, dl, f.sources, "qbittorrent", "test-hash", "", nil, []string{unknown, romanian})
-	variantBlocked(t, f, dl, "requested variant remains wanted")
+	variantBlocked(t, f, dl, "requested variant remains unfilled")
 	rows := variantImportedFiles(t, f, 1)
 	if rows[0].VariantID == nil || *rows[0].VariantID != other[0].ID || rows[0].Language != "rum" || rows[0].Verification != "verified" {
 		t.Fatalf("unverified primary claimed or sibling lost: %+v", rows)
@@ -191,8 +191,8 @@ func TestVariantHardlink_VerifiedSiblingDoesNotCompleteUnverifiedPrimary(t *test
 		t.Fatal(err)
 	}
 	for _, v := range variants {
-		if v.ID == f.variant.ID && v.Status != models.VariantWanted {
-			t.Fatalf("English variant falsely completed: %+v", v)
+		if v.ID == f.variant.ID && v.Status != models.VariantReview {
+			t.Fatalf("unverified English source did not hold variant for review: %+v", v)
 		}
 	}
 }
