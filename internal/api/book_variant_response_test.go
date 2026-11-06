@@ -393,3 +393,181 @@ func TestVariantResponseRequesterLibraryPagesAndNeverExposesPaths(t *testing.T) 
 		}
 	}
 }
+
+// A book can change owners after the library page is selected but before
+// its variants and legacy files are read. Only the current owner may see them.
+func TestVariantRequesterLibraryReassignmentBetweenReads(t *testing.T) {
+	auth.SetEnforceTenancyForTests(t, true)
+	f := newRequestsFixture(t, wellsRequestStub(), &fakeAdder{})
+	ctx := asUser(httptest.NewRequest(http.MethodGet, "/api/v1/requests/library", nil), f.requester).Context()
+	author := seedWells(t, f.authors)
+	book := &models.Book{ForeignID: "OL-LIB-RACE", AuthorID: author.ID, OwnerUserID: f.requester.ID,
+		Title: "Reassigned", SortTitle: "reassigned", MediaType: models.MediaTypeEbook, Status: models.BookStatusImported}
+	if err := f.books.Create(ctx, book); err != nil {
+		t.Fatal(err)
+	}
+	copies, err := f.books.VariantRepo().EnsureWanted(ctx, book.ID, models.MediaTypeEbook, []string{"eng"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.books.VariantRepo().SetStatus(ctx, copies[0].ID, models.VariantImported); err != nil {
+		t.Fatal(err)
+	}
+	const path = "/private/new-owner-legacy.epub"
+	if _, err := f.database.ExecContext(ctx, `INSERT INTO book_files (book_id, format, path) VALUES (?, 'ebook', ?)`, book.ID, path); err != nil {
+		t.Fatal(err)
+	}
+	rows, total, err := f.requests.ListLibraryProjection(ctx, auth.ListScopeUserID(ctx), "", 10, 0)
+	if err != nil || total != 1 || len(rows) != 1 || rows[0].ID != book.ID {
+		t.Fatalf("authorized library page: rows=%+v total=%d err=%v", rows, total, err)
+	}
+	if _, err := f.database.ExecContext(ctx, `UPDATE books SET owner_user_id = ? WHERE id = ?`, f.other.ID, book.ID); err != nil {
+		t.Fatal(err)
+	}
+	items, err := f.h.projectLibrary(ctx, rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || len(items[0].Variants) != 0 || len(items[0].LegacyFiles) != 0 {
+		t.Fatalf("old owner's paginated book exposed new owner's status: %+v", items)
+	}
+	payload, err := json.Marshal(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(payload), path) || strings.Contains(string(payload), "path") {
+		t.Fatalf("requester library exposed legacy file path: %s", payload)
+	}
+	// The new owner still sees the copies, but never a filesystem path.
+	otherCtx := asUser(httptest.NewRequest(http.MethodGet, "/api/v1/requests/library", nil), f.other).Context()
+	owned, err := f.h.projectLibrary(otherCtx, rows)
+	if err != nil || len(owned) != 1 || len(owned[0].Variants) != 1 || len(owned[0].LegacyFiles) != 1 {
+		t.Fatalf("new owner status: items=%+v err=%v", owned, err)
+	}
+	ownedJSON, err := json.Marshal(owned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(ownedJSON), path) || strings.Contains(string(ownedJSON), "path") {
+		t.Fatalf("new owner's library exposed legacy file path: %s", ownedJSON)
+	}
+}
+
+// An admin's forUser queue must project the target's copies, not the admin's.
+// A stale request page must stop showing them after the book changes owners.
+func TestVariantRequestReassignmentBetweenReads(t *testing.T) {
+	f := newRequestsFixture(t, wellsRequestStub(), nil)
+	created := decodeRequest(t, f.create(t, f.admin, forUserBody("OL27482W", f.requester.ID)))
+	if rec := f.approve(f.admin, created.ID, `{"searchOnAdd":false}`); rec.Code != http.StatusOK {
+		t.Fatalf("approve: %d %s", rec.Code, rec.Body.String())
+	}
+	ctx := context.Background()
+	book, err := f.books.GetByForeignID(ctx, "OL27482W")
+	if err != nil || book == nil {
+		t.Fatalf("approved book: %+v %v", book, err)
+	}
+	copies, err := f.books.VariantRepo().ListByBook(ctx, book.ID)
+	if err != nil || len(copies) != 1 {
+		t.Fatalf("requested copy: %+v %v", copies, err)
+	}
+	if err := f.books.VariantRepo().SetStatus(ctx, copies[0].ID, models.VariantImported); err != nil {
+		t.Fatal(err)
+	}
+	const path = "/private/new-owner-legacy.epub"
+	if _, err := f.database.ExecContext(ctx, `INSERT INTO book_files (book_id, format, path) VALUES (?, 'ebook', ?)`, book.ID, path); err != nil {
+		t.Fatal(err)
+	}
+	mine, total, err := f.requests.ListByOwner(ctx, f.requester.ID, 10, 0)
+	if err != nil || total != 1 || len(mine) != 1 || !mine[0].BookFulfilled {
+		t.Fatalf("first owner read: requests=%+v total=%d err=%v", mine, total, err)
+	}
+	queue, total, err := f.requests.ListAll(ctx, models.RequestStatusApproved, 10, 0)
+	if err != nil || total != 1 || len(queue) != 1 || !queue[0].BookFulfilled {
+		t.Fatalf("admin forUser read: requests=%+v total=%d err=%v", queue, total, err)
+	}
+	visible, err := f.h.projectRequests(ctx, queue, true)
+	if err != nil || len(visible) != 1 || visible[0].Username != f.requester.Username ||
+		visible[0].CreatedVia != models.RequestCreatedViaAdmin || !visible[0].Fulfilled || len(visible[0].Variants) != 1 || len(visible[0].LegacyFiles) != 1 {
+		t.Fatalf("admin queue forUser target status: responses=%+v err=%v", visible, err)
+	}
+	if _, err := f.database.ExecContext(ctx, `UPDATE books SET owner_user_id = ? WHERE id = ?`, f.other.ID, book.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name  string
+		items []models.LibraryRequest
+		admin bool
+	}{
+		{"own requests", mine, false},
+		{"admin forUser queue", queue, true},
+	} {
+		out, err := f.h.projectRequests(ctx, tc.items, tc.admin)
+		if err != nil || len(out) != 1 {
+			t.Fatalf("%s projection: responses=%+v err=%v", tc.name, out, err)
+		}
+		if out[0].Fulfilled || len(out[0].Variants) != 0 || len(out[0].LegacyFiles) != 0 {
+			t.Fatalf("%s leaked new owner's statuses after reassignment: %+v", tc.name, out[0])
+		}
+		payload, err := json.Marshal(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(payload), path) || strings.Contains(string(payload), "path") {
+			t.Fatalf("%s leaked legacy file path: %s", tc.name, payload)
+		}
+	}
+}
+
+// Two approved requests may reference the same old unowned book. After a
+// reassignment, the admin queue must use each request's owner separately.
+func TestVariantAdminQueueSharedBookScopesEachRequestOwner(t *testing.T) {
+	f := newRequestsFixture(t, wellsRequestStub(), nil)
+	first := decodeRequest(t, f.create(t, f.admin, forUserBody("OL27482W", f.requester.ID)))
+	second := decodeRequest(t, f.create(t, f.other, `{"kind":"book","foreignId":"OL27482W","mediaType":"ebook"}`))
+	if rec := f.approve(f.admin, first.ID, `{"searchOnAdd":false}`); rec.Code != http.StatusOK {
+		t.Fatalf("approve first: %d %s", rec.Code, rec.Body.String())
+	}
+	ctx := context.Background()
+	book, err := f.books.GetByForeignID(ctx, "OL27482W")
+	if err != nil || book == nil {
+		t.Fatalf("book: %+v %v", book, err)
+	}
+	copies, err := f.books.VariantRepo().ListByBook(ctx, book.ID)
+	if err != nil || len(copies) != 1 {
+		t.Fatalf("book variant: %+v %v", copies, err)
+	}
+	if err := f.books.VariantRepo().SetStatus(ctx, copies[0].ID, models.VariantImported); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := f.requests.Claim(ctx, second.ID, f.admin.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.requests.Complete(ctx, second.ID, claim.ClaimToken, &book.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.database.ExecContext(ctx, `UPDATE books SET owner_user_id = NULL WHERE id = ?`, book.ID); err != nil {
+		t.Fatal(err)
+	}
+	queue, total, err := f.requests.ListAll(ctx, models.RequestStatusApproved, 10, 0)
+	if err != nil || total != 2 || len(queue) != 2 || !queue[0].BookFulfilled || !queue[1].BookFulfilled {
+		t.Fatalf("unowned book queue: rows=%+v total=%d err=%v", queue, total, err)
+	}
+	if _, err := f.database.ExecContext(ctx, `UPDATE books SET owner_user_id = ? WHERE id = ?`, f.other.ID, book.ID); err != nil {
+		t.Fatal(err)
+	}
+	out, err := f.h.projectRequests(ctx, queue, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byUser := make(map[string]requestResponse, len(out))
+	for _, row := range out {
+		byUser[row.Username] = row
+	}
+	if old := byUser[f.requester.Username]; old.Fulfilled || len(old.Variants) != 0 {
+		t.Fatalf("old owner got new owner's variant: %+v", old)
+	}
+	if current := byUser[f.other.Username]; !current.Fulfilled || len(current.Variants) != 1 || current.Variants[0].ID != copies[0].ID {
+		t.Fatalf("new owner lost variant in mixed admin queue: %+v", current)
+	}
+}

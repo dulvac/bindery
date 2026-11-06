@@ -1,10 +1,12 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
 	"github.com/vavallee/bindery/internal/auth"
+	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/models"
 )
 
@@ -49,19 +51,29 @@ func (h *RequestHandler) Library(w http.ResponseWriter, r *http.Request) {
 	if len(search) > 200 {
 		search = search[:200]
 	}
-	rows, total, err := h.requests.ListLibraryProjection(ctx, auth.ListScopeUserID(ctx), strings.TrimSpace(search), limit, offset)
+	scopeUserID := auth.ListScopeUserID(ctx)
+	rows, total, err := h.requests.ListLibraryProjection(ctx, scopeUserID, strings.TrimSpace(search), limit, offset)
 	if err != nil {
 		writeServerError(w, r, err)
 		return
 	}
-	ids := make([]int64, 0, len(rows))
+	items, err := h.projectLibrary(ctx, rows)
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, requesterLibraryResponse{Items: items, Total: total, Limit: limit, Offset: offset})
+}
+
+func (h *RequestHandler) projectLibrary(ctx context.Context, rows []db.LibraryProjectionRow) ([]requesterLibraryBook, error) {
+	scopeUserID := auth.ListScopeUserID(ctx)
+	accesses := make([]db.BookStatusAccess, 0, len(rows))
 	for _, row := range rows {
-		ids = append(ids, row.ID)
+		accesses = append(accesses, db.BookStatusAccess{BookID: row.ID, OwnerUserID: scopeUserID})
 	}
-	statuses, err := h.variants.ListStatusByBooks(ctx, ids)
+	statuses, err := h.variants.ListStatusByBooks(ctx, accesses)
 	if err != nil {
-		writeServerError(w, r, err)
-		return
+		return nil, err
 	}
 	items := make([]requesterLibraryBook, 0, len(rows))
 	for _, row := range rows {
@@ -72,6 +84,7 @@ func (h *RequestHandler) Library(w http.ResponseWriter, r *http.Request) {
 		if row.HasAudiobook {
 			formats = append(formats, models.MediaTypeAudiobook)
 		}
+		projection := statuses[db.BookStatusAccess{BookID: row.ID, OwnerUserID: scopeUserID}]
 		items = append(items, requesterLibraryBook{
 			ID:             row.ID,
 			Title:          row.Title,
@@ -81,9 +94,9 @@ func (h *RequestHandler) Library(w http.ResponseWriter, r *http.Request) {
 			CoverURL:       ProxyImageURL(row.ImageURL),
 			Status:         row.Status,
 			Formats:        formats,
-			Variants:       variantResponses(statuses[row.ID].Variants),
-			LegacyFiles:    legacyFileResponses(statuses[row.ID].LegacyFiles),
+			Variants:       variantResponses(projection.Variants),
+			LegacyFiles:    legacyFileResponses(projection.LegacyFiles),
 		})
 	}
-	writeJSON(w, http.StatusOK, requesterLibraryResponse{Items: items, Total: total, Limit: limit, Offset: offset})
+	return items, nil
 }

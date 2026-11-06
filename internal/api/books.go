@@ -415,12 +415,13 @@ func (h *BookHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.prepareBookDetail(r.Context(), book)
-	status, err := h.books.VariantRepo().ListStatusByBooks(r.Context(), []int64{book.ID})
+	access := db.BookStatusAccess{BookID: book.ID, OwnerUserID: auth.ListScopeUserID(r.Context())}
+	status, err := h.books.VariantRepo().ListStatusByBooks(r.Context(), []db.BookStatusAccess{access})
 	if err != nil {
 		writeServerError(w, r, err)
 		return
 	}
-	projection := status[book.ID]
+	projection := status[access]
 	writeJSON(w, http.StatusOK, struct {
 		*models.Book
 		Variants    []variantResponse    `json:"variants"`

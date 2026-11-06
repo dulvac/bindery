@@ -300,41 +300,43 @@ func (r *RequestRepo) fillAuthorProgress(ctx context.Context, page []models.Libr
 // per page. A book-level imported status cannot attest to a language: legacy
 // files are unverified until they are explicitly linked to a variant.
 func (r *RequestRepo) fillBookProgress(ctx context.Context, page []models.LibraryRequest) error {
-	seen := make(map[int64]bool)
-	ids := make([]int64, 0)
+	seen := make(map[BookStatusAccess]bool)
+	accesses := make([]BookStatusAccess, 0)
 	for _, req := range page {
 		if req.Kind == models.RequestKindBook && req.Status == models.RequestStatusApproved && req.ResultBookID != nil &&
-			(req.BookOwnerUserID == 0 || req.BookOwnerUserID == req.OwnerUserID) && !seen[*req.ResultBookID] {
-			id := *req.ResultBookID
-			seen[id] = true
-			ids = append(ids, id)
+			(req.BookOwnerUserID == 0 || req.BookOwnerUserID == req.OwnerUserID) {
+			access := BookStatusAccess{BookID: *req.ResultBookID, OwnerUserID: req.OwnerUserID}
+			if !seen[access] {
+				seen[access] = true
+				accesses = append(accesses, access)
+			}
 		}
 	}
-	if len(ids) == 0 {
+	if len(accesses) == 0 {
 		return nil
 	}
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		args[i] = id
-	}
-	// #nosec G202 -- placeholders consists only of question marks from the number of books on this page.
-	rows, err := r.db.QueryContext(ctx, `SELECT book_id, media_type, language, status FROM book_variants WHERE book_id IN (`+placeholders+`)`, args...)
+	marks, args := bookAccessValues(accesses)
+	// #nosec G202 -- VALUES contains only placeholders, never caller text.
+	rows, err := r.db.QueryContext(ctx, `WITH scope(book_id, owner_user_id) AS (VALUES `+marks+`)
+		SELECT scope.book_id, scope.owner_user_id, v.media_type, v.language, v.status FROM scope
+		JOIN books b ON b.id = scope.book_id
+			AND (b.owner_user_id = scope.owner_user_id OR b.owner_user_id IS NULL)
+		JOIN book_variants v ON v.book_id = scope.book_id`, args...)
 	if err != nil {
 		return fmt.Errorf("load request variants: %w", err)
 	}
-	byBook := make(map[int64]map[string]string, len(ids))
+	byBook := make(map[BookStatusAccess]map[string]string, len(accesses))
 	for rows.Next() {
-		var id int64
+		var access BookStatusAccess
 		var mediaType, language, status string
-		if err := rows.Scan(&id, &mediaType, &language, &status); err != nil {
+		if err := rows.Scan(&access.BookID, &access.OwnerUserID, &mediaType, &language, &status); err != nil {
 			_ = rows.Close()
 			return err
 		}
-		if byBook[id] == nil {
-			byBook[id] = make(map[string]string)
+		if byBook[access] == nil {
+			byBook[access] = make(map[string]string)
 		}
-		byBook[id][mediaType+"/"+language] = status
+		byBook[access][mediaType+"/"+language] = status
 	}
 	err = rows.Err()
 	_ = rows.Close()
@@ -356,9 +358,10 @@ func (r *RequestRepo) fillBookProgress(ctx context.Context, page []models.Librar
 			continue
 		}
 		req.BookFulfilled = true
+		access := BookStatusAccess{BookID: *req.ResultBookID, OwnerUserID: req.OwnerUserID}
 		for _, format := range formats {
 			for _, language := range req.Languages {
-				if byBook[*req.ResultBookID][format+"/"+language] != models.VariantImported {
+				if byBook[access][format+"/"+language] != models.VariantImported {
 					req.BookFulfilled = false
 				}
 			}

@@ -1008,16 +1008,19 @@ func (h *RequestHandler) maxPendingPerUser(ctx context.Context) int {
 // request rows. A request sees its own selected copies, not every language a
 // different request for the same book happened to add.
 func (h *RequestHandler) projectRequests(ctx context.Context, items []models.LibraryRequest, admin bool) ([]requestResponse, error) {
-	ids := make([]int64, 0, len(items))
-	seen := make(map[int64]bool)
+	accesses := make([]db.BookStatusAccess, 0, len(items))
+	seen := make(map[db.BookStatusAccess]bool)
 	for _, req := range items {
 		if req.Kind == models.RequestKindBook && req.Status == models.RequestStatusApproved && req.ResultBookID != nil &&
-			(req.BookOwnerUserID == 0 || req.BookOwnerUserID == req.OwnerUserID) && !seen[*req.ResultBookID] {
-			seen[*req.ResultBookID] = true
-			ids = append(ids, *req.ResultBookID)
+			(req.BookOwnerUserID == 0 || req.BookOwnerUserID == req.OwnerUserID) {
+			access := db.BookStatusAccess{BookID: *req.ResultBookID, OwnerUserID: req.OwnerUserID}
+			if !seen[access] {
+				seen[access] = true
+				accesses = append(accesses, access)
+			}
 		}
 	}
-	statuses, err := h.variants.ListStatusByBooks(ctx, ids)
+	statuses, err := h.variants.ListStatusByBooks(ctx, accesses)
 	if err != nil {
 		return nil, err
 	}
@@ -1026,8 +1029,16 @@ func (h *RequestHandler) projectRequests(ctx context.Context, items []models.Lib
 		response := toRequestResponse(req, admin)
 		if req.Kind == models.RequestKindBook && req.Status == models.RequestStatusApproved && req.ResultBookID != nil &&
 			(req.BookOwnerUserID == 0 || req.BookOwnerUserID == req.OwnerUserID) {
-			projection := statuses[*req.ResultBookID]
+			projection := statuses[db.BookStatusAccess{BookID: *req.ResultBookID, OwnerUserID: req.OwnerUserID}]
 			response.Variants = requestedVariants(req, projection.Variants)
+			// Fulfillment from the earlier page query may be stale if the book
+			// changed owners before this status read.
+			response.Fulfilled = req.BookFulfilled && len(response.Variants) == len(requestFormats(req))*len(req.Languages)
+			for _, variant := range response.Variants {
+				if variant.Status != models.VariantImported {
+					response.Fulfilled = false
+				}
+			}
 			for _, file := range projection.LegacyFiles {
 				for _, format := range requestFormats(req) {
 					if file.MediaType == format {

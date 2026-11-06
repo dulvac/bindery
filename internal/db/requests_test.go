@@ -292,6 +292,68 @@ func TestRequestRepo_ListDerivesFulfilment(t *testing.T) {
 	}
 }
 
+// A request row can be read under one owner, then the result book moved
+// before fulfillment is calculated. The variant query must check the owner
+// at the time it runs, while preserving access to legacy unowned books.
+func TestRequestRepo_FulfillmentReassignmentBetweenReads(t *testing.T) {
+	database, repo, users := newRequestsFixture(t)
+	ctx := context.Background()
+	admin := mustUser(t, users, "admin")
+	owner := mustUser(t, users, "reader")
+	other := mustUser(t, users, "other")
+	if _, err := database.ExecContext(ctx, `INSERT INTO authors (id, foreign_id, name, sort_name, owner_user_id)
+		VALUES (150, 'OL150A', 'Writer', 'Writer', ?)`, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO books (id, foreign_id, author_id, title, sort_title, media_type, owner_user_id)
+		VALUES (150, 'OL150W', 150, 'Reassigned', 'reassigned', 'ebook', ?)`, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	copies, err := NewBookVariantRepo(database).EnsureWanted(ctx, 150, models.MediaTypeEbook, []string{"eng"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := NewBookVariantRepo(database).SetStatus(ctx, copies[0].ID, models.VariantImported); err != nil {
+		t.Fatal(err)
+	}
+	req := &models.LibraryRequest{OwnerUserID: owner.ID, Kind: models.RequestKindBook, ForeignID: "OL150W",
+		MediaType: models.MediaTypeEbook, Languages: []string{"eng"}, Title: "Reassigned", PayloadJSON: "{}"}
+	if err := repo.Create(ctx, req, 0); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := repo.Claim(ctx, req.ID, admin.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bookID := int64(150)
+	if err := repo.Complete(ctx, req.ID, claimed.ClaimToken, &bookID, nil); err != nil {
+		t.Fatal(err)
+	}
+	page, total, err := repo.ListByOwner(ctx, owner.ID, 10, 0)
+	if err != nil || total != 1 || len(page) != 1 || !page[0].BookFulfilled || page[0].BookOwnerUserID != owner.ID {
+		t.Fatalf("first owner read: page=%+v total=%d err=%v", page, total, err)
+	}
+	if _, err := database.ExecContext(ctx, `UPDATE books SET owner_user_id = ? WHERE id = 150`, other.ID); err != nil {
+		t.Fatal(err)
+	}
+	page[0].BookFulfilled = false
+	if err := repo.fillBookProgress(ctx, page); err != nil {
+		t.Fatal(err)
+	}
+	if page[0].BookFulfilled {
+		t.Fatal("fulfillment read exposed newly reassigned owner's imported variant")
+	}
+	if _, err := database.ExecContext(ctx, `UPDATE books SET owner_user_id = NULL WHERE id = 150`); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.fillBookProgress(ctx, page); err != nil {
+		t.Fatal(err)
+	}
+	if !page[0].BookFulfilled {
+		t.Fatal("legacy unowned book lost its requested imported copy")
+	}
+}
+
 // TestRequestRepo_DeletingTheUserRemovesTheirRequests: owner_user_id
 // cascades, so deleting a requester leaves no orphan requests and does not
 // block the delete.
