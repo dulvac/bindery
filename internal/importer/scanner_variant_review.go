@@ -15,7 +15,23 @@ import (
 // checkedVariantSource stays local to the importer: Task 8 owns persisted
 // book-file associations and language-bearing destinations.
 type checkedVariantSource struct {
-	path string
+	path     string
+	assessed os.FileInfo
+}
+
+// A successful hardlink must still identify the regular file whose evidence
+// was read. A new inode or a write to the same inode invalidates that review.
+func sameAssessedSource(assessed, linked os.FileInfo) bool {
+	return assessed != nil && linked != nil && linked.Mode().IsRegular() &&
+		os.SameFile(assessed, linked) && assessed.Size() == linked.Size() &&
+		assessed.ModTime().Equal(linked.ModTime())
+}
+
+func variantSourceChanged(phase, source string, cause error) error {
+	if cause != nil {
+		return fmt.Errorf("variant source %s %s: %w", source, phase, cause)
+	}
+	return fmt.Errorf("variant source %s %s (inode, size or mtime mismatch)", source, phase)
 }
 
 // reviewVariantImport gates the existing placement paths. It reads source
@@ -25,7 +41,7 @@ type checkedVariantSource struct {
 // any destination is created. The returned list is the only list placement may
 // use, so a mixed release cannot import a second, wrong-language file.
 func (s *Scanner) reviewVariantImport(ctx context.Context, dl *models.Download, book *models.Book, author *models.Author,
-	format, downloadPath string, files []string) ([]string, bool, string, error) {
+	format, downloadPath string, files []string) ([]checkedVariantSource, bool, string, error) {
 	if s.books == nil || s.downloads == nil || s.history == nil || dl == nil || book == nil {
 		return nil, false, "", fmt.Errorf("variant import requires persisted download, book and history")
 	}
@@ -52,7 +68,7 @@ func (s *Scanner) reviewVariantImport(ctx context.Context, dl *models.Download, 
 		return nil, false, "", fmt.Errorf("selected variant does not belong to book and downloaded format")
 	}
 	rejections := s.books.RejectionRepo()
-	paths, err := rejections.ListSourcePaths(ctx, book.ID)
+	paths, err := rejections.ListVariantSourcePaths(ctx, book.ID, variant.ID)
 	if err != nil {
 		return nil, false, "", err
 	}
@@ -62,7 +78,7 @@ func (s *Scanner) reviewVariantImport(ctx context.Context, dl *models.Download, 
 		}
 		// Check the exact file even when no folder rejection was found. A
 		// failed lookup is not permission to import.
-		rejected, err := rejections.IsRejected(ctx, book.ID, source)
+		rejected, err := rejections.IsRejected(ctx, book.ID, variant.ID, source)
 		if err != nil {
 			return nil, false, "", err
 		}
@@ -127,15 +143,29 @@ func (s *Scanner) reviewVariantImport(ctx context.Context, dl *models.Download, 
 		if detectDownloadFormat([]string{source}) != variant.MediaType {
 			continue
 		}
+		assessed, err := os.Lstat(source)
+		if err != nil {
+			return nil, false, "", fmt.Errorf("inspect variant evidence source %s: %w", source, err)
+		}
+		if !assessed.Mode().IsRegular() {
+			return nil, false, "", fmt.Errorf("variant evidence source is not regular: %s", source)
+		}
 		e, err := s.AssessVariantEvidence(ctx, stored, book, author, variant, []string{source}, override)
 		if err != nil {
 			return nil, false, "", err
+		}
+		if err := s.safeVariantSource(downloadPath, source); err != nil {
+			return nil, false, "", err
+		}
+		current, err := os.Lstat(source)
+		if err != nil || !sameAssessedSource(assessed, current) {
+			return nil, false, "", variantSourceChanged("changed during assessment", source, err)
 		}
 		if e.WrongWork {
 			wrongWork = true
 			reason = e.Reason
 		}
-		candidate := checkedVariantSource{path: source}
+		candidate := checkedVariantSource{path: source, assessed: assessed}
 		switch {
 		case e.WrongLanguage:
 			mismatched = append(mismatched, candidate)
@@ -164,7 +194,7 @@ func (s *Scanner) reviewVariantImport(ctx context.Context, dl *models.Download, 
 			bad = append(bad, mismatched...)
 		}
 		for _, item := range bad {
-			identity := variantRejectionIdentity(ctx, stored, downloadPath, item.path)
+			identity := variantRejectionIdentity(ctx, stored, downloadPath, item.path, variant.MediaType)
 			if err := rejections.Record(ctx, book.ID, variant.ID, stored.ID, identity, reason); err != nil {
 				return nil, false, "", fmt.Errorf("record rejected source: %w", err)
 			}
@@ -181,11 +211,7 @@ func (s *Scanner) reviewVariantImport(ctx context.Context, dl *models.Download, 
 	if len(matching) > 0 {
 		selected = matching
 	}
-	out := make([]string, 0, len(selected))
-	for _, item := range selected {
-		out = append(out, item.path)
-	}
-	return out, false, "", nil
+	return selected, false, "", nil
 }
 
 func missingVariantRow(err error) error {
@@ -244,11 +270,13 @@ func (s *Scanner) safeVariantPath(root, source string, allowFolder bool) error {
 	}
 }
 
-// Source-folder rejection is only safe when the content path is the torrent's
-// own folder (or a strictly nested folder below the reported shared root).
-// A single-file torrent at a shared save root rejects its file, not siblings.
-func variantRejectionIdentity(ctx context.Context, dl *models.Download, downloadPath, source string) string {
-	if dl.Protocol != "torrent" {
+// Audiobook source-folder rejection is only safe when the content path is
+// the torrent's own folder (or strictly nested below a reported shared root).
+// Ebook rejections and single-file torrents always name the exact file.
+func variantRejectionIdentity(ctx context.Context, dl *models.Download, downloadPath, source, format string) string {
+	// Ebook rejection is always the exact file, even inside a torrent's own
+	// folder. A sibling or another language variant may still be correct.
+	if format == models.MediaTypeEbook || dl.Protocol != "torrent" {
 		return source
 	}
 	info, err := os.Lstat(downloadPath)

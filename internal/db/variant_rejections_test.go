@@ -45,9 +45,9 @@ func TestVariantRejectionsIdempotentAndScoped(t *testing.T) {
 		{book.ID + 1, path, false},
 		{book.ID, "/downloads/mam/english.epub", false},
 	} {
-		got, err := repo.IsRejected(ctx, tc.book, tc.path)
+		got, err := repo.IsRejected(ctx, tc.book, variantID, tc.path)
 		if err != nil || got != tc.want {
-			t.Errorf("IsRejected(%d, %q) = %t, %v; want %t", tc.book, tc.path, got, err, tc.want)
+			t.Errorf("IsRejected(%d, %d, %q) = %t, %v; want %t", tc.book, variantID, tc.path, got, err, tc.want)
 		}
 	}
 	var count int
@@ -57,6 +57,39 @@ func TestVariantRejectionsIdempotentAndScoped(t *testing.T) {
 	}
 	if count != 1 || reason != "wrong language" {
 		t.Fatalf("repeat changed rejection: count=%d reason=%q", count, reason)
+	}
+}
+
+// A source that missed one language must be eligible for a different variant.
+// A second independent verdict must also be retained for that variant.
+func TestVariantRejectionsKeepIndependentVerdictsForSameSource(t *testing.T) {
+	repo, book, englishID, downloadID := rejectionFixture(t)
+	ctx := context.Background()
+	romanian, err := NewBookVariantRepo(repo.db).EnsureWanted(ctx, book.ID, models.MediaTypeEbook, []string{"rum"})
+	if err != nil || len(romanian) != 1 {
+		t.Fatalf("Romanian variant: %+v %v", romanian, err)
+	}
+	const path = "/downloads/mam/dune.epub"
+	if err := repo.Record(ctx, book.ID, englishID, downloadID, path, "wrong language for English"); err != nil {
+		t.Fatal(err)
+	}
+	if rejected, err := repo.IsRejected(ctx, book.ID, romanian[0].ID, path); err != nil || rejected {
+		t.Fatalf("English verdict blocks Romanian before reassessment: %t %v", rejected, err)
+	}
+	if err := repo.Record(ctx, book.ID, romanian[0].ID, downloadID, path, "wrong work for Romanian"); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := repo.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM variant_rejections WHERE book_id = ? AND source_path = ?`, book.ID, path).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("same source has %d verdicts, want one per variant", count)
+	}
+	for _, id := range []int64{englishID, romanian[0].ID} {
+		if rejected, err := repo.IsRejected(ctx, book.ID, id, path); err != nil || !rejected {
+			t.Fatalf("variant %d lost its rejection: %t %v", id, rejected, err)
+		}
 	}
 }
 
@@ -88,17 +121,17 @@ func TestVariantRejectionsRefuseWrongAssociations(t *testing.T) {
 	if err := repo.Record(ctx, book.ID, variantID, foreign.ID, "/downloads/mam/wrong.epub", "wrong work"); !errors.Is(err, ErrVariantRejectionAssociation) {
 		t.Errorf("cross-book download = %v; want association error", err)
 	}
-	if rejected, err := repo.IsRejected(ctx, book.ID, "/downloads/mam/wrong.epub"); err != nil || rejected {
+	if rejected, err := repo.IsRejected(ctx, book.ID, variantID, "/downloads/mam/wrong.epub"); err != nil || rejected {
 		t.Errorf("invalid association wrote a row: %t, %v", rejected, err)
 	}
 }
 
 func TestVariantRejectionsFailClosedOnReadError(t *testing.T) {
-	repo, book, _, _ := rejectionFixture(t)
+	repo, book, variantID, _ := rejectionFixture(t)
 	if err := repo.db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if rejected, err := repo.IsRejected(context.Background(), book.ID, "/downloads/mam/dune.epub"); err == nil || rejected {
+	if rejected, err := repo.IsRejected(context.Background(), book.ID, variantID, "/downloads/mam/dune.epub"); err == nil || rejected {
 		t.Fatalf("closed DB lookup = %t, %v; must return error, never a clean negative", rejected, err)
 	}
 }
@@ -138,7 +171,7 @@ func TestVariantRejectionsSurviveReopenForRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer again.Close()
-	if rejected, err := NewVariantRejectionRepo(again).IsRejected(ctx, book.ID, source); err != nil || !rejected {
+	if rejected, err := NewVariantRejectionRepo(again).IsRejected(ctx, book.ID, variants[0].ID, source); err != nil || !rejected {
 		t.Fatalf("retry after reopen lost rejection: %t, %v", rejected, err)
 	}
 }

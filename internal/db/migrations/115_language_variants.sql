@@ -19,12 +19,12 @@ ALTER TABLE requests ADD COLUMN languages_json TEXT NOT NULL DEFAULT '["eng"]';
 CREATE TABLE variant_rejections (
     id          INTEGER PRIMARY KEY,
     book_id     INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
-    variant_id  INTEGER REFERENCES book_variants(id),
+    variant_id  INTEGER NOT NULL REFERENCES book_variants(id),
     download_id INTEGER REFERENCES downloads(id),
     source_path TEXT NOT NULL,
     reason      TEXT NOT NULL,
     created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (book_id, source_path)
+    UNIQUE (book_id, variant_id, source_path)
 );
 
 -- +migrate Down

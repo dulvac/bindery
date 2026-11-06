@@ -176,7 +176,7 @@ func (f *rejectSourceFixture) body() map[string]any {
 
 func (f *rejectSourceFixture) assertNoRejection(t *testing.T) {
 	t.Helper()
-	got, err := f.rejected.IsRejected(f.ctx, f.book.ID, f.source)
+	got, err := f.rejected.IsRejected(f.ctx, f.book.ID, f.variant.ID, f.source)
 	if err != nil || got {
 		t.Fatalf("unsafe rejection recorded: %t %v", got, err)
 	}
@@ -191,7 +191,7 @@ func TestRejectSourceAdminHardlinkIdempotentAndNonDestructive(t *testing.T) {
 			t.Fatalf("call %d: %d %s", i, rec.Code, rec.Body.String())
 		}
 	}
-	got, err := f.rejected.IsRejected(f.ctx, f.book.ID, f.source)
+	got, err := f.rejected.IsRejected(f.ctx, f.book.ID, f.variant.ID, f.source)
 	if err != nil || !got {
 		t.Fatalf("expected source rejection: %t %v", got, err)
 	}
@@ -212,6 +212,9 @@ func TestRejectSourceAdminHardlinkIdempotentAndNonDestructive(t *testing.T) {
 	variants, err := f.database.VariantRepo().ListByBook(f.ctx, f.book.ID)
 	if err != nil || len(variants) != 2 || variants[0].Status != models.VariantWanted {
 		t.Fatalf("unrelated English variant changed: %+v %v", variants, err)
+	}
+	if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, variants[0].ID, f.source); err != nil || rejected {
+		t.Fatalf("admin rejection leaked to English variant: %t %v", rejected, err)
 	}
 }
 
@@ -359,7 +362,7 @@ func TestRejectSourceSharedSaveRootUsesExactListedFile(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("shared save root = %d %s; want 200", rec.Code, rec.Body.String())
 	}
-	if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, f.source); err != nil || !rejected {
+	if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, f.variant.ID, f.source); err != nil || !rejected {
 		t.Fatalf("exact source was not recorded: %t %v", rejected, err)
 	}
 }
@@ -420,7 +423,7 @@ func TestRejectSourceAcceptsSingleFileTorrentContentPath(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("single-file source = %d %s", rec.Code, rec.Body.String())
 	}
-	if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, f.source); err != nil || !rejected {
+	if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, f.variant.ID, f.source); err != nil || !rejected {
 		t.Fatalf("single-file source not recorded: %t %v", rejected, err)
 	}
 }
@@ -435,7 +438,7 @@ func TestRejectSourceMapsGlobalRemapWhenClientHasNone(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("global path remap: %d %s; want 200", rec.Code, rec.Body.String())
 	}
-	if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, f.source); err != nil || !rejected {
+	if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, f.variant.ID, f.source); err != nil || !rejected {
 		t.Fatalf("remapped torrent source not recorded: %t %v", rejected, err)
 	}
 }
@@ -452,7 +455,7 @@ func TestRejectSourceLegacyEbookWithoutImportPath(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("historical EPUB: %d %s; want 200", rec.Code, rec.Body.String())
 	}
-	if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, f.source); err != nil || !rejected {
+	if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, f.variant.ID, f.source); err != nil || !rejected {
 		t.Fatalf("historical EPUB source not rejected: %t %v", rejected, err)
 	}
 }
@@ -554,7 +557,7 @@ func TestRejectSourceAudiobookTrackedFolder(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("audiobook folder: %d %s; want 200", rec.Code, rec.Body.String())
 	}
-	if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, sourceDir); err != nil || !rejected {
+	if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, variantID, sourceDir); err != nil || !rejected {
 		t.Fatalf("audiobook source folder not rejected: %t %v", rejected, err)
 	}
 }
@@ -567,7 +570,7 @@ func TestRejectSourceAudiobookRefusesSourceInsideTrackedFolder(t *testing.T) {
 		if rec.Code != http.StatusConflict {
 			t.Fatalf("single-file overlap: %d %s; want 409", rec.Code, rec.Body.String())
 		}
-		if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, sourceTrack); err != nil || rejected {
+		if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, variantID, sourceTrack); err != nil || rejected {
 			t.Fatalf("single-file overlap was rejected: %t %v", rejected, err)
 		}
 	})
@@ -589,7 +592,7 @@ func TestRejectSourceAudiobookRefusesSourceInsideTrackedFolder(t *testing.T) {
 		if rec.Code != http.StatusConflict {
 			t.Fatalf("nested overlap: %d %s; want 409", rec.Code, rec.Body.String())
 		}
-		if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, nestedDir); err != nil || rejected {
+		if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, variantID, nestedDir); err != nil || rejected {
 			t.Fatalf("nested overlap was rejected: %t %v", rejected, err)
 		}
 	})
@@ -628,7 +631,7 @@ func TestRejectSourceAudiobookRequiresEveryMediaMember(t *testing.T) {
 			if rec.Code != http.StatusConflict {
 				t.Fatalf("audiobook with unproved member = %d %s; want 409", rec.Code, rec.Body.String())
 			}
-			if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, sourceDir); err != nil || rejected {
+			if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, variantID, sourceDir); err != nil || rejected {
 				t.Fatalf("unproved audiobook source was rejected: %t %v", rejected, err)
 			}
 		})
@@ -654,7 +657,7 @@ func TestRejectSourceForeignFileInSameSaveDirectory(t *testing.T) {
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("foreign file: %d %s; want 409", rec.Code, rec.Body.String())
 	}
-	if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, foreign); err != nil || rejected {
+	if rejected, err := f.rejected.IsRejected(f.ctx, f.book.ID, f.variant.ID, foreign); err != nil || rejected {
 		t.Fatalf("foreign release was rejected: %t %v", rejected, err)
 	}
 }
