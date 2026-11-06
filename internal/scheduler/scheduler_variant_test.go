@@ -188,6 +188,116 @@ func TestVariantTerminalImportReviewDoesNotTriggerDuplicateGrab(t *testing.T) {
 	}
 }
 
+// Sweep explicitly at both sides of the named old-torrent action. The prior
+// two-call path could expose wanted between review retry and import re-arming;
+// neither boundary here may spend a fresh search or send.
+func TestVariantExistingTorrentRetryInterleavedWantedSweepsNeverGrab(t *testing.T) {
+	s, search, downloads, book, sends := variantGrabFixture(t)
+	ctx := context.Background()
+	copies, err := s.books.VariantRepo().EnsureWanted(ctx, book.ID, models.MediaTypeEbook, []string{"eng"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &models.DownloadClient{Name: "retained-qbit", Type: "qbittorrent", Host: "127.0.0.1", Port: 1}
+	if err := s.clients.Create(ctx, client); err != nil {
+		t.Fatal(err)
+	}
+	hash := "abcdef1234567890abcdef1234567890abcdef12"
+	dl := &models.Download{GUID: "retry-existing-torrent", Title: "Dune [ENG / EPUB]", BookID: &book.ID,
+		VariantID: &copies[0].ID, DownloadClientID: &client.ID, TorrentID: &hash, Protocol: "torrent", Status: models.StateGrabbed}
+	if err := downloads.Create(ctx, dl); err != nil {
+		t.Fatal(err)
+	}
+	if err := downloads.UpdateStatus(ctx, dl.ID, models.StateDownloading); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.books.VariantRepo().MarkDownloading(ctx, copies[0].ID); err != nil || !ok {
+		t.Fatalf("mark old grab: %t %v", ok, err)
+	}
+	for _, next := range []models.DownloadState{models.StateCompleted, models.StateImportPending, models.StateImporting} {
+		if err := downloads.UpdateStatus(ctx, dl.ID, next); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := downloads.SetErrorWithStatus(ctx, dl.ID, models.StateImportBlocked, "file list unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	assertNoGrab := func(phase string, status models.DownloadState) {
+		t.Helper()
+		if queue := s.wantedSearchQueue(ctx); len(queue) != 0 {
+			t.Fatalf("%s: sweep queued new release: %+v", phase, queue)
+		}
+		s.SearchAndGrabBook(ctx, *book)
+		rows, err := downloads.List(ctx)
+		if err != nil || len(rows) != 1 || rows[0].Status != status || rows[0].TorrentID == nil || *rows[0].TorrentID != hash || len(search.calls) != 0 || *sends != 0 {
+			t.Fatalf("%s: old torrent changed or new release sent: rows=%+v searches=%d sends=%d err=%v", phase, rows, len(search.calls), *sends, err)
+		}
+	}
+	assertNoGrab("before named retry", models.StateImportBlocked)
+	accepted, found, err := downloads.ResetImportRetry(ctx, dl.ID)
+	if err != nil || accepted || !found {
+		t.Fatalf("unnamed queue retry bypassed review: %t %t %v", accepted, found, err)
+	}
+	approved, err := downloads.RetryReviewedImport(ctx, book.ID, copies[0].ID, dl.ID, 42, "old torrent file list recovered")
+	if err != nil || !approved {
+		t.Fatalf("atomic named retry: %t %v", approved, err)
+	}
+	assertNoGrab("after named retry", models.StateImportFailed)
+	current, err := s.books.VariantRepo().ListByBook(ctx, book.ID)
+	if err != nil || len(current) != 1 || current[0].Status != models.VariantDownloading {
+		t.Fatalf("named retry exposed wanted between sweeps: %+v %v", current, err)
+	}
+}
+
+// An exhausted old import is a review hold until an admin explicitly chooses
+// a new release. Once they do, it must not be hidden by the dead old row.
+func TestVariantExhaustedReviewedNewReleaseReentersWantedSweep(t *testing.T) {
+	s, search, downloads, book, sends := variantGrabFixture(t)
+	ctx := context.Background()
+	copies, err := s.books.VariantRepo().EnsureWanted(ctx, book.ID, models.MediaTypeEbook, []string{"eng"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dl := &models.Download{GUID: "old-exhausted-torrent", Title: "Dune [ENG / EPUB]", BookID: &book.ID,
+		VariantID: &copies[0].ID, Protocol: "torrent", Status: models.StateGrabbed}
+	if err := downloads.Create(ctx, dl); err != nil {
+		t.Fatal(err)
+	}
+	if err := downloads.UpdateStatus(ctx, dl.ID, models.StateDownloading); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.books.VariantRepo().MarkDownloading(ctx, copies[0].ID); err != nil || !ok {
+		t.Fatalf("old grab not downloading: %t %v", ok, err)
+	}
+	for _, next := range []models.DownloadState{models.StateCompleted, models.StateImportPending, models.StateImporting} {
+		if err := downloads.UpdateStatus(ctx, dl.ID, next); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < db.ImportRetryLimit; i++ {
+		if err := downloads.IncrementImportRetryCount(ctx, dl.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := downloads.RecoverInterruptedImports(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if queue := s.wantedSearchQueue(ctx); len(queue) != 0 {
+		t.Fatalf("review queued an unattended grab: %+v", queue)
+	}
+	approved, err := s.books.VariantRepo().RetryReviewed(ctx, book.ID, copies[0].ID, 42, "seek another release")
+	if err != nil || !approved {
+		t.Fatalf("new-release decision: %t %v", approved, err)
+	}
+	queue := s.wantedSearchQueue(ctx)
+	if len(queue) != 1 || queue[0].book.ID != book.ID || len(queue[0].formats) != 1 || queue[0].formats[0] != models.MediaTypeEbook {
+		t.Fatalf("exhausted old import hid named new-release search: %+v", queue)
+	}
+	if len(search.calls) != 0 || *sends != 0 {
+		t.Fatalf("queue inspection sent a release: searches=%d sends=%d", len(search.calls), *sends)
+	}
+}
+
 func TestVariantGrabImportedEnglishStillSearchesMissingRomanian(t *testing.T) {
 	s, search, downloads, book, sends := variantGrabFixture(t)
 	ctx := context.Background()

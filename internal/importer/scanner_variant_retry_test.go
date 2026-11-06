@@ -14,7 +14,7 @@ import (
 	"github.com/vavallee/bindery/internal/models"
 )
 
-func TestVariantImport_RejectedSourcesStayRejectedAcrossQbitRetries(t *testing.T) {
+func TestVariantImport_RejectedSourcesStayRejectedAcrossQbitPollsAndRefusedRetries(t *testing.T) {
 	for _, audio := range []bool{false, true} {
 		name := "ebook"
 		format := models.MediaTypeEbook
@@ -74,8 +74,12 @@ func TestVariantImport_RejectedSourcesStayRejectedAcrossQbitRetries(t *testing.T
 			for attempt := 0; attempt < 2; attempt++ {
 				if attempt > 0 {
 					ok, found, err := f.downloads.ResetImportRetry(f.ctx, dl.ID)
-					if err != nil || !ok || !found {
-						t.Fatalf("rearm retry = %t %t %v", ok, found, err)
+					if err != nil || ok || !found {
+						t.Fatalf("generic retry bypassed review = %t %t %v", ok, found, err)
+					}
+					ok, err = f.downloads.RetryReviewedImport(f.ctx, f.book.ID, f.variant.ID, dl.ID, 42, "retry rejected source")
+					if err != nil || ok {
+						t.Fatalf("rejected source was rearmed = %t %v", ok, err)
 					}
 				}
 				f.scanner.checkQbittorrentDownloads(f.ctx, client)
@@ -350,12 +354,21 @@ func TestVariantRetry_SecondFileDBFailureRollsBackWholeBundle(t *testing.T) {
 	if _, err := f.database.ExecContext(f.ctx, `DROP TRIGGER refuse_second_variant_file`); err != nil {
 		t.Fatal(err)
 	}
-	approved, err := f.books.VariantRepo().RetryReviewed(f.ctx, f.book.ID, f.variant.ID, 42, "retry after staging failure")
-	if err != nil || !approved {
-		t.Fatalf("manual review retry: %t %v", approved, err)
-	}
-	if _, err := f.database.ExecContext(f.ctx, `UPDATE downloads SET status='completed' WHERE id=?`, dl.ID); err != nil {
+	// Attach the retained torrent identity to this direct-import fixture so
+	// the named existing-torrent action can rearm it without exposing wanted.
+	client := &models.DownloadClient{Name: "test-retained-torrent", Type: "qbittorrent", Host: "127.0.0.1", Port: 1}
+	if err := db.NewDownloadClientRepo(f.database).Create(f.ctx, client); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := f.database.ExecContext(f.ctx, `UPDATE downloads SET download_client_id=? WHERE id=?`, client.ID, dl.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.downloads.SetTorrentID(f.ctx, dl.ID, "retained-test-hash"); err != nil {
+		t.Fatal(err)
+	}
+	approved, err := f.downloads.RetryReviewedImport(f.ctx, f.book.ID, f.variant.ID, dl.ID, 42, "retry after staging failure")
+	if err != nil || !approved {
+		t.Fatalf("named existing-torrent retry: %t %v", approved, err)
 	}
 	importTwoKindleFiles(t, f, dl, files)
 	variantBlocked(t, f, dl, "no-replace")

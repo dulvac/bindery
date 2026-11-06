@@ -1136,6 +1136,20 @@ func (h *QueueHandler) RetryImport(w http.ResponseWriter, r *http.Request) {
 		status := models.DownloadState("unknown")
 		if d, err := h.downloads.GetByID(r.Context(), id); err == nil && d != nil {
 			status = d.Status
+			if d.VariantID != nil && d.BookID != nil && h.books != nil {
+				variants, err := h.books.VariantRepo().ListByBook(r.Context(), *d.BookID)
+				if err != nil {
+					writeServerError(w, r, err)
+					return
+				}
+				for _, v := range variants {
+					if v.ID == *d.VariantID && v.Status == models.VariantReview {
+						writeJSON(w, http.StatusConflict, map[string]string{"error": fmt.Sprintf(
+							"variant is in review: retry the existing torrent with the named admin action POST /api/v1/book/%d/variants/%d/retry-import (downloadId and reason); use /retry only to seek a new release", *d.BookID, *d.VariantID)})
+						return
+					}
+				}
+			}
 		}
 		writeJSON(w, http.StatusConflict, map[string]string{"error": retryImportConflictDetail(status)})
 		return
@@ -1164,7 +1178,7 @@ var errRetryNotResendable = errors.New("download cannot be retried")
 // user verbatim, so it names the state that was refused as well as the two
 // ResetImportRetry accepts.
 func retryImportConflictDetail(status models.DownloadState) string {
-	detail := fmt.Sprintf("download is %s, so it has no failed import to retry: only importFailed and importBlocked downloads do", status)
+	detail := fmt.Sprintf("download is %s: retry import here accepts legacy importFailed and importBlocked downloads, or variant-bound importFailed downloads below the retry limit with a downloading variant; a reviewed torrent needs a named admin existing-torrent retry", status)
 	if status == models.StateFailed {
 		detail += ". This download never finished, so there are no files to import; retry the download to send the release again"
 	}

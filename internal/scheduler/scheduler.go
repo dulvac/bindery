@@ -2057,8 +2057,9 @@ func (s *Scheduler) inFlightVariants(ctx context.Context) map[int64]bool {
 	if s.downloads == nil {
 		return busy
 	}
-	// ImportFailed still has automatic scanner retries; unlike a dead
-	// download-side failure it must not spend another indexer query.
+	// ImportFailed still has automatic scanner retries until its budget is
+	// spent; an exhausted row is held by review until a named new-release
+	// decision reopens the variant.
 	states := append(slices.Clone(inFlightDownloadStates), models.StateImportFailed)
 	active, err := s.downloads.ListByStatuses(ctx, states...)
 	if err != nil {
@@ -2066,6 +2067,9 @@ func (s *Scheduler) inFlightVariants(ctx context.Context) map[int64]bool {
 		return busy
 	}
 	for _, d := range active {
+		if d.Status == models.StateImportFailed && d.ImportRetryCount >= db.ImportRetryLimit {
+			continue
+		}
 		if d.VariantID != nil {
 			busy[*d.VariantID] = true
 		}

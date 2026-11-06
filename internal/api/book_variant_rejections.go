@@ -58,6 +58,7 @@ func RegisterVariantRejectionRoute(r chi.Router, h *BookHandler) {
 		r.Use(auth.RequireAdmin)
 		r.Post("/book/{id}/variants/{variantId}/reject-source", h.RejectVariantSource)
 		r.Post("/book/{id}/variants/{variantId}/retry", h.RetryReviewedVariant)
+		r.Post("/book/{id}/variants/{variantId}/retry-import", h.RetryReviewedVariantImport)
 	})
 }
 

@@ -72,3 +72,79 @@ func (h *BookHandler) RetryReviewedVariant(w http.ResponseWriter, r *http.Reques
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "wanted"})
 }
+
+// RetryReviewedVariantImport is a separate named admin decision to retry the
+// old torrent, without releasing the reviewed copy to a wanted search. The
+// DB switches both states and writes the audit in one transaction.
+func (h *BookHandler) RetryReviewedVariantImport(w http.ResponseWriter, r *http.Request) {
+	if auth.UserRoleFromContext(r.Context()) != auth.RoleAdmin {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin role required"})
+		return
+	}
+	actor := auth.UserIDFromContext(r.Context())
+	if actor <= 0 {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "named admin required"})
+		return
+	}
+	if h.downloads == nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "download retry is not configured"})
+		return
+	}
+	book, ok := h.loadOwnedBook(w, r)
+	if !ok {
+		return
+	}
+	variantID, err := strconv.ParseInt(chi.URLParam(r, "variantId"), 10, 64)
+	if err != nil || variantID <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid variant id"})
+		return
+	}
+	var input struct {
+		DownloadID int64  `json:"downloadId"`
+		Reason     string `json:"reason"`
+	}
+	if err := decodeStrict(w, r, 4096, false, &input); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid retry request"})
+		return
+	}
+	input.Reason = strings.TrimSpace(input.Reason)
+	if input.DownloadID <= 0 || input.Reason == "" || len(input.Reason) > 500 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "downloadId and reason are required (max 500 bytes)"})
+		return
+	}
+	variants, err := h.books.VariantRepo().ListByBook(r.Context(), book.ID)
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	found := false
+	for _, v := range variants {
+		if v.ID == variantID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "variant not found"})
+		return
+	}
+	dl, err := h.downloads.GetByID(r.Context(), input.DownloadID)
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if dl == nil || dl.BookID == nil || *dl.BookID != book.ID || dl.VariantID == nil || *dl.VariantID != variantID {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "download not found"})
+		return
+	}
+	changed, err := h.downloads.RetryReviewedImport(r.Context(), book.ID, variantID, input.DownloadID, actor, input.Reason)
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if !changed {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "variant or torrent is not available for a reviewed import retry"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "downloading"})
+}

@@ -801,9 +801,10 @@ const wedgedCompletedReconcileCap = 50
 //     automatic re-entry. CheckDownloads only retries from StateImportFailed,
 //     so without this sweep the download is wedged forever (issue #706
 //     finding 1). Moving it to StateImportFailed lets the existing retry path
-//     (CheckDownloads, while the source is still in the client) pick it up; if
-//     the source has since vanished, the same path now terminally blocks it
-//     (finding 4) rather than leaving it silently stuck.
+//     (CheckDownloads, while the source is still in the client) pick it up
+//     while retries remain. An interrupted attempt that spent its budget
+//     enters variant review atomically without waiting for a client poll; a
+//     vanished source below the limit still blocks on a later poll (finding 4).
 //
 //  2. StateCompleted with no book_files row — the state machine allows
 //     Completed -> ImportPending, but the transition is driven by the scanner
@@ -834,20 +835,19 @@ func (s *Scanner) RecoverInterruptedImports(ctx context.Context) {
 		// error; emit history for those.
 	}
 	for _, id := range recovered {
-		slog.Info("recovered interrupted import — re-queued for retry", "download_id", id)
 		dl, getErr := s.downloadByID(ctx, id)
 		if getErr != nil || dl == nil {
 			continue
 		}
+		slog.Info("recovered interrupted import", "download_id", id, "reason", dl.ErrorMessage)
 		s.createHistoryEvent(ctx, models.HistoryEventImportFailed, dl.Title, dl.BookID, map[string]string{
 			"guid":    dl.GUID,
-			"message": "import interrupted (process restart) — re-queued for retry",
+			"message": dl.ErrorMessage,
 			"status":  string(models.StateImportFailed),
 		})
-		// Intentionally NOT firing EventDownloadFailed here: this is a benign
-		// startup-recovery transition that re-queues the import for retry, not a
-		// terminal failure. Webhooking every interrupted import on every restart
-		// would be noise for the user (issue #849).
+		// Recovery publishes history but does not fire EventDownloadFailed:
+		// every interrupted import gets the same startup treatment, and a
+		// webhook on each restart would be noise (issue #849).
 	}
 
 	s.recoverWedgedCompleted(ctx)

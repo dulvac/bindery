@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -25,8 +26,10 @@ var ErrVariantUnavailable = errors.New("book variant is not available for a grab
 const ImportRetryLimit = 5
 
 // The reservation and status reconciliation must agree about what still fills
-// a variant. A failed or imported download alone does not fill it.
-const variantActiveSQL = `status IN ('grabbed', 'downloading', 'completed', 'importPending', 'importing', 'importExternal', 'importHeld', 'importFailed')`
+// a variant. Exhausted importFailed rows cannot retry on their own, so only
+// a still-retryable importFailed reserves a wanted variant.
+var variantActiveSQL = fmt.Sprintf(`(status IN ('grabbed', 'downloading', 'completed', 'importPending', 'importing', 'importExternal', 'importHeld')
+	OR (status = 'importFailed' AND import_retry_count < %d))`, ImportRetryLimit)
 
 func checkVariantClaim(ctx context.Context, tx *sql.Tx, d *models.Download) error {
 	if d.VariantID == nil {
@@ -558,6 +561,76 @@ func (r *DownloadRepo) claimForRegrab(ctx context.Context, d *models.Download, q
 	return true, nil
 }
 
+// RetryReviewedImport records a named admin decision to retry the existing
+// torrent, not to seek another release. The old download becomes importFailed
+// and the reviewed variant becomes downloading in one transaction. Neither
+// row is ever wanted, and the torrent and source are not modified. A rejected
+// source, tracked file, other active download, or mismatched association
+// refuses the retry without changing anything.
+func (r *DownloadRepo) RetryReviewedImport(ctx context.Context, bookID, variantID, downloadID, actorID int64, reason string) (bool, error) {
+	reason = strings.TrimSpace(reason)
+	if bookID <= 0 || variantID <= 0 || downloadID <= 0 || actorID <= 0 || reason == "" || len(reason) > 500 {
+		return false, fmt.Errorf("reviewed import retry requires book, variant, download, actor and reason (max 500 bytes)")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin reviewed import retry: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, `UPDATE book_variants SET status='downloading'
+		WHERE id=? AND book_id=? AND status='review'
+		AND NOT EXISTS (SELECT 1 FROM book_files f WHERE f.variant_id=book_variants.id)
+		AND NOT EXISTS (SELECT 1 FROM downloads other WHERE other.variant_id=book_variants.id
+			AND other.id != ? AND `+variantActiveSQL+`)
+		AND NOT EXISTS (SELECT 1 FROM variant_rejections rejection
+			WHERE rejection.variant_id=book_variants.id AND rejection.download_id=?)
+		AND EXISTS (SELECT 1 FROM downloads d WHERE d.id=? AND d.book_id=book_variants.book_id
+			AND d.variant_id=book_variants.id AND d.status IN ('importFailed', 'importBlocked')
+			AND d.protocol='torrent' AND d.torrent_id IS NOT NULL AND TRIM(d.torrent_id) != ''
+			AND d.download_client_id IS NOT NULL)`, variantID, bookID, downloadID, downloadID, downloadID)
+	if err != nil {
+		return false, fmt.Errorf("claim reviewed variant for old torrent: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("count reviewed variant claims: %w", err)
+	}
+	if n != 1 {
+		return false, nil
+	}
+	res, err = tx.ExecContext(ctx, `UPDATE downloads SET status=?, import_retry_count=0,
+		error_message='', dead_at=NULL WHERE id=? AND book_id=? AND variant_id=?
+		AND status IN (?, ?)`, models.StateImportFailed, downloadID, bookID, variantID,
+		models.StateImportFailed, models.StateImportBlocked)
+	if err != nil {
+		return false, fmt.Errorf("rearm reviewed torrent import: %w", err)
+	}
+	n, err = res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("count rearmed torrent imports: %w", err)
+	}
+	if n != 1 {
+		return false, nil // transaction rolls back the variant claim
+	}
+	data, err := json.Marshal(struct {
+		ActorUserID int64  `json:"actorUserId"`
+		VariantID   int64  `json:"variantId"`
+		DownloadID  int64  `json:"downloadId"`
+		Reason      string `json:"reason"`
+	}{actorID, variantID, downloadID, reason})
+	if err != nil {
+		return false, fmt.Errorf("encode reviewed import retry audit: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO history (book_id, event_type, source_title, data, created_at)
+		VALUES (?, 'variantImportRetried', '', ?, ?)`, bookID, string(data), time.Now().UTC()); err != nil {
+		return false, fmt.Errorf("audit reviewed import retry: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit reviewed import retry: %w", err)
+	}
+	return true, nil
+}
+
 // ResetImportRetry atomically re-enables scanner retries for a download stuck
 // in StateImportFailed — or one already terminally blocked (StateImportBlocked)
 // after exhausting its retry budget, which it flips back to StateImportFailed so
@@ -571,13 +644,21 @@ func (r *DownloadRepo) claimForRegrab(ctx context.Context, d *models.Download, q
 // the field on the way through UpdateStatus, and the external hand-off settles
 // in StateImportExternal instead, where the row lives in the queue permanently
 // and would display the stale error next to an import that demonstrably worked.
+// A variant-bound terminal block or exhausted retry needs the separate named
+// RetryReviewedImport decision, even if a different active download keeps the
+// variant downloading. This also closes the old review -> wanted -> generic
+// retry window in which a scheduled search could grab a new release.
 func (r *DownloadRepo) ResetImportRetry(ctx context.Context, id int64) (accepted bool, found bool, err error) {
 	// dead_at is cleared with the rest: a re-armed row is no longer dead, and
 	// leaving the stamp would have it describe an attempt that is being
 	// retried (#2710).
 	result, err := r.db.ExecContext(ctx,
-		"UPDATE downloads SET import_retry_count=0, error_message='', dead_at=NULL, status=? WHERE id=? AND status IN (?, ?)",
-		models.StateImportFailed, id, models.StateImportFailed, models.StateImportBlocked)
+		`UPDATE downloads SET import_retry_count=0, error_message='', dead_at=NULL, status=?
+		WHERE id=? AND status IN (?, ?) AND (variant_id IS NULL OR (
+			status=? AND import_retry_count < ? AND EXISTS (
+				SELECT 1 FROM book_variants v WHERE v.id = downloads.variant_id AND v.status = 'downloading')))`,
+		models.StateImportFailed, id, models.StateImportFailed, models.StateImportBlocked,
+		models.StateImportFailed, ImportRetryLimit)
 	if err != nil {
 		return false, false, fmt.Errorf("reset import retry: %w", err)
 	}
@@ -783,10 +864,21 @@ func (r *DownloadRepo) SetError(ctx context.Context, id int64, errMsg string) er
 }
 
 func (r *DownloadRepo) releaseFailedVariant(ctx context.Context, downloadID int64) error {
-	_, err := r.db.ExecContext(ctx, `UPDATE book_variants SET status = 'wanted'
+	// The last live claim may die after a sibling import already exhausted its
+	// budget. Keep that old failed torrent in review rather than silently
+	// releasing the variant to another scheduled grab.
+	_, err := r.db.ExecContext(ctx, `UPDATE book_variants SET status = CASE
+		WHEN EXISTS (SELECT 1 FROM book_files f WHERE f.variant_id = book_variants.id
+			AND f.book_id = book_variants.book_id AND f.format = book_variants.media_type
+			AND (f.verification = 'verified' AND f.language = book_variants.language
+				OR f.verification = 'unverified')) THEN 'imported'
+		WHEN EXISTS (SELECT 1 FROM downloads d WHERE d.variant_id = book_variants.id
+			AND d.book_id = book_variants.book_id AND (d.status = 'importBlocked'
+				OR (d.status = 'importFailed' AND d.import_retry_count >= ?))) THEN 'review'
+		ELSE 'wanted' END
 		WHERE id = (SELECT variant_id FROM downloads WHERE id = ?)
 		AND status = 'downloading'
-		AND NOT EXISTS (SELECT 1 FROM downloads WHERE variant_id = book_variants.id AND `+variantActiveSQL+`)`, downloadID)
+		AND NOT EXISTS (SELECT 1 FROM downloads WHERE variant_id = book_variants.id AND `+variantActiveSQL+`)`, ImportRetryLimit, downloadID)
 	if err != nil {
 		return fmt.Errorf("release failed download's variant: %w", err)
 	}
@@ -832,24 +924,33 @@ func (r *DownloadRepo) SetErrorWithStatus(ctx context.Context, id int64, status 
 	// file wins, another live download stays downloading, and an existing
 	// review decision is never overwritten.
 	if status == models.StateImportBlocked || status == models.StateImportFailed && retries >= ImportRetryLimit {
-		_, err := tx.ExecContext(ctx, `UPDATE book_variants SET status = CASE
-			WHEN EXISTS (SELECT 1 FROM book_files f WHERE f.variant_id = book_variants.id
-				AND f.book_id = book_variants.book_id AND f.format = book_variants.media_type
-				AND (f.verification = 'verified' AND f.language = book_variants.language
-					OR f.verification = 'unverified')) THEN 'imported'
-			WHEN EXISTS (SELECT 1 FROM downloads d WHERE d.variant_id = book_variants.id
-				AND d.book_id = book_variants.book_id AND d.id != ? AND `+variantActiveSQL+`
-				AND NOT (d.status = 'importFailed' AND d.import_retry_count >= ?)) THEN 'downloading'
-			ELSE 'review' END
-			WHERE id = (SELECT variant_id FROM downloads WHERE id = ?)
-				AND status IN ('wanted', 'downloading')`,
-			id, ImportRetryLimit, id)
-		if err != nil {
-			return fmt.Errorf("reconcile terminal import variant: %w", err)
+		if err := reconcileTerminalImportVariant(ctx, tx, id); err != nil {
+			return err
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit import failure transition: %w", err)
+	}
+	return nil
+}
+
+// reconcileTerminalImportVariant must run in the same transaction as the
+// download's terminal transition. A failed reconciliation leaves the old
+// download state intact so recovery can retry after the database is repaired.
+func reconcileTerminalImportVariant(ctx context.Context, tx *sql.Tx, id int64) error {
+	_, err := tx.ExecContext(ctx, `UPDATE book_variants SET status = CASE
+		WHEN EXISTS (SELECT 1 FROM book_files f WHERE f.variant_id = book_variants.id
+			AND f.book_id = book_variants.book_id AND f.format = book_variants.media_type
+			AND (f.verification = 'verified' AND f.language = book_variants.language
+				OR f.verification = 'unverified')) THEN 'imported'
+		WHEN EXISTS (SELECT 1 FROM downloads d WHERE d.variant_id = book_variants.id
+			AND d.book_id = book_variants.book_id AND d.id != ? AND `+variantActiveSQL+`) THEN 'downloading'
+		ELSE 'review' END
+		WHERE id = (SELECT variant_id FROM downloads WHERE id = ?)
+			AND status IN ('wanted', 'downloading')`,
+		id, id)
+	if err != nil {
+		return fmt.Errorf("reconcile terminal import variant: %w", err)
 	}
 	return nil
 }
@@ -865,10 +966,12 @@ func (r *DownloadRepo) IncrementImportRetryCount(ctx context.Context, id int64) 
 
 // RecoverInterruptedImports moves every download stuck in a non-terminal,
 // non-resumable import state (StateImporting, StateImportPending) to
-// StateImportFailed so the scanner's retry path (which only fires from
-// StateImportFailed) can pick them up. It is called once on startup: a process
-// crash or timeout mid-import leaves the download in StateImporting/Pending
-// with no automatic re-entry, wedging it forever (issue #706 finding 1).
+// StateImportFailed so the scanner's retry path can pick up attempts below
+// the limit. An attempt that already spent its budget instead puts an
+// unfilled variant in review in the same transaction, even if the client is
+// offline. It is called once on startup: a crash or timeout mid-import leaves
+// the download in StateImporting/Pending with no automatic re-entry (issue
+// #706 finding 1).
 //
 // StateImportExternal is intentionally NOT swept — it is a legitimate
 // long-lived parked state awaiting reconciliation by ScanLibrary, not a
@@ -885,17 +988,54 @@ func (r *DownloadRepo) RecoverInterruptedImports(ctx context.Context) ([]int64, 
 		return nil, nil
 	}
 
-	// Both StateImporting and StateImportPending can legally transition to
-	// StateImportFailed (see validTransitions), so a single guarded UPDATE is
-	// safe. The error_message records why the state moved so the cause is
-	// visible in the Queue/History UI.
-	const msg = "import interrupted (process restart) — re-queued for retry"
+	// Each recovery atomically moves the download and, once the retry budget
+	// is spent, reconciles its variant. A crash during the fifth attempt must
+	// not depend on the download client coming back to release its claim.
 	recovered := make([]int64, 0, len(ids))
 	for _, id := range ids {
-		if _, err := r.db.ExecContext(ctx,
+		tx, err := r.db.BeginTx(ctx, nil)
+		if err != nil {
+			return recovered, fmt.Errorf("begin interrupted import recovery %d: %w", id, err)
+		}
+		var retries int
+		err = tx.QueryRowContext(ctx, "SELECT import_retry_count FROM downloads WHERE id=? AND status IN (?, ?)",
+			id, models.StateImporting, models.StateImportPending).Scan(&retries)
+		if errors.Is(err, sql.ErrNoRows) {
+			_ = tx.Rollback()
+			continue
+		}
+		if err != nil {
+			_ = tx.Rollback()
+			return recovered, fmt.Errorf("look up interrupted import %d: %w", id, err)
+		}
+		msg := "import interrupted (process restart) — re-queued for retry"
+		if retries >= ImportRetryLimit {
+			msg = "import interrupted (process restart) — retry limit reached; review required"
+		}
+		result, err := tx.ExecContext(ctx,
 			"UPDATE downloads SET status=?, error_message=? WHERE id=? AND status IN (?, ?)",
-			models.StateImportFailed, msg, id, models.StateImporting, models.StateImportPending); err != nil {
+			models.StateImportFailed, msg, id, models.StateImporting, models.StateImportPending)
+		if err != nil {
+			_ = tx.Rollback()
 			return recovered, fmt.Errorf("recover interrupted import %d: %w", id, err)
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			_ = tx.Rollback()
+			return recovered, fmt.Errorf("count interrupted import recovery %d: %w", id, err)
+		}
+		if n == 0 {
+			_ = tx.Rollback()
+			continue
+		}
+		if retries >= ImportRetryLimit {
+			if err := reconcileTerminalImportVariant(ctx, tx, id); err != nil {
+				_ = tx.Rollback()
+				return recovered, fmt.Errorf("recover interrupted import %d: %w", id, err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return recovered, fmt.Errorf("commit interrupted import recovery %d: %w", id, err)
 		}
 		recovered = append(recovered, id)
 	}

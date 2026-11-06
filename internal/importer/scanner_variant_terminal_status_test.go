@@ -109,15 +109,14 @@ func TestVariantTerminalQbitMissingFileListReconcilesAfterRetries(t *testing.T) 
 		t.Fatalf("failed torrent missing from actionable queue: %+v %v", active, err)
 	}
 	assertTerminalSourceUnchanged(t, source, before, mutators)
-	// A person can re-open this copy with a named audit, then retry import of
-	// the existing torrent. This does not send or replace the seed.
-	approved, err := f.books.VariantRepo().RetryReviewed(f.ctx, f.book.ID, f.variant.ID, 42, "qBittorrent Files list recovered")
+	// The named existing-torrent action re-arms both rows atomically. It
+	// never exposes wanted or sends/replaces the seed.
+	approved, err := f.downloads.RetryReviewedImport(f.ctx, f.book.ID, f.variant.ID, dl.ID, 42, "qBittorrent Files list recovered")
 	if err != nil || !approved {
-		t.Fatalf("manual review retry: %t %v", approved, err)
+		t.Fatalf("rearm existing torrent: %t %v", approved, err)
 	}
-	accepted, found, err := f.downloads.ResetImportRetry(f.ctx, dl.ID)
-	if err != nil || !accepted || !found {
-		t.Fatalf("rearm existing torrent: %t %t %v", accepted, found, err)
+	if status := twoKindleVariantStatus(t, f); status != models.VariantDownloading {
+		t.Fatalf("named retry left variant %q", status)
 	}
 	missingList = false
 	f.scanner.checkQbittorrentDownloads(f.ctx, client)
