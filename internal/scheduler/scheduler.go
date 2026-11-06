@@ -2257,12 +2257,14 @@ func (s *Scheduler) handleStalledDownload(ctx context.Context, dl *models.Downlo
 	}
 	reason := kind.Reason()
 
-	s.removeStalledFromClient(ctx, dl, client, kind.DeletesData())
-
-	// Mark failed in DB.
+	// The snapshot may have finished importing while the client was polled.
+	// Only remove the client job and publish stall effects after the guarded
+	// failure transition has actually taken the row.
 	if err := s.downloads.SetError(ctx, dl.ID, reason); err != nil {
 		slog.Warn("stall: failed to set error", "download_id", dl.ID, "error", err)
+		return
 	}
+	s.removeStalledFromClient(ctx, dl, client, kind.DeletesData())
 
 	// Record history event.
 	if s.history != nil {

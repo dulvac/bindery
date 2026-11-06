@@ -75,11 +75,13 @@ func TestScheduler_ReadErrorsFailSafe(t *testing.T) {
 		"failed to list wanted books",
 		"failed to list authors",
 		"stall: failed to set error",
-		"stall: failed to add to blocklist",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected log %q on a read error; logs:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "stall: failed to add to blocklist") {
+		t.Error("a refused failure transition must not attempt a blocklist write")
 	}
 	if strings.Contains(out, "stall: triggering re-search") {
 		t.Error("a stall whose book cannot be loaded must not start a re-search")

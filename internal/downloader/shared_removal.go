@@ -47,7 +47,7 @@ func clientJobRef(client *models.DownloadClient, dl *models.Download) (ref strin
 //   - failed: the attempt is over and nothing will contact the client for it
 //     again. The pollers skip failed rows, so if a failed row held the job, the
 //     job would never be removed by anyone. The stall handler relies on this:
-//     it marks each stalled row failed after asking for removal, so the last
+//     it marks each stalled row failed before asking for removal, so the last
 //     row of a shared stalled torrent is the one that removes it.
 //   - imported, when the client is set to remove on import: the user has said
 //     an imported download has no further claim on the client, and the import

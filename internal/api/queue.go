@@ -1822,6 +1822,7 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 		slog.Error("failed to send download", "client_type", client.Type, "error", err, "title", req.Title)
 		if setErr := h.downloads.SetError(ctx, dl.ID, err.Error()); setErr != nil {
 			slog.Warn("failed to persist download error", "download_id", dl.ID, "error", setErr)
+			return nil, &sendError{cause: err, pin: pin}
 		}
 		h.recordHistory(ctx, models.HistoryEventDownloadFailed, req.Title, bookID, map[string]any{"guid": req.GUID, "message": err.Error()})
 		if h.notif != nil {
