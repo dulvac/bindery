@@ -31,6 +31,8 @@ import MetadataLinksMenu from '../components/MetadataLinksMenu'
 import { usePolling } from '../components/usePolling'
 import { languageName } from '../util/language'
 import CoverImage from '../components/CoverImage'
+import BookLanguages from '../components/BookLanguages'
+import BookVariantStatus from '../components/BookVariantStatus'
 import { decodeEntities } from '../util/decodeEntities'
 
 function formatDuration(seconds?: number): string {
@@ -128,6 +130,11 @@ function groupRowsByFormat(
     .filter(g => g.rows.length > 0 || (rows.length > 0 && wanted(g.format)))
 }
 
+function requestedFormats(mediaType: string): Array<'ebook' | 'audiobook'> {
+  if (mediaType === 'both') return ['ebook', 'audiobook']
+  if (mediaType === 'audiobook') return ['audiobook']
+  return ['ebook']
+}
 
 // Small coloured dot for a history row, by event type.
 const eventDotColors: Record<string, string> = {
@@ -416,6 +423,10 @@ function BookDetailPageInner() {
   // Series the user took this book out of (#2554). Refreshes leave it out
   // of these; Restore puts it back where it was.
   const [keptOut, setKeptOut] = useState<BookSeriesExclusion[]>([])
+  const [addVariantMediaType, setAddVariantMediaType] = useState<MediaType>('ebook')
+  const [addVariantLanguages, setAddVariantLanguages] = useState<string[]>(['eng'])
+  const [addingVariant, setAddingVariant] = useState(false)
+  const [showAddVariantForm, setShowAddVariantForm] = useState(false)
 
   useEffect(() => {
     if (book?.title) {
@@ -423,6 +434,21 @@ function BookDetailPageInner() {
       return () => { document.title = 'Bindery' }
     }
   }, [book?.title])
+
+  useEffect(() => {
+    if (!book) return
+    const mediaType: MediaType = book.mediaType === 'audiobook' || book.mediaType === 'both' ? book.mediaType : 'ebook'
+    setAddVariantMediaType(mediaType)
+    const formats = requestedFormats(mediaType)
+    const selected = new Set(
+      (book.variants ?? [])
+        .filter(v => formats.includes(v.mediaType as 'ebook' | 'audiobook'))
+        .map(v => (v.language || '').trim().toLowerCase())
+        .filter(Boolean),
+    )
+    setAddVariantLanguages(selected.size > 0 ? Array.from(selected) : ['eng'])
+    setShowAddVariantForm(false)
+  }, [book])
 
   useEffect(() => {
     let cancelled = false
@@ -570,6 +596,40 @@ function BookDetailPageInner() {
       setError(e instanceof Error ? e.message : t('bookDetail.saveFailed'))
     } finally {
       setSaving(false)
+    }
+  }
+
+  const selectedVariantFormats = requestedFormats(addVariantMediaType)
+  const variantSelectionHasMissing = (bookToCheck: Book | null): boolean => {
+    if (!bookToCheck || addVariantLanguages.length === 0) return false
+    const existing = new Set(
+      (bookToCheck.variants ?? [])
+        .map(v => `${v.mediaType}/${(v.language || '').trim().toLowerCase()}`),
+    )
+    return selectedVariantFormats.some(format =>
+      addVariantLanguages.some(language => !existing.has(`${format}/${language}`)),
+    )
+  }
+
+  const addAnotherLanguage = async () => {
+    if (!book || !book.foreignBookId || addVariantLanguages.length === 0 || !variantSelectionHasMissing(book)) return
+    setAddingVariant(true)
+    setError(null)
+    try {
+      await api.addBook({
+        foreignBookId: book.foreignBookId,
+        foreignAuthorId: book.author?.foreignAuthorId ?? '',
+        authorName: book.author?.authorName ?? '',
+        mediaType: addVariantMediaType,
+        languages: addVariantLanguages,
+        searchOnAdd: false,
+      })
+      setBook(await api.getBook(book.id))
+      setShowAddVariantForm(false)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : t('bookDetail.addLanguageFailed', 'Could not add the language'))
+    } finally {
+      setAddingVariant(false)
     }
   }
 
@@ -936,6 +996,8 @@ function BookDetailPageInner() {
   const rows = fileRows(book)
   const groups = groupRowsByFormat(rows, mt)
   const hasAnyFile = rows.length > 0
+  const hasVariantStatuses = (book.variants?.length ?? 0) + (book.legacyFiles?.length ?? 0) > 0
+  const canAddAnotherLanguage = variantSelectionHasMissing(book)
 
   const lang = languageName(book.language)
   const publishedDate = book.releaseDate
@@ -1306,6 +1368,74 @@ function BookDetailPageInner() {
               <MediaBadge type={mt} />
             </span>
           </div>
+
+          {hasVariantStatuses && (
+            <div className="mt-4">
+              <BookVariantStatus
+                variants={book.variants}
+                legacyFiles={book.legacyFiles}
+                testId="book-variant-statuses"
+              />
+            </div>
+          )}
+
+          {isAdmin && (
+            <div className="mt-4 border-t border-slate-200 dark:border-zinc-800 pt-4">
+              <button
+                type="button"
+                className={actionBtnCls}
+                onClick={() => setShowAddVariantForm(open => !open)}
+              >
+                {t('bookDetail.addLanguageButton', 'Add another language')}
+              </button>
+
+              {showAddVariantForm && (
+                <div className="mt-3 space-y-3">
+                  <label className="flex items-center gap-2 text-sm select-none">
+                    <span className="font-medium">{t('bookDetail.addLanguageLabel', 'Add another language')}</span>
+                    <select
+                      aria-label={t('bookDetail.addLanguageFormatLabel', 'Format to extend')}
+                      value={addVariantMediaType}
+                      onChange={event => setAddVariantMediaType(event.target.value as MediaType)}
+                      disabled={addingVariant}
+                      className="text-xs bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-2 py-1"
+                    >
+                      <option value="ebook">{t('common.ebook')}</option>
+                      <option value="audiobook">{t('common.audiobook')}</option>
+                      <option value="both">{t('common.both')}</option>
+                    </select>
+                  </label>
+
+                  <BookLanguages value={addVariantLanguages} onChange={setAddVariantLanguages} disabled={addingVariant} />
+
+                  {!canAddAnotherLanguage && addVariantLanguages.length > 0 && (
+                    <p className="text-xs text-fg-muted">{t('bookDetail.addLanguageDuplicate', 'That format and language selection is already requested.')}</p>
+                  )}
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void addAnotherLanguage()}
+                      disabled={addingVariant || addVariantLanguages.length === 0 || !canAddAnotherLanguage}
+                      className={`px-3 py-1.5 ${primaryFill} disabled:opacity-50 disabled:cursor-not-allowed rounded-md text-sm font-medium`}
+                    >
+                      {addingVariant
+                        ? t('bookDetail.addLanguageSubmitting', 'Adding…')
+                        : t('bookDetail.addLanguageSubmit', 'Submit language request')}
+                    </button>
+                    <button
+                      type="button"
+                      className={actionBtnCls}
+                      disabled={addingVariant}
+                      onClick={() => setShowAddVariantForm(false)}
+                    >
+                      {t('common.cancel')}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
 
           {hasAnyFile ? (
             <div className="mt-4 space-y-4">

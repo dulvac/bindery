@@ -1,4 +1,5 @@
 import { request } from './core'
+import type { BookVariantStatus, LegacyBookFileStatus } from './books'
 
 export type RequestKind = 'book' | 'author'
 export type RequestStatus = 'pending' | 'approved' | 'declined'
@@ -19,6 +20,9 @@ export interface LibraryRequest {
   createdAt: string
   decidedAt?: string
   fulfilled: boolean
+  // Requested copy statuses for book requests only.
+  variants?: BookVariantStatus[]
+  legacyFiles?: LegacyBookFileStatus[]
   booksTotal?: number
   booksImported?: number
   username?: string
@@ -48,6 +52,8 @@ export interface RequesterLibraryBook {
   coverUrl?: string
   status: string
   formats: string[]
+  variants?: BookVariantStatus[]
+  legacyFiles?: LegacyBookFileStatus[]
 }
 
 export interface RequesterLibraryPage {

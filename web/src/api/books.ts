@@ -11,6 +11,25 @@ export interface BookFile {
   createdAt: string
 }
 
+// One requested format/language copy and its current state.
+export interface BookVariantStatus {
+  id: number
+  mediaType: 'ebook' | 'audiobook'
+  language: string
+  status: string
+  verification: string
+}
+
+// A legacy imported file with no variant binding. language is intentionally
+// blank and verification unverified until a user or importer correction binds
+// it to a variant.
+export interface LegacyBookFileStatus {
+  mediaType: 'ebook' | 'audiobook'
+  language: string
+  status: string
+  verification: string
+}
+
 // One provider's id for a book, from the identity map added in #1705.
 export interface BookIdentifier {
   bookId: number
@@ -53,6 +72,11 @@ export interface Book {
   audiobookFilePath: string
   // All on-disk files tracked in book_files (populated on single-book GET).
   bookFiles?: BookFile[]
+  // Requested format/language copies for this book. Additive; absent on older
+  // servers.
+  variants?: BookVariantStatus[]
+  // Legacy imported rows that are not linked to a variant yet.
+  legacyFiles?: LegacyBookFileStatus[]
   // True on a single-book response while a download for the book is still on
   // its way into the library. The book page refreshes itself while it is set
   // (#2423).

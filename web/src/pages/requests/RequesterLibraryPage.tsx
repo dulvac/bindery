@@ -5,6 +5,7 @@ import { api } from '../../api/client'
 import type { RequesterLibraryBook } from '../../api/client'
 import { mediaTypeLabel } from './requestLabels'
 import CoverImage from '../../components/CoverImage'
+import BookVariantStatus from '../../components/BookVariantStatus'
 import { primaryFill } from '../../components/buttons'
 
 const PAGE_SIZE = 60
@@ -88,6 +89,7 @@ export default function RequesterLibraryPage() {
                 ? b.formats.map(f => mediaTypeLabel(t, f)).join(', ')
                 : t('requests.library.notYetAvailable')}
             </div>
+            <BookVariantStatus variants={b.variants} legacyFiles={b.legacyFiles} className="mt-1" />
           </li>
         ))}
       </ul>

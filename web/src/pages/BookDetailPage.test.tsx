@@ -52,6 +52,7 @@ vi.mock('../api/client', async importOriginal => {
       searchBookAutomatic: vi.fn(),
       listIndexers: vi.fn(),
       grab: vi.fn(),
+      addBook: vi.fn(),
       updateBook: vi.fn(),
       uploadBookCover: vi.fn(),
       deleteBook: vi.fn(),
@@ -240,6 +241,10 @@ beforeEach(() => {
   vi.mocked(api.searchBookAutomatic).mockResolvedValue({ results: { '42': { ok: true } } })
   vi.mocked(api.listIndexers).mockResolvedValue([])
   vi.mocked(api.grab).mockResolvedValue(makeDownload())
+  vi.mocked(api.addBook).mockImplementation(async body => makeBook({
+    id: 42,
+    mediaType: (body.mediaType as Book['mediaType']) || 'ebook',
+  }))
   vi.mocked(api.updateBook).mockImplementation(async (_id, patch) => makeBook(patch))
   vi.mocked(api.deleteBook).mockResolvedValue(undefined)
   vi.mocked(api.deleteBookFile).mockImplementation(async () => makeBook())
@@ -653,6 +658,70 @@ describe('BookDetailPage — file section actions', () => {
     await waitFor(() =>
       expect(navigator.clipboard.writeText).toHaveBeenCalledWith('/library/book.epub'),
     )
+  })
+
+  it('renders variant statuses and keeps legacy file language unknown', async () => {
+    vi.mocked(api.getBook).mockResolvedValue(
+      makeBook({
+        language: 'eng',
+        variants: [
+          { id: 1, mediaType: 'ebook', language: 'eng', status: 'imported', verification: 'verified' },
+          { id: 2, mediaType: 'ebook', language: 'rum', status: 'wanted', verification: '' },
+          { id: 3, mediaType: 'audiobook', language: 'eng', status: 'review', verification: '' },
+        ],
+        legacyFiles: [
+          { mediaType: 'ebook', language: '', status: 'imported', verification: 'unverified' },
+        ],
+      }),
+    )
+
+    renderBookDetailPage()
+
+    const statuses = await screen.findByTestId('book-variant-statuses')
+    expect(within(statuses).getByText('Romanian')).toBeInTheDocument()
+    expect(within(statuses).getByText('Wanted')).toBeInTheDocument()
+    expect(within(statuses).getByText('Review')).toBeInTheDocument()
+    expect(within(statuses).getByText('Verified')).toBeInTheDocument()
+    expect(within(statuses).getByText('Unverified')).toBeInTheDocument()
+
+    const legacy = within(statuses).getByTestId('book-variant-status-legacy-0')
+    expect(legacy).toHaveTextContent('Language unknown')
+    expect(legacy).not.toHaveTextContent('English')
+  })
+
+  it('adds only missing language variants for an existing book', async () => {
+    vi.mocked(api.getBook).mockResolvedValue(
+      makeBook({
+        foreignBookId: 'OL1W',
+        author: { ...author, foreignAuthorId: 'OL39307A', authorName: 'Frank Herbert' },
+        variants: [
+          { id: 1, mediaType: 'ebook', language: 'eng', status: 'imported', verification: 'verified' },
+        ],
+      }),
+    )
+
+    renderBookDetailPage()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Add another language' }))
+    const submit = screen.getByRole('button', { name: 'Submit language request' })
+    expect(submit).toBeDisabled()
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Romanian' }))
+    expect(submit).toBeEnabled()
+
+    fireEvent.click(submit)
+    await waitFor(() => expect(api.addBook).toHaveBeenCalledWith(expect.objectContaining({
+      foreignBookId: 'OL1W',
+      foreignAuthorId: 'OL39307A',
+      mediaType: 'ebook',
+      languages: ['eng', 'rum'],
+      searchOnAdd: false,
+    })))
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Add another language' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'English' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Romanian' }))
+    expect(screen.getByRole('button', { name: 'Submit language request' })).toBeDisabled()
   })
 })
 

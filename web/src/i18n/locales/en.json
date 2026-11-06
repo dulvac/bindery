@@ -2771,6 +2771,11 @@
       "declined": "Declined",
       "authorProgress": "{{imported}} of {{total}} books here"
     },
+    "variant": {
+      "review": "Review",
+      "verified": "Verified",
+      "unverified": "Unverified"
+    },
     "confirm": {
       "bookHint": "An admin will look at your request and add the book if they agree. You can follow it under My requests.",
       "authorHint": "An admin will look at your request and add this author's books if they agree. You can follow it under My requests.",
@@ -2790,7 +2795,12 @@
       "withdraw": "Withdraw",
       "withdrawLabel": "Withdraw request for {{title}}",
       "withdrawFailed": "Could not withdraw the request",
-      "reason": "Reason: {{reason}}"
+      "reason": "Reason: {{reason}}",
+      "addLanguage": "Add another language",
+      "addLanguageHint": "Request another language or format for this same book.",
+      "requestLanguage": "Send language request",
+      "extendFailed": "Could not send the language request",
+      "duplicateSelection": "That format and language selection is already requested."
     },
     "library": {
       "title": "Library",
@@ -2962,6 +2972,13 @@
     "unexcludeHint": "Un-exclude this book from searches and the Wanted page",
     "deleteThisFile": "Delete this file",
     "deleteThisFileHint": "Permanently delete only this file from disk",
+    "addLanguageButton": "Add another language",
+    "addLanguageLabel": "Add another language",
+    "addLanguageFormatLabel": "Format to extend",
+    "addLanguageSubmit": "Submit language request",
+    "addLanguageDuplicate": "That format and language selection is already requested.",
+    "addLanguageSubmitting": "Adding…",
+    "addLanguageFailed": "Could not add the language",
     "deletingFile": "Deleting…",
     "fixMatch": {
       "button": "Fix match",
