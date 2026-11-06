@@ -230,7 +230,7 @@ func TestVariantHardlink_AudioLanguagesPromoteSeparateWholeFolders(t *testing.T)
 		}
 		files := []string{filepath.Join(folder, "01.m4b"), filepath.Join(folder, "02.m4b")}
 		for _, p := range files {
-			if err := os.WriteFile(p, mp4File(atom("\xa9alb", dataAtom(1, []byte(tc.title))), atom("\xa9ART", dataAtom(1, []byte("Frank Herbert"))), atom("\xa9lan", dataAtom(1, []byte(tc.lang)))), 0o600); err != nil {
+			if err := os.WriteFile(p, mp4File(atom("\xa9alb", dataAtom(1, []byte(tc.title))), atom("\xa9ART", dataAtom(1, []byte("Frank Herbert"))), atom("\xa9lan", dataAtom(1, []byte(tc.lang)))), 0o644); err != nil {
 				t.Fatal(err)
 			}
 		}

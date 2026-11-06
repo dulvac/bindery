@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -189,12 +190,28 @@ func (r *BookFileRepo) Add(ctx context.Context, bookID int64, format, path strin
 	return err
 }
 
+// VariantReviewApproval identifies a named admin's exact audit for one
+// reviewed download. The DB checks the event and download again in the same
+// transaction that moves review to imported; a caller's boolean is not proof.
+type VariantReviewApproval struct {
+	AuditEventID, DownloadID int64
+	ExpectedStatus           string
+}
+
 // TrackVariant records a successfully placed path and its language evidence in
 // one transaction. The caller must finish private staging and collision-safe
 // placement before calling; this method never touches a public or source file.
 // A legacy path or another variant's path cannot be relabeled by an import.
 // Review requires an explicit manual retry before a new claim is accepted.
 func (r *BookFileRepo) TrackVariant(ctx context.Context, bookID, variantID int64, format, path, language, verification string) error {
+	return r.TrackVariantChecked(ctx, bookID, variantID, format, path, language, verification, nil, VariantReviewApproval{})
+}
+
+// TrackVariantChecked runs the caller's filesystem ownership check inside the
+// transaction, immediately before commit. Bindery must be the only library
+// writer during import; SQLite cannot make a same-UID filesystem replacement
+// atomic with its commit without a separate filesystem access-control gate.
+func (r *BookFileRepo) TrackVariantChecked(ctx context.Context, bookID, variantID int64, format, path, language, verification string, validate func() error, approval VariantReviewApproval) error {
 	if bookID <= 0 || variantID <= 0 || !filepath.IsAbs(path) || filepath.Clean(path) != path || path == string(filepath.Separator) {
 		return fmt.Errorf("invalid variant book, variant or path %q", path)
 	}
@@ -219,8 +236,14 @@ func (r *BookFileRepo) TrackVariant(ctx context.Context, bookID, variantID int64
 		Scan(&variantBookID, &variantFormat, &variantLanguage, &status); err != nil {
 		return fmt.Errorf("book_files variant lookup: %w", err)
 	}
-	if variantBookID != bookID || variantFormat != format || language != "" && language != variantLanguage || status == models.VariantReview {
-		return fmt.Errorf("book_files variant %d does not match book, format or language, or is in review", variantID)
+	if variantBookID != bookID || variantFormat != format || verification == "verified" && language != variantLanguage ||
+		approval.ExpectedStatus != "" && status != approval.ExpectedStatus {
+		return fmt.Errorf("book_files variant %d does not match book, format, verified language or expected status", variantID)
+	}
+	if status == models.VariantReview {
+		if err := validateVariantReviewApproval(ctx, tx, bookID, variantID, approval); err != nil {
+			return fmt.Errorf("book_files variant %d remains in review: %w", variantID, err)
+		}
 	}
 
 	var owner, existingVariant sql.NullInt64
@@ -246,15 +269,52 @@ func (r *BookFileRepo) TrackVariant(ctx context.Context, bookID, variantID int64
 		return fmt.Errorf("book_files path %q already has a different or legacy claim", path)
 	}
 
-	if _, err := tx.ExecContext(ctx, `UPDATE book_variants SET status = 'imported' WHERE id = ? AND status != 'review'`, variantID); err != nil {
+	updated, err := tx.ExecContext(ctx, `UPDATE book_variants SET status = 'imported' WHERE id = ? AND status = ?`, variantID, status)
+	if err != nil {
 		return fmt.Errorf("book_files mark variant imported: %w", err)
+	}
+	if count, err := updated.RowsAffected(); err != nil || count != 1 {
+		return fmt.Errorf("book_files variant status changed before import: %v", err)
 	}
 	// Keep the old book-level status and paths in sync with the same commit.
 	if err := NewBookRepo(r.db).WithTx(tx).refreshBookStatus(ctx, bookID); err != nil {
 		return fmt.Errorf("book_files refresh variant book: %w", err)
 	}
+	if validate != nil {
+		if err := validate(); err != nil {
+			return fmt.Errorf("book_files variant ownership changed before commit: %w", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("book_files track variant commit: %w", err)
+	}
+	return nil
+}
+
+func validateVariantReviewApproval(ctx context.Context, tx *sql.Tx, bookID, variantID int64, approval VariantReviewApproval) error {
+	if approval.ExpectedStatus != models.VariantReview || approval.AuditEventID <= 0 || approval.DownloadID <= 0 {
+		return fmt.Errorf("missing exact reviewed-download approval")
+	}
+	var data string
+	if err := tx.QueryRowContext(ctx, `SELECT data FROM history WHERE id = ? AND book_id = ? AND event_type = 'variantLanguageOverride'`,
+		approval.AuditEventID, bookID).Scan(&data); err != nil {
+		return fmt.Errorf("load review audit: %w", err)
+	}
+	var event struct {
+		ActorUserID int64  `json:"actorUserId"`
+		VariantID   int64  `json:"variantId"`
+		DownloadID  int64  `json:"downloadId"`
+		Reason      string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(data), &event); err != nil || event.ActorUserID <= 0 ||
+		event.VariantID != variantID || event.DownloadID != approval.DownloadID || strings.TrimSpace(event.Reason) == "" {
+		return fmt.Errorf("review audit does not approve this variant and download: %v", err)
+	}
+	var linkedBook, linkedVariant sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT book_id, variant_id FROM downloads WHERE id = ?`, approval.DownloadID).
+		Scan(&linkedBook, &linkedVariant); err != nil || !linkedBook.Valid || linkedBook.Int64 != bookID ||
+		!linkedVariant.Valid || linkedVariant.Int64 != variantID {
+		return fmt.Errorf("review audit download association changed: %v", err)
 	}
 	return nil
 }

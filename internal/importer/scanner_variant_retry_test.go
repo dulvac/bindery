@@ -32,7 +32,7 @@ func TestVariantImport_RejectedSourcesStayRejectedAcrossQbitRetries(t *testing.T
 					t.Fatal(err)
 				}
 				file = filepath.Join(content, "English catalogue label.m4b")
-				if err := os.WriteFile(file, mp4File(atom("\xa9alb", dataAtom(1, []byte("English catalogue label"))), atom("\xa9ART", dataAtom(1, []byte("Sample Author")))), 0o600); err != nil {
+				if err := os.WriteFile(file, mp4File(atom("\xa9alb", dataAtom(1, []byte("English catalogue label"))), atom("\xa9ART", dataAtom(1, []byte("Sample Author")))), 0o644); err != nil {
 					t.Fatal(err)
 				}
 			} else {
@@ -161,6 +161,68 @@ func TestVariantRetry_ReviewedVariantNeedsExactAdminOverrideOrWantedTransition(t
 				f.assertLibraryFiles(t, 0)
 			}
 		})
+	}
+}
+
+func TestVariantRetry_ReviewedCollisionKeepsReviewUntilSuccessfulPlacement(t *testing.T) {
+	f := newVariantReviewFixture(t, "English catalogue label", "Sample Author", models.MediaTypeEbook, "eng")
+	source := variantEPUBSource(t, f.sources, "English catalogue label.epub", "english.epub")
+	dl := f.addDownload(t, "English catalogue label [ENG / EPUB]")
+	if err := f.books.VariantRepo().SetStatus(f.ctx, f.variant.ID, models.VariantReview); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{"actorUserId": int64(42), "variantId": f.variant.ID, "downloadId": dl.ID, "reason": "approved retry"})
+	if err := f.history.Create(f.ctx, &models.HistoryEvent{BookID: &f.book.ID, EventType: "variantLanguageOverride", Data: string(payload)}); err != nil {
+		t.Fatal(err)
+	}
+	dest := variantEbookTarget(t, f, source)
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dest, []byte("other owner"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.importSource(t, dl, source)
+	variantBlocked(t, f, dl, "no-replace")
+	if rows, err := f.books.VariantRepo().ListByBook(f.ctx, f.book.ID); err != nil || len(rows) != 1 || rows[0].Status != models.VariantReview {
+		t.Fatalf("failed placement cleared review: %+v %v", rows, err)
+	}
+	if rows, err := f.books.ListFiles(f.ctx, f.book.ID); err != nil || len(rows) != 0 {
+		t.Fatalf("failed placement tracked file: %+v %v", rows, err)
+	}
+	if b, err := os.ReadFile(dest); err != nil || string(b) != "other owner" {
+		t.Fatalf("collision replaced another owner: %q %v", b, err)
+	}
+}
+
+func TestVariantRetry_WithdrawnAuditBeforeTrackingCannotClearReview(t *testing.T) {
+	f := newVariantReviewFixture(t, "English catalogue label", "Sample Author", models.MediaTypeEbook, "eng")
+	source := variantEPUBSource(t, f.sources, "English catalogue label.epub", "english.epub")
+	dl := f.addDownload(t, "English catalogue label [ENG / EPUB]")
+	if err := f.books.VariantRepo().SetStatus(f.ctx, f.variant.ID, models.VariantReview); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{"actorUserId": int64(42), "variantId": f.variant.ID, "downloadId": dl.ID, "reason": "approved retry"})
+	audit := &models.HistoryEvent{BookID: &f.book.ID, EventType: "variantLanguageOverride", Data: string(payload)}
+	if err := f.history.Create(f.ctx, audit); err != nil {
+		t.Fatal(err)
+	}
+	variantBeforeTrackHook = func() {
+		if err := f.history.Delete(f.ctx, audit.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { variantBeforeTrackHook = nil })
+	f.importSource(t, dl, source)
+	variantBlocked(t, f, dl, "stranded")
+	if rows, err := f.books.VariantRepo().ListByBook(f.ctx, f.book.ID); err != nil || len(rows) != 1 || rows[0].Status != models.VariantReview {
+		t.Fatalf("withdrawn audit cleared review: %+v %v", rows, err)
+	}
+	if rows, err := f.books.ListFiles(f.ctx, f.book.ID); err != nil || len(rows) != 0 {
+		t.Fatalf("withdrawn audit tracked file: %+v %v", rows, err)
+	}
+	if _, err := os.Lstat(variantEbookTarget(t, f, source)); err != nil {
+		t.Fatalf("promoted link must remain for reconciliation: %v", err)
 	}
 }
 

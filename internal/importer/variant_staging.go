@@ -16,6 +16,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/models"
 )
 
@@ -32,6 +33,14 @@ type stagedVariantFile struct {
 // promotion always uses the kernel's atomic no-replace operation.
 var variantPromotionHook func()
 var variantBeforeTrackHook func()
+var variantCommitWindowHook func()
+var variantAfterAttemptHook func(string)
+
+// Resolve the private destination relative to the verified attempt fd.
+// Tests inject source mutations at this edge without changing the source API.
+var variantStageLink = func(source string, parentFD int, name string) error {
+	return unix.Linkat(unix.AT_FDCWD, source, parentFD, name, 0)
+}
 
 func (s *Scanner) importTorrentVariant(ctx context.Context, dl *models.Download, book *models.Book, author *models.Author,
 	format, downloadPath string, files []string, selected []checkedVariantSource) error {
@@ -191,8 +200,14 @@ func (s *Scanner) importTorrentVariant(ctx context.Context, dl *models.Download,
 		return err
 	}
 	defer attempt.close()
+	if variantAfterAttemptHook != nil {
+		variantAfterAttemptHook(attempt.name)
+	}
+	if err := attempt.checkStageRoot(); err != nil {
+		return err
+	}
 	if format == models.MediaTypeAudiobook {
-		if err := os.Mkdir(filepath.Join(attempt.path, "audio"), 0o700); err != nil {
+		if err := unix.Mkdirat(attempt.attemptFD, "audio", 0o700); err != nil {
 			return fmt.Errorf("stage audio folder: %w", err)
 		}
 	}
@@ -205,18 +220,16 @@ func (s *Scanner) importTorrentVariant(ctx context.Context, dl *models.Download,
 		if err != nil || !sameAssessedSource(p.checked.assessed, current) {
 			return variantSourceChanged("before staging", p.checked.path, err)
 		}
-		if format == models.MediaTypeAudiobook {
-			if err := os.MkdirAll(filepath.Dir(filepath.Join(attempt.path, p.stage)), 0o700); err != nil {
-				return err
-			}
-		} else {
+		if format == models.MediaTypeAudiobook && current.Mode().Perm()&0o004 == 0 {
+			return fmt.Errorf("audio source %s is not readable by ABS's separate UID; cannot chmod a hardlink without changing its torrent seed", p.checked.path)
+		}
+		if format != models.MediaTypeAudiobook {
 			p.stage = fmt.Sprintf("file-%d", i)
 		}
-		staged := filepath.Join(attempt.path, p.stage)
-		if err := osLink(p.checked.path, staged); err != nil {
+		if err := attempt.linkStage(p.checked.path, p.stage); err != nil {
 			return fmt.Errorf("stage hardlink (no copy fallback) %s: %w", p.checked.path, err)
 		}
-		linked, err := os.Lstat(staged)
+		linked, err := statNoFollowRelative(attempt.attemptFD, p.stage)
 		if err != nil || !sameAssessedSource(p.checked.assessed, linked) {
 			return variantSourceChanged("at staged hardlink", p.checked.path, err)
 		}
@@ -226,7 +239,7 @@ func (s *Scanner) importTorrentVariant(ctx context.Context, dl *models.Download,
 			return err
 		}
 		source, sourceErr := os.Lstat(p.checked.path)
-		staged, stageErr := os.Lstat(filepath.Join(attempt.path, p.stage))
+		staged, stageErr := statNoFollowRelative(attempt.attemptFD, p.stage)
 		if sourceErr != nil || stageErr != nil || !sameAssessedSource(p.checked.assessed, source) || !sameAssessedSource(p.checked.assessed, staged) {
 			return variantSourceChanged("before promotion", p.checked.path, errors.Join(sourceErr, stageErr))
 		}
@@ -241,25 +254,30 @@ func (s *Scanner) importTorrentVariant(ctx context.Context, dl *models.Download,
 	// become visible. In particular, do this after the race-test boundary.
 	for _, p := range chosen {
 		source, sourceErr := os.Lstat(p.checked.path)
-		staged, stageErr := os.Lstat(filepath.Join(attempt.path, p.stage))
+		staged, stageErr := statNoFollowRelative(attempt.attemptFD, p.stage)
 		if sourceErr != nil || stageErr != nil || !sameAssessedSource(p.checked.assessed, source) || !sameAssessedSource(p.checked.assessed, staged) {
 			return variantSourceChanged("immediately before promotion", p.checked.path, errors.Join(sourceErr, stageErr))
 		}
-	}
-	// A named admin's exact override is the only way this import may leave
-	// review. Do it only after private staging verified every selected inode;
-	// an ordinary queue retry can never silently clear a review state.
-	if wanted.Status == models.VariantReview {
-		if err := s.books.VariantRepo().SetStatus(ctx, wanted.ID, models.VariantWanted); err != nil {
-			return fmt.Errorf("approve reviewed variant for placement: %w", err)
+		if format == models.MediaTypeAudiobook && source.Mode().Perm()&0o004 == 0 {
+			return fmt.Errorf("audio source %s is no longer readable by ABS's separate UID", p.checked.path)
 		}
 	}
+	// Keep review unchanged until successful placement. The exact audit and
+	// expected status are checked again by TrackVariant in its transaction.
 	var stagedFolder os.FileInfo
 	if format == models.MediaTypeAudiobook {
-		stagedFolder, err = os.Lstat(filepath.Join(attempt.path, "audio"))
+		// The stage root and attempt remain 0700, but every directory that
+		// will move into ABS's mount must allow a different UID to traverse.
+		if err := attempt.makeAudioDirectoriesReadable(); err != nil {
+			return fmt.Errorf("prepare audio folder for ABS: %w", err)
+		}
+		stagedFolder, err = statNoFollowRelative(attempt.attemptFD, "audio")
 		if err != nil || !stagedFolder.IsDir() {
 			return fmt.Errorf("staged audio directory changed: %v", err)
 		}
+	}
+	if err := attempt.checkStageRoot(); err != nil {
+		return err
 	}
 	// Folder promotion is a single atomic no-replace operation. Ebook links
 	// are individually no-replace; never roll back public paths after success.
@@ -280,37 +298,72 @@ func (s *Scanner) importTorrentVariant(ctx context.Context, dl *models.Download,
 	if variantBeforeTrackHook != nil {
 		variantBeforeTrackHook()
 	}
-	if format == models.MediaTypeAudiobook {
-		published, err := os.Lstat(chosen[0].dest)
-		if err != nil || !published.IsDir() || !os.SameFile(stagedFolder, published) {
-			return fmt.Errorf("stranded audio folder at %s; public directory changed before tracking: %v", chosen[0].dest, err)
-		}
+	validate := func() error {
+		return s.validatePromotedVariant(downloadPath, root, chosen, stagedFolder)
+	}
+	if err := validate(); err != nil {
+		return err
 	}
 	for _, p := range chosen {
-		source, err := os.Lstat(p.checked.path)
-		if err != nil || !sameAssessedSource(p.checked.assessed, source) {
-			return fmt.Errorf("stranded public link at %s: %w", p.dest, variantSourceChanged("after promotion", p.checked.path, err))
+		approval := db.VariantReviewApproval{ExpectedStatus: p.variant.Status}
+		if p.variant.Status == models.VariantReview {
+			approval.AuditEventID, approval.DownloadID = p.checked.auditEventID, dl.ID
 		}
-		public := p.dest
-		if format == models.MediaTypeAudiobook {
-			public = filepath.Join(p.dest, strings.TrimPrefix(p.stage, "audio"+string(filepath.Separator)))
-		}
-		linked, err := os.Lstat(public)
-		if err != nil || !sameAssessedSource(p.checked.assessed, linked) {
-			return fmt.Errorf("stranded public link at %s; destination changed before tracking: %v", public, err)
-		}
-	}
-	for _, p := range chosen {
-		language := p.checked.detectedLanguage
-		if p.checked.verification != "verified" {
-			language = ""
-		}
-		if err := s.books.TrackVariantFile(ctx, book.ID, p.variant.ID, format, p.dest, language, p.checked.verification); err != nil {
+		if err := s.books.TrackVariantFileChecked(ctx, book.ID, p.variant.ID, format, p.dest, p.checked.detectedLanguage, p.checked.verification, func() error {
+			if variantCommitWindowHook != nil {
+				variantCommitWindowHook()
+			}
+			return validate()
+		}, approval); err != nil {
 			return fmt.Errorf("stranded verified public link at %s; reconcile manually (no public rollback): %w", p.dest, err)
 		}
 		if format == models.MediaTypeAudiobook {
 			break
 		} // one folder, one association
+	}
+	return nil
+}
+
+// A name on a public path is not a claim to its contents. Check the original
+// assessed source and reopen the destination through no-follow directories
+// for every selected file, including the folder's own inode for audio.
+func (s *Scanner) validatePromotedVariant(downloadPath, root string, chosen []stagedVariantFile, stagedFolder os.FileInfo) error {
+	for _, p := range chosen {
+		if err := s.safeVariantSource(downloadPath, p.checked.path); err != nil {
+			return fmt.Errorf("stranded public link at %s; unsafe source: %w", p.dest, err)
+		}
+		source, err := os.Lstat(p.checked.path)
+		if err != nil || !sameAssessedSource(p.checked.assessed, source) {
+			return fmt.Errorf("stranded public link at %s: %w", p.dest, variantSourceChanged("after promotion", p.checked.path, err))
+		}
+		if p.variant.MediaType == models.MediaTypeAudiobook && source.Mode().Perm()&0o004 == 0 {
+			return fmt.Errorf("stranded public link at %s; audio source is no longer readable by ABS's separate UID", p.dest)
+		}
+		fd, name, err := openVariantDestination(root, p.dest)
+		if err != nil {
+			return fmt.Errorf("stranded public link at %s; unsafe destination: %w", p.dest, err)
+		}
+		var linked os.FileInfo
+		if p.variant.MediaType == models.MediaTypeAudiobook {
+			folder, openErr := unix.Openat(fd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+			if openErr == nil {
+				file := os.NewFile(uintptr(folder), name)
+				folderInfo, statErr := file.Stat()
+				if statErr != nil || !os.SameFile(stagedFolder, folderInfo) {
+					openErr = fmt.Errorf("public directory changed before tracking: %v", statErr)
+				} else {
+					linked, openErr = statNoFollowRelative(folder, strings.TrimPrefix(p.stage, "audio"+string(filepath.Separator)))
+				}
+				_ = file.Close()
+			}
+			err = openErr
+		} else {
+			linked, err = statNoFollowRelative(fd, name)
+		}
+		_ = unix.Close(fd)
+		if err != nil || !sameAssessedSource(p.checked.assessed, linked) {
+			return fmt.Errorf("stranded public link at %s; destination changed before tracking: %v", p.dest, err)
+		}
 	}
 	return nil
 }
@@ -406,13 +459,15 @@ func safeVariantRelative(path string) bool {
 }
 
 type variantAttempt struct {
-	path, name string
-	stageRoot  *os.Root
+	path, name                   string // path is for diagnostics only, never for stage I/O
+	parentFD, stageFD, attemptFD int
+	stageDev                     uint64
+	stageIno                     uint64
 }
 
 // The stage is a private sibling of books/audiobooks, never inside either
-// public ABS mount. A pre-existing stage root must be owned by this process
-// and mode 0700. Exclusive random attempt creation never adopts old debris.
+// public ABS mount. Hold the verified root and random attempt by descriptor:
+// reopening either by path would let a renamed root redirect staging/cleanup.
 func newVariantAttempt(libraryParent, publicRoot string) (*variantAttempt, error) {
 	if !filepath.IsAbs(libraryParent) || filepath.Clean(libraryParent) != libraryParent ||
 		libraryParent == publicRoot || strictlyWithin(libraryParent, publicRoot) {
@@ -422,7 +477,11 @@ func newVariantAttempt(libraryParent, publicRoot string) (*variantAttempt, error
 	if err != nil {
 		return nil, fmt.Errorf("open staging parent: %w", err)
 	}
-	defer unix.Close(parent)
+	defer func() {
+		if parent >= 0 {
+			_ = unix.Close(parent)
+		}
+	}()
 	const stageName = ".bindery-staging"
 	if err := unix.Mkdirat(parent, stageName, 0o700); err != nil && !errors.Is(err, syscall.EEXIST) {
 		return nil, fmt.Errorf("create private staging root: %w", err)
@@ -431,20 +490,17 @@ func newVariantAttempt(libraryParent, publicRoot string) (*variantAttempt, error
 	if err != nil {
 		return nil, fmt.Errorf("open private staging root: %w", err)
 	}
+	defer func() {
+		if fd >= 0 {
+			_ = unix.Close(fd)
+		}
+	}()
 	var st unix.Stat_t
 	if err = unix.Fstat(fd, &st); err != nil {
-		unix.Close(fd)
 		return nil, err
 	}
 	if st.Uid != uint32(os.Geteuid()) || st.Mode&0o777 != 0o700 {
-		unix.Close(fd)
 		return nil, fmt.Errorf("private staging root has wrong owner or mode")
-	}
-	stagePath := filepath.Join(libraryParent, stageName)
-	stageRoot, err := os.OpenRoot(stagePath)
-	if err != nil {
-		unix.Close(fd)
-		return nil, err
 	}
 	var attemptName string
 	for i := 0; i < 3; i++ {
@@ -458,20 +514,170 @@ func newVariantAttempt(libraryParent, publicRoot string) (*variantAttempt, error
 			break
 		}
 	}
-	unix.Close(fd)
 	if err != nil {
-		stageRoot.Close()
 		return nil, fmt.Errorf("create private attempt: %w", err)
 	}
-	return &variantAttempt{path: filepath.Join(stagePath, attemptName), name: attemptName, stageRoot: stageRoot}, nil
+	attemptFD, err := unix.Openat(fd, attemptName, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		_ = unix.Unlinkat(fd, attemptName, unix.AT_REMOVEDIR)
+		return nil, fmt.Errorf("open private attempt: %w", err)
+	}
+	a := &variantAttempt{
+		path: filepath.Join(libraryParent, stageName, attemptName), name: attemptName,
+		parentFD: parent, stageFD: fd, attemptFD: attemptFD, stageDev: uint64(st.Dev), stageIno: st.Ino,
+	}
+	parent, fd = -1, -1
+	return a, nil
+}
+
+func (a *variantAttempt) checkStageRoot() error {
+	var st unix.Stat_t
+	if err := unix.Fstatat(a.parentFD, ".bindery-staging", &st, unix.AT_SYMLINK_NOFOLLOW); err != nil ||
+		uint64(st.Dev) != a.stageDev || st.Ino != a.stageIno || st.Mode&unix.S_IFMT != unix.S_IFDIR ||
+		st.Uid != uint32(os.Geteuid()) || st.Mode&0o777 != 0o700 {
+		return fmt.Errorf("private staging root changed during import: %v", err)
+	}
+	return nil
+}
+
+// stageParent returns a descriptor for rel's immediate parent. Intermediate
+// folders are private, owned, no-follow directories even for nested discs.
+func (a *variantAttempt) stageParent(rel string, create bool) (int, string, error) {
+	if !safeVariantRelative(rel) {
+		return -1, "", fmt.Errorf("unsafe private stage name %q", rel)
+	}
+	fd, err := unix.Dup(a.attemptFD)
+	if err != nil {
+		return -1, "", err
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	for _, part := range parts[:len(parts)-1] {
+		if create {
+			if err := unix.Mkdirat(fd, part, 0o700); err != nil && !errors.Is(err, syscall.EEXIST) {
+				unix.Close(fd)
+				return -1, "", err
+			}
+		}
+		next, openErr := unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		unix.Close(fd)
+		if openErr != nil {
+			return -1, "", openErr
+		}
+		fd = next
+	}
+	return fd, parts[len(parts)-1], nil
+}
+
+func (a *variantAttempt) linkStage(source, rel string) error {
+	if err := a.checkStageRoot(); err != nil {
+		return err
+	}
+	fd, name, err := a.stageParent(rel, true)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	return variantStageLink(source, fd, name)
+}
+
+func (a *variantAttempt) makeAudioDirectoriesReadable() error {
+	if err := a.checkStageRoot(); err != nil {
+		return err
+	}
+	folder, err := unix.Openat(a.attemptFD, "audio", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(folder)
+	return makeVariantDirectoriesReadable(folder)
+}
+
+func makeVariantDirectoriesReadable(fd int) error {
+	dup, err := unix.Dup(fd)
+	if err != nil {
+		return err
+	}
+	file := os.NewFile(uintptr(dup), "staged audio directory")
+	entries, err := file.ReadDir(-1)
+	_ = file.Close()
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("symlink in staged audio folder")
+		}
+		if !entry.IsDir() {
+			continue
+		}
+		child, err := unix.Openat(fd, entry.Name(), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return err
+		}
+		err = makeVariantDirectoriesReadable(child)
+		_ = unix.Close(child)
+		if err != nil {
+			return err
+		}
+	}
+	return unix.Fchmod(fd, 0o755)
 }
 
 func (a *variantAttempt) close() {
-	if err := a.stageRoot.RemoveAll(a.name); err != nil { // only our unguessable private attempt, never public
-		// A failed cleanup stays in the private root for manual inspection.
+	defer unix.Close(a.parentFD)
+	defer unix.Close(a.stageFD)
+	defer unix.Close(a.attemptFD)
+	// Never clean a path the stage-root owner may have swapped underneath us.
+	var held, named unix.Stat_t
+	err := unix.Fstat(a.attemptFD, &held)
+	if err == nil {
+		err = unix.Fstatat(a.stageFD, a.name, &named, unix.AT_SYMLINK_NOFOLLOW)
+	}
+	if err == nil && (held.Dev != named.Dev || held.Ino != named.Ino || named.Mode&unix.S_IFMT != unix.S_IFDIR) {
+		err = fmt.Errorf("private attempt name changed")
+	}
+	if err == nil {
+		err = removeVariantStageContents(a.attemptFD)
+	}
+	if err == nil {
+		err = unix.Unlinkat(a.stageFD, a.name, unix.AT_REMOVEDIR)
+	}
+	if err != nil {
+		// A failed cleanup remains private and needs manual inspection.
 		fmt.Fprintf(os.Stderr, "bindery: private variant staging cleanup %s: %v\n", a.path, err)
 	}
-	_ = a.stageRoot.Close()
+}
+
+func removeVariantStageContents(fd int) error {
+	dup, err := unix.Dup(fd)
+	if err != nil {
+		return err
+	}
+	file := os.NewFile(uintptr(dup), "private variant attempt")
+	entries, err := file.ReadDir(-1)
+	_ = file.Close()
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			child, err := unix.Openat(fd, entry.Name(), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+			if err != nil {
+				return err
+			}
+			err = removeVariantStageContents(child)
+			_ = unix.Close(child)
+			if err != nil {
+				return err
+			}
+			if err := unix.Unlinkat(fd, entry.Name(), unix.AT_REMOVEDIR); err != nil {
+				return err
+			}
+		} else if err := unix.Unlinkat(fd, entry.Name(), 0); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // openVariantDestination uses no-follow directory descriptors at every
@@ -516,12 +722,12 @@ func (a *variantAttempt) promoteFile(root, stage, dest string) error {
 		return err
 	}
 	defer unix.Close(fd)
-	staged, err := unix.Open(a.path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	staged, stagedName, err := a.stageParent(stage, false)
 	if err != nil {
 		return err
 	}
 	defer unix.Close(staged)
-	if err := unix.Linkat(staged, stage, fd, name, 0); err != nil {
+	if err := unix.Linkat(staged, stagedName, fd, name, 0); err != nil {
 		return fmt.Errorf("no-replace variant file promotion %s: %w", dest, err)
 	}
 	return nil
@@ -533,12 +739,7 @@ func (a *variantAttempt) promoteAudio(root, dest string) error {
 		return err
 	}
 	defer unix.Close(fd)
-	staged, err := unix.Open(a.path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return err
-	}
-	defer unix.Close(staged)
-	if err := renameVariantDirNoReplace(staged, "audio", fd, name); err != nil {
+	if err := renameVariantDirNoReplace(a.attemptFD, "audio", fd, name); err != nil {
 		return fmt.Errorf("no-replace variant audio promotion %s: %w", dest, err)
 	}
 	return nil

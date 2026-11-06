@@ -1003,6 +1003,12 @@ func (r *BookRepo) TrackVariantFile(ctx context.Context, bookID, variantID int64
 	return r.files.TrackVariant(ctx, bookID, variantID, format, path, language, verification)
 }
 
+// TrackVariantFileChecked keeps the importer's final inode check inside the
+// same database transaction that records the new file and variant status.
+func (r *BookRepo) TrackVariantFileChecked(ctx context.Context, bookID, variantID int64, format, path, language, verification string, validate func() error, approval VariantReviewApproval) error {
+	return r.files.TrackVariantChecked(ctx, bookID, variantID, format, path, language, verification, validate, approval)
+}
+
 // AddBookFileIfMissing records a new on-disk file and reports whether this call
 // made the row the book's, refreshing the book's aggregate status either way.
 // See BookFileRepo.AddIfMissing for why the caller needs to know (#1635). A

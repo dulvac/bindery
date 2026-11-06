@@ -100,7 +100,7 @@ func reconcileVariantAfterDetach(ctx context.Context, tx *sql.Tx, variantID sql.
 			WHERE f.variant_id = book_variants.id AND f.book_id = book_variants.book_id
 			AND f.format = book_variants.media_type
 			AND (f.verification = 'verified' AND f.language = book_variants.language
-				OR f.verification = 'unverified' AND f.language IN ('', book_variants.language))) THEN 'imported'
+				OR f.verification = 'unverified')) THEN 'imported'
 		WHEN EXISTS (SELECT 1 FROM downloads d
 			WHERE d.variant_id = book_variants.id AND d.book_id = book_variants.book_id
 			AND d.status IN (?, ?, ?, ?, ?, ?, ?, ?)) THEN 'downloading'

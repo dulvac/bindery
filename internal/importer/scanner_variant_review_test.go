@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -218,7 +219,7 @@ func TestVariantImport_AudioWorkEvidencePrecedesIdempotency(t *testing.T) {
 				t.Fatal(err)
 			}
 			file := filepath.Join(folder, "Dune.m4b")
-			if err := os.WriteFile(file, mp4File(atom("\xa9nam", dataAtom(1, []byte("Chapter 1"))), atom("\xa9alb", dataAtom(1, []byte(tc.album))), atom("\xa9ART", dataAtom(1, []byte(tc.artist)))), 0o600); err != nil {
+			if err := os.WriteFile(file, mp4File(atom("\xa9nam", dataAtom(1, []byte("Chapter 1"))), atom("\xa9alb", dataAtom(1, []byte(tc.album))), atom("\xa9ART", dataAtom(1, []byte(tc.artist)))), 0o644); err != nil {
 				t.Fatal(err)
 			}
 			if tc.preexisting {
@@ -308,8 +309,8 @@ func TestVariantImport_OverrideIsAuditedForExactDownloadAndNeverWrongWork(t *tes
 			} else {
 				f.assertVariantPlaced(t, dl)
 				rows := variantImportedFiles(t, f, 1)
-				if rows[0].Verification != "unverified" || rows[0].Language != "" {
-					t.Fatalf("override must not relabel Romanian as English: %+v", rows[0])
+				if rows[0].Verification != "unverified" || rows[0].Language != "rum" {
+					t.Fatalf("override must retain detected Romanian without verifying English: %+v", rows[0])
 				}
 			}
 		})
@@ -375,10 +376,10 @@ func TestVariantImport_WrongLanguageRejectsOnlyExactFileAndRequestedVariant(t *t
 // assessed inode disappeared and must not promote the replacement.
 func replaceVariantSourceOnLink(t *testing.T, source string, replacement []byte) (string, *bool) {
 	t.Helper()
-	originalLink := osLink
+	originalLink := variantStageLink
 	original := source + ".assessed"
 	swapped := false
-	osLink = func(src, dst string) error {
+	variantStageLink = func(src string, parentFD int, name string) error {
 		if src == source && !swapped {
 			if err := os.Rename(source, original); err != nil {
 				t.Fatal(err)
@@ -388,9 +389,9 @@ func replaceVariantSourceOnLink(t *testing.T, source string, replacement []byte)
 			}
 			swapped = true
 		}
-		return originalLink(src, dst)
+		return originalLink(src, parentFD, name)
 	}
-	t.Cleanup(func() { osLink = originalLink })
+	t.Cleanup(func() { variantStageLink = originalLink })
 	return original, &swapped
 }
 
@@ -429,7 +430,7 @@ func TestVariantImport_AudioEvidenceNeverStartsPublicLink(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := filepath.Join(folder, "Dune.m4b")
-	if err := os.WriteFile(source, mp4File(atom("\xa9alb", dataAtom(1, []byte("Dune"))), atom("\xa9ART", dataAtom(1, []byte("Frank Herbert")))), 0o600); err != nil {
+	if err := os.WriteFile(source, mp4File(atom("\xa9alb", dataAtom(1, []byte("Dune"))), atom("\xa9ART", dataAtom(1, []byte("Frank Herbert")))), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	bad := mp4File(atom("\xa9alb", dataAtom(1, []byte("Dreamer of Dune: The Biography of Frank Herbert"))), atom("\xa9ART", dataAtom(1, []byte("Brian Herbert"))))
@@ -461,23 +462,23 @@ func TestVariantImport_AudioStageMutationCannotPromote(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := filepath.Join(folder, "Dune.m4b")
-	if err := os.WriteFile(source, mp4File(atom("\xa9alb", dataAtom(1, []byte("Dune"))), atom("\xa9ART", dataAtom(1, []byte("Frank Herbert")))), 0o600); err != nil {
+	if err := os.WriteFile(source, mp4File(atom("\xa9alb", dataAtom(1, []byte("Dune"))), atom("\xa9ART", dataAtom(1, []byte("Frank Herbert")))), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	originalLink := osLink
+	originalLink := variantStageLink
 	changed := false
-	osLink = func(src, dst string) error {
-		err := originalLink(src, dst)
+	variantStageLink = func(src string, parentFD int, name string) error {
+		err := originalLink(src, parentFD, name)
 		if err == nil && src == source && !changed {
 			later := time.Now().Add(2 * time.Hour)
-			if err := os.Chtimes(dst, later, later); err != nil {
+			if err := os.Chtimes(source, later, later); err != nil {
 				t.Fatal(err)
 			}
 			changed = true
 		}
 		return err
 	}
-	t.Cleanup(func() { osLink = originalLink })
+	t.Cleanup(func() { variantStageLink = originalLink })
 	dl := f.addDownload(t, "Dune by Frank Herbert [ENG / M4B]")
 	f.scanner.tryImportInternal(withTorrentOwnFolder(f.ctx, true), dl, folder, "qbittorrent", "test-hash", "", nil, []string{source})
 	if !changed {
@@ -542,14 +543,14 @@ func TestVariantImport_MultiTrackAudioStageMutationCannotPromote(t *testing.T) {
 	}
 	files := []string{filepath.Join(folder, "01.m4b"), filepath.Join(folder, "02.m4b")}
 	for _, source := range files {
-		if err := os.WriteFile(source, mp4File(atom("\xa9alb", dataAtom(1, []byte("Dune"))), atom("\xa9ART", dataAtom(1, []byte("Frank Herbert")))), 0o600); err != nil {
+		if err := os.WriteFile(source, mp4File(atom("\xa9alb", dataAtom(1, []byte("Dune"))), atom("\xa9ART", dataAtom(1, []byte("Frank Herbert")))), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	originalLink := osLink
+	originalLink := variantStageLink
 	changed := false
-	osLink = func(src, dst string) error {
-		err := originalLink(src, dst)
+	variantStageLink = func(src string, parentFD int, name string) error {
+		err := originalLink(src, parentFD, name)
 		if err == nil && src == files[1] && !changed {
 			later := time.Now().Add(2 * time.Hour)
 			if err := os.Chtimes(files[0], later, later); err != nil {
@@ -559,7 +560,7 @@ func TestVariantImport_MultiTrackAudioStageMutationCannotPromote(t *testing.T) {
 		}
 		return err
 	}
-	t.Cleanup(func() { osLink = originalLink })
+	t.Cleanup(func() { variantStageLink = originalLink })
 	dl := f.addDownload(t, "Dune by Frank Herbert [ENG / M4B]")
 	f.scanner.tryImportInternal(withTorrentOwnFolder(f.ctx, true), dl, folder, "qbittorrent", "test-hash", "", nil, files)
 	if !changed {
@@ -574,14 +575,9 @@ func TestVariantImport_MultiTrackAudioStageMutationCannotPromote(t *testing.T) {
 	}
 }
 
-func TestVariantImport_EbookDoesNotCreatePublicStagingPathBeforeTask8(t *testing.T) {
+func TestVariantImport_EbookDoesNotCreatePublicStagingPath(t *testing.T) {
 	f := newVariantReviewFixture(t, "English catalogue label", "Sample Author", models.MediaTypeEbook, "eng")
 	source := variantEPUBSource(t, f.sources, "English catalogue label.epub", "english.epub")
-	bad := variantEPUBSource(t, f.sources, "unchecked.epub", "romanian-en-opf.epub")
-	unchecked, err := os.ReadFile(bad)
-	if err != nil {
-		t.Fatal(err)
-	}
 	author, err := db.NewAuthorRepo(f.database).GetByID(f.ctx, f.book.AuthorID)
 	if err != nil {
 		t.Fatal(err)
@@ -597,25 +593,31 @@ func TestVariantImport_EbookDoesNotCreatePublicStagingPathBeforeTask8(t *testing
 	if err := os.WriteFile(unrelated, []byte("not this import"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	originalLink := osLink
-	swapped := false
-	osLink = func(src, dst string) error {
-		if !swapped && src != source && filepath.Dir(src) == filepath.Dir(dst) {
-			if err := os.Remove(src); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(src, unchecked, 0o600); err != nil {
-				t.Fatal(err)
-			}
-			swapped = true
+	originalLink := variantStageLink
+	stagedPrivately := false
+	variantStageLink = func(src string, parentFD int, name string) error {
+		if src != source {
+			t.Fatalf("stage linked unreviewed source %s", src)
 		}
-		return originalLink(src, dst)
+		dup, err := syscall.Dup(parentFD)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stagedParent := os.NewFile(uintptr(dup), "stage parent")
+		privateInfo, statErr := stagedParent.Stat()
+		_ = stagedParent.Close()
+		publicInfo, publicErr := os.Stat(filepath.Dir(dest))
+		if statErr != nil || publicErr != nil || os.SameFile(privateInfo, publicInfo) {
+			t.Fatalf("variant staged in the public directory: %v %v", statErr, publicErr)
+		}
+		stagedPrivately = true
+		return originalLink(src, parentFD, name)
 	}
-	t.Cleanup(func() { osLink = originalLink })
+	t.Cleanup(func() { variantStageLink = originalLink })
 	dl := f.addDownload(t, "English catalogue label [ENG / EPUB]")
 	f.importSource(t, dl, source)
-	if swapped {
-		t.Fatal("variant staged in the public directory")
+	if !stagedPrivately {
+		t.Fatal("private stage link not exercised")
 	}
 	f.assertVariantPlaced(t, dl)
 	if _, err := os.Lstat(dest); !os.IsNotExist(err) {
@@ -698,7 +700,7 @@ func TestVariantImport_PublicAudioReplacementSurvivesPlacementRace(t *testing.T)
 		t.Fatal(err)
 	}
 	source := filepath.Join(folder, "Dune.m4b")
-	if err := os.WriteFile(source, mp4File(atom("\xa9alb", dataAtom(1, []byte("Dune"))), atom("\xa9ART", dataAtom(1, []byte("Frank Herbert")))), 0o600); err != nil {
+	if err := os.WriteFile(source, mp4File(atom("\xa9alb", dataAtom(1, []byte("Dune"))), atom("\xa9ART", dataAtom(1, []byte("Frank Herbert")))), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	held := filepath.Join(f.library, "another-writer")

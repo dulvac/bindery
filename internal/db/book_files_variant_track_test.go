@@ -116,7 +116,6 @@ func TestTrackVariantRejectsWrongAssociationAndExistingPath(t *testing.T) {
 		{"wrong format", book.ID, audio[0].ID, "ebook", "/lib/audio.epub", "rum", "verified"},
 		{"wrong book id", other.ID, own[1].ID, "ebook", "/lib/wrong-book.epub", "rum", "verified"},
 		{"verified wrong language", book.ID, own[1].ID, "ebook", "/lib/wrong-language.epub", "eng", "verified"},
-		{"unverified known mismatch", book.ID, own[1].ID, "ebook", "/lib/unverified-mismatch.epub", "eng", "unverified"},
 		{"unknown verification", book.ID, own[1].ID, "ebook", "/lib/unknown.epub", "rum", "unknown"},
 		{"verified unknown language", book.ID, own[1].ID, "ebook", "/lib/empty.epub", "", "verified"},
 		{"non-absolute path", book.ID, own[1].ID, "ebook", "../lib/unsafe.epub", "rum", "verified"},
@@ -158,6 +157,37 @@ func TestTrackVariantRejectsWrongAssociationAndExistingPath(t *testing.T) {
 	var owned *PathOwnedError
 	if !errors.As(err, &owned) || owned.OwnerBookID != other.ID {
 		t.Fatalf("cross-book path error = %v; want PathOwnedError for book %d", err, other.ID)
+	}
+}
+
+func TestTrackVariantUnverifiedMismatchRetainsDetectedLanguage(t *testing.T) {
+	database, _, book := openTestDB(t)
+	ctx := context.Background()
+	books := NewBookRepo(database)
+	if err := books.SetLanguage(ctx, book.ID, "eng"); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := books.VariantRepo().EnsureWanted(ctx, book.ID, "ebook", []string{"eng"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "approved [eng].epub")
+	if err := os.WriteFile(path, []byte("approved Romanian text"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewBookFileRepo(database).TrackVariant(ctx, book.ID, rows[0].ID, "ebook", path, "rum", "unverified"); err != nil {
+		t.Fatal(err)
+	}
+	file, err := NewBookFileRepo(database).GetByPath(ctx, path)
+	if err != nil || file == nil || file.Language != "rum" || file.Verification != "unverified" {
+		t.Fatalf("lost detected file language: %+v %v", file, err)
+	}
+	if got := variantStatus(t, database, book.ID, rows[0].ID); got != models.VariantImported {
+		t.Fatalf("approved variant status = %q", got)
+	}
+	got, err := books.GetByID(ctx, book.ID)
+	if err != nil || got.Language != "eng" {
+		t.Fatalf("file relabeled catalogue language: %+v %v", got, err)
 	}
 }
 

@@ -20,6 +20,7 @@ type checkedVariantSource struct {
 	verification     string
 	detectedLanguage string
 	adminOverride    bool
+	auditEventID     int64
 }
 
 // A successful hardlink must still identify the regular file whose evidence
@@ -126,6 +127,7 @@ func (s *Scanner) reviewVariantImport(ctx context.Context, dl *models.Download, 
 		return nil, false, "", fmt.Errorf("load variant override audit: %w", err)
 	}
 	var override bool
+	var auditEventID int64
 	for _, event := range audit {
 		if event.EventType != "variantLanguageOverride" {
 			continue
@@ -139,6 +141,7 @@ func (s *Scanner) reviewVariantImport(ctx context.Context, dl *models.Download, 
 		if json.Unmarshal([]byte(event.Data), &data) == nil && data.ActorUserID > 0 &&
 			data.VariantID == variant.ID && data.DownloadID == stored.ID && strings.TrimSpace(data.Reason) != "" {
 			override = true
+			auditEventID = event.ID
 			break
 		}
 	}
@@ -173,7 +176,7 @@ func (s *Scanner) reviewVariantImport(ctx context.Context, dl *models.Download, 
 			wrongWork = true
 			reason = e.Reason
 		}
-		candidate := checkedVariantSource{path: source, assessed: assessed, verification: "unverified", adminOverride: override}
+		candidate := checkedVariantSource{path: source, assessed: assessed, verification: "unverified", detectedLanguage: e.DetectedLanguage, adminOverride: override, auditEventID: auditEventID}
 		switch {
 		case e.WrongLanguage:
 			mismatched = append(mismatched, candidate)

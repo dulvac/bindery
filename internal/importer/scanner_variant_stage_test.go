@@ -55,7 +55,7 @@ func variantAudioSources(t *testing.T, f *variantReviewFixture) (string, []strin
 	}
 	files := []string{filepath.Join(folder, "01.m4b"), filepath.Join(folder, "02.m4b")}
 	for _, p := range files {
-		if err := os.WriteFile(p, mp4File(atom("\xa9alb", dataAtom(1, []byte("Dune"))), atom("\xa9ART", dataAtom(1, []byte("Frank Herbert")))), 0o600); err != nil {
+		if err := os.WriteFile(p, mp4File(atom("\xa9alb", dataAtom(1, []byte("Dune"))), atom("\xa9ART", dataAtom(1, []byte("Frank Herbert")))), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -108,6 +108,70 @@ func TestVariantCollision_ExistingEbookAndConcurrentDirectoryAreNeverReplaced(t 
 	}
 }
 
+func TestVariantStage_UnreadableAudioSourceFailsWithoutChangingSeed(t *testing.T) {
+	f := newVariantReviewFixture(t, "Dune", "Frank Herbert", models.MediaTypeAudiobook, "eng")
+	folder, files := variantAudioSources(t, f)
+	for _, source := range files {
+		if err := os.Chmod(source, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(files[1], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dl := f.addDownload(t, "Dune by Frank Herbert [ENG / M4B]")
+	f.scanner.tryImportInternal(withTorrentOwnFolder(f.ctx, true), dl, folder, "qbittorrent", "hash", "", nil, files)
+	variantBlocked(t, f, dl, "not readable by ABS")
+	if rows, err := f.books.ListFiles(f.ctx, f.book.ID); err != nil || len(rows) != 0 {
+		t.Fatalf("unreadable audio tracked: %+v %v", rows, err)
+	}
+	if _, err := os.Lstat(variantAudioTarget(t, f)); !os.IsNotExist(err) {
+		t.Fatalf("unreadable audio published: %v", err)
+	}
+	if info, err := os.Stat(files[1]); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("torrent source mode changed: %v %v", info, err)
+	}
+}
+
+func TestVariantStage_AudioDirectoryAndDiscReadableBySeparateABSUID(t *testing.T) {
+	f := newVariantReviewFixture(t, "Dune", "Frank Herbert", models.MediaTypeAudiobook, "eng")
+	folder, files := variantAudioSources(t, f)
+	disc := filepath.Join(folder, "Disc 1")
+	if err := os.Mkdir(disc, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(files[1], filepath.Join(disc, "02.m4b")); err != nil {
+		t.Fatal(err)
+	}
+	files[1] = filepath.Join(disc, "02.m4b")
+	for _, source := range files {
+		if err := os.Chmod(source, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dl := f.addDownload(t, "Dune by Frank Herbert [ENG / M4B]")
+	f.scanner.tryImportInternal(withTorrentOwnFolder(f.ctx, true), dl, folder, "qbittorrent", "hash", "", nil, files)
+	variantImportedDownload(t, f, dl.ID)
+	dest := variantAudioTarget(t, f)
+	for _, dir := range []string{dest, filepath.Join(dest, "Disc 1")} {
+		info, err := os.Stat(dir)
+		if err != nil || !info.IsDir() || info.Mode().Perm()&0o005 != 0o005 {
+			t.Fatalf("simulated ABS UID cannot read/traverse %s: %v %v", dir, info, err)
+		}
+	}
+	for _, source := range files {
+		rel, _ := filepath.Rel(folder, source)
+		linked, err := os.Stat(filepath.Join(dest, rel))
+		if err != nil || linked.Mode().Perm()&0o004 == 0 || !sameFilePath(t, source, linked) {
+			t.Fatalf("simulated ABS UID cannot read unchanged track %s: %v %v", rel, linked, err)
+		}
+	}
+	stageInfo, err := os.Stat(filepath.Join(filepath.Dir(f.library), ".bindery-staging"))
+	if err != nil || stageInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("stage root lost private mode: %v %v", stageInfo, err)
+	}
+}
+
 func TestVariantCollision_AudioFolderNoReplaceAndAllOrNothing(t *testing.T) {
 	for _, failSecond := range []bool{false, true} {
 		t.Run(map[bool]string{false: "existing folder", true: "second track fails"}[failSecond], func(t *testing.T) {
@@ -115,14 +179,14 @@ func TestVariantCollision_AudioFolderNoReplaceAndAllOrNothing(t *testing.T) {
 			folder, files := variantAudioSources(t, f)
 			dest := variantAudioTarget(t, f)
 			if failSecond {
-				original := osLink
-				osLink = func(src, dst string) error {
+				original := variantStageLink
+				variantStageLink = func(src string, parentFD int, name string) error {
 					if src == files[1] {
 						return errors.New("test second track failure")
 					}
-					return original(src, dst)
+					return original(src, parentFD, name)
 				}
-				t.Cleanup(func() { osLink = original })
+				t.Cleanup(func() { variantStageLink = original })
 			} else {
 				if err := os.MkdirAll(dest, 0o700); err != nil {
 					t.Fatal(err)
@@ -186,9 +250,9 @@ func TestVariantStage_SourceChangedBetweenReviewAndPromotionCannotPublish(t *tes
 			f := newVariantReviewFixture(t, "English catalogue label", "Sample Author", models.MediaTypeEbook, "eng")
 			source := variantEPUBSource(t, f.sources, "English catalogue label.epub", "english.epub")
 			dest := variantEbookTarget(t, f, source)
-			original := osLink
+			original := variantStageLink
 			if swap {
-				osLink = func(src, dst string) error {
+				variantStageLink = func(src string, parentFD int, name string) error {
 					if src == source {
 						if err := os.Rename(src, src+".old"); err != nil {
 							t.Fatal(err)
@@ -197,9 +261,9 @@ func TestVariantStage_SourceChangedBetweenReviewAndPromotionCannotPublish(t *tes
 							t.Fatal(err)
 						}
 					}
-					return original(src, dst)
+					return original(src, parentFD, name)
 				}
-				t.Cleanup(func() { osLink = original })
+				t.Cleanup(func() { variantStageLink = original })
 			} else {
 				variantPromotionHook = func() {
 					later := time.Now().Add(2 * time.Hour)
@@ -217,6 +281,58 @@ func TestVariantStage_SourceChangedBetweenReviewAndPromotionCannotPublish(t *tes
 				t.Fatalf("changed source published: %v", err)
 			}
 		})
+	}
+}
+
+func TestVariantStage_RenamedRootAndSymlinkCannotRedirectStagingOrCleanup(t *testing.T) {
+	f := newVariantReviewFixture(t, "English catalogue label", "Sample Author", models.MediaTypeEbook, "eng")
+	source := variantEPUBSource(t, f.sources, "English catalogue label.epub", "english.epub")
+	dest := variantEbookTarget(t, f, source)
+	stage := filepath.Join(filepath.Dir(f.library), ".bindery-staging")
+	moved := stage + "-moved"
+	decoy := filepath.Join(t.TempDir(), "decoy")
+	if err := os.Mkdir(decoy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	variantAfterAttemptHook = func(name string) {
+		called = true
+		if err := os.Rename(stage, moved); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(decoy, stage); err != nil {
+			t.Fatal(err)
+		}
+		trap := filepath.Join(decoy, name)
+		if err := os.Mkdir(trap, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(trap, "keep"), []byte("not Bindery's stage"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { variantAfterAttemptHook = nil })
+	dl := f.addDownload(t, "English catalogue label [ENG / EPUB]")
+	f.importSource(t, dl, source)
+	if !called {
+		t.Fatal("root rename hook was not exercised")
+	}
+	variantBlocked(t, f, dl, "staging root")
+	variantImportedFiles(t, f, 0)
+	if _, err := os.Lstat(dest); !os.IsNotExist(err) {
+		t.Fatalf("unverified stage published: %v", err)
+	}
+	entries, err := os.ReadDir(decoy)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("symlink target changed: %+v %v", entries, err)
+	}
+	trap := filepath.Join(decoy, entries[0].Name())
+	if b, err := os.ReadFile(filepath.Join(trap, "keep")); err != nil || string(b) != "not Bindery's stage" {
+		t.Fatalf("decoy was staged into or cleaned: %q %v", b, err)
+	}
+	entries, err = os.ReadDir(moved)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("verified stage cleanup failed: %+v %v", entries, err)
 	}
 }
 
@@ -276,6 +392,44 @@ func TestVariantStage_TrackFailurePreservesPublicLinkAndDoesNotNotifyABS(t *test
 type variantABSCount struct{ calls *int }
 
 func (a *variantABSCount) ScanLibrary(_ context.Context, _ string) error { (*a.calls)++; return nil }
+
+func TestVariantStage_TrackingTransactionRechecksPublicAndSourceBeforeCommit(t *testing.T) {
+	for _, target := range []string{"public", "source"} {
+		t.Run(target, func(t *testing.T) {
+			f := newVariantReviewFixture(t, "English catalogue label", "Sample Author", models.MediaTypeEbook, "eng")
+			source := variantEPUBSource(t, f.sources, "English catalogue label.epub", "english.epub")
+			dest := variantEbookTarget(t, f, source)
+			variantCommitWindowHook = func() {
+				if target == "source" {
+					later := time.Now().Add(2 * time.Hour)
+					if err := os.Chtimes(source, later, later); err != nil {
+						t.Fatal(err)
+					}
+					return
+				}
+				if err := os.Remove(dest); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(dest, []byte("other writer"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Cleanup(func() { variantCommitWindowHook = nil })
+			dl := f.addDownload(t, "English catalogue label [ENG / EPUB]")
+			f.importSource(t, dl, source)
+			variantBlocked(t, f, dl, "stranded")
+			variantImportedFiles(t, f, 0)
+			if rows, err := f.books.VariantRepo().ListByBook(f.ctx, f.book.ID); err != nil || len(rows) != 1 || rows[0].Status == models.VariantImported {
+				t.Fatalf("failed validation committed variant: %+v %v", rows, err)
+			}
+			if target == "public" {
+				if b, err := os.ReadFile(dest); err != nil || string(b) != "other writer" {
+					t.Fatalf("other writer's public link changed: %q %v", b, err)
+				}
+			}
+		})
+	}
+}
 
 func TestVariantStage_PublicReplacementBeforeTrackingIsNeverDeletedOrClaimed(t *testing.T) {
 	f := newVariantReviewFixture(t, "English catalogue label", "Sample Author", models.MediaTypeEbook, "eng")
