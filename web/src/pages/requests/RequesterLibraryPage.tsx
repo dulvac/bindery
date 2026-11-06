@@ -5,14 +5,22 @@ import { api } from '../../api/client'
 import type { RequesterLibraryBook } from '../../api/client'
 import { mediaTypeLabel } from './requestLabels'
 import CoverImage from '../../components/CoverImage'
+import BookLanguages from '../../components/BookLanguages'
 import BookVariantStatus from '../../components/BookVariantStatus'
 import { primaryFill } from '../../components/buttons'
 
 const PAGE_SIZE = 60
 
-// The library as a requester sees it: read only, from the projection
-// endpoint, with no links into book pages and no downloads. Anything missing
-// is one click away from a request.
+function hasMissingSelection(book: RequesterLibraryBook | undefined, mediaType: string, languages: string[]): boolean {
+  if (!book || languages.length === 0) return false
+  const formats = mediaType === 'both' ? ['ebook', 'audiobook'] : [mediaType]
+  const existing = new Set((book.variants ?? []).map(v => `${v.mediaType}/${v.language.trim().toLowerCase()}`))
+  return formats.some(format => languages.some(language => !existing.has(`${format}/${language}`)))
+}
+
+// The library as a requester sees it: browsed through the scoped projection,
+// with no links into book pages and no downloads. Owned books can
+// start a missing-language request directly without a My Requests row.
 export default function RequesterLibraryPage() {
   const { t } = useTranslation()
   const [query, setQuery] = useState('')
@@ -21,6 +29,11 @@ export default function RequesterLibraryPage() {
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [editingBookId, setEditingBookId] = useState<number | null>(null)
+  const [editMediaType, setEditMediaType] = useState('ebook')
+  const [editLanguages, setEditLanguages] = useState<string[]>(['eng'])
+  const [sending, setSending] = useState(false)
+  const [sentBookId, setSentBookId] = useState<number | null>(null)
 
   const load = useCallback(async (offset: number, term: string) => {
     setLoading(true)
@@ -37,6 +50,34 @@ export default function RequesterLibraryPage() {
   }, [t])
 
   useEffect(() => { void load(0, search) }, [load, search])
+
+  const openAdd = (book: RequesterLibraryBook) => {
+    if (editingBookId === book.id) {
+      setEditingBookId(null)
+      return
+    }
+    const format = book.formats[0] === 'audiobook' ? 'audiobook' : 'ebook'
+    const existing = (book.variants ?? []).filter(v => v.mediaType === format).map(v => v.language)
+    setEditMediaType(format)
+    setEditLanguages(existing.length > 0 ? Array.from(new Set(existing)) : ['eng'])
+    setEditingBookId(book.id)
+    setSentBookId(null)
+  }
+
+  const sendAdd = async (book: RequesterLibraryBook) => {
+    if (!book.foreignBookId || !hasMissingSelection(book, editMediaType, editLanguages)) return
+    setSending(true)
+    setError(null)
+    try {
+      await api.createRequest('book', book.foreignBookId, editMediaType, editLanguages)
+      setEditingBookId(null)
+      setSentBookId(book.id)
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : t('requests.mine.extendFailed'))
+    } finally {
+      setSending(false)
+    }
+  }
 
   return (
     <div className="space-y-6">
@@ -90,6 +131,45 @@ export default function RequesterLibraryPage() {
                 : t('requests.library.notYetAvailable')}
             </div>
             <BookVariantStatus variants={b.variants} legacyFiles={b.legacyFiles} className="mt-1" />
+            {b.foreignBookId && (
+              <>
+                <button
+                  type="button"
+                  className="mt-2 text-xs text-accent-text hover:underline"
+                  onClick={() => openAdd(b)}
+                >
+                  {t('requests.mine.addLanguage')}
+                </button>
+                {editingBookId === b.id && (
+                  <div className="mt-2 p-2 rounded-md border border-slate-300 dark:border-zinc-700 space-y-3">
+                    <label className="flex flex-col gap-1 text-xs">
+                      <span>{t('requests.confirm.format')}</span>
+                      <select
+                        aria-label={t('requests.confirm.formatLabel')}
+                        value={editMediaType}
+                        onChange={event => setEditMediaType(event.target.value)}
+                        disabled={sending}
+                        className="bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-2 py-1"
+                      >
+                        <option value="ebook">{t('common.ebook')}</option>
+                        <option value="audiobook">{t('common.audiobook')}</option>
+                        <option value="both">{t('common.both')}</option>
+                      </select>
+                    </label>
+                    <BookLanguages value={editLanguages} onChange={setEditLanguages} disabled={sending} />
+                    <button
+                      type="button"
+                      onClick={() => void sendAdd(b)}
+                      disabled={sending || !hasMissingSelection(b, editMediaType, editLanguages)}
+                      className={`px-3 py-1.5 ${primaryFill} disabled:opacity-50 disabled:cursor-not-allowed rounded-md text-xs font-medium`}
+                    >
+                      {sending ? t('requests.confirm.sending') : t('requests.mine.requestLanguage')}
+                    </button>
+                  </div>
+                )}
+                {sentBookId === b.id && <p role="status" className="mt-1 text-xs text-fg-muted">{t('requests.library.languageRequested')}</p>}
+              </>
+            )}
           </li>
         ))}
       </ul>

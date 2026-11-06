@@ -219,6 +219,53 @@ func TestVariantFulfilledRequiresEverySelectedCopy(t *testing.T) {
 	check(true)
 }
 
+// Pending selections must remain visible before approval, including an
+// already-imported copy on the requester's own book. Missing pairs cannot
+// silently disappear just because they have no book_variants row yet.
+func TestVariantPendingRequestProjectsSelectedPairsAndOwnedBookStatuses(t *testing.T) {
+	f := newRequestsFixture(t, wellsRequestStub(), nil)
+	ctx := context.Background()
+	created := decodeRequest(t, f.create(t, f.requester, `{"kind":"book","foreignId":"OL27482W","mediaType":"ebook","languages":["eng"]}`))
+	if rec := f.approve(f.admin, created.ID, `{"searchOnAdd":false}`); rec.Code != http.StatusOK {
+		t.Fatalf("approve English: %d %s", rec.Code, rec.Body.String())
+	}
+	book, err := f.books.GetByForeignID(ctx, "OL27482W")
+	if err != nil || book == nil {
+		t.Fatalf("approved book: %+v %v", book, err)
+	}
+	english, err := f.books.VariantRepo().ListByBook(ctx, book.ID)
+	if err != nil || len(english) != 1 {
+		t.Fatalf("English variant: %+v %v", english, err)
+	}
+	if err := f.books.VariantRepo().SetStatus(ctx, english[0].ID, models.VariantImported); err != nil {
+		t.Fatal(err)
+	}
+	pending := decodeRequest(t, f.create(t, f.requester, `{"kind":"book","foreignId":"OL27482W","mediaType":"both","languages":["eng","rum"]}`))
+	if pending.Status != models.RequestStatusPending {
+		t.Fatalf("request after extending existing book: %+v", pending)
+	}
+	rec := httptest.NewRecorder()
+	f.h.ListMine(rec, asUser(httptest.NewRequest(http.MethodGet, "/api/v1/requests", nil), f.requester))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mine: %d %s", rec.Code, rec.Body.String())
+	}
+	var got requestListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Items) != 1 || got.Items[0].Fulfilled {
+		t.Fatalf("pending request must be unfulfilled: %+v", got.Items)
+	}
+	pairs := map[string]string{}
+	for _, v := range got.Items[0].Variants {
+		pairs[v.MediaType+"/"+v.Language] = v.Status
+	}
+	want := map[string]string{"ebook/eng": "imported", "ebook/rum": "wanted", "audiobook/eng": "wanted", "audiobook/rum": "wanted"}
+	if !reflect.DeepEqual(pairs, want) || len(got.Items[0].Variants) != len(want) {
+		t.Fatalf("pending requested copies = %v, want %v: %s", pairs, want, rec.Body.String())
+	}
+}
+
 // An approved request must not keep showing another owner's statuses if its
 // result book is reassigned after approval (even before tenancy is enabled).
 func TestVariantFulfilledOwnerReassignmentDoesNotExposeCopies(t *testing.T) {
@@ -348,7 +395,7 @@ func TestVariantResponseRequesterLibraryPagesAndNeverExposesPaths(t *testing.T) 
 			t.Fatalf("page %d: %d %s", page, rec.Code, rec.Body.String())
 		}
 		body := rec.Body.String()
-		for _, key := range []string{"/private/", "path", "filePath", "ebookFilePath", "audiobookFilePath", "downloadUrl", "torrent", "OL-"} {
+		for _, key := range []string{"/private/", "path", "filePath", "ebookFilePath", "audiobookFilePath", "downloadUrl", "torrent", "OL-Other"} {
 			if strings.Contains(strings.ToLower(body), strings.ToLower(key)) {
 				t.Errorf("page %d leaks %s: %s", page, key, body)
 			}
@@ -358,8 +405,9 @@ func TestVariantResponseRequesterLibraryPagesAndNeverExposesPaths(t *testing.T) 
 			Limit  int `json:"limit"`
 			Offset int `json:"offset"`
 			Items  []struct {
-				Title    string `json:"title"`
-				Variants []struct {
+				Title         string `json:"title"`
+				ForeignBookID string `json:"foreignBookId"`
+				Variants      []struct {
 					ID           int64  `json:"id"`
 					MediaType    string `json:"mediaType"`
 					Language     string `json:"language"`
@@ -376,8 +424,8 @@ func TestVariantResponseRequesterLibraryPagesAndNeverExposesPaths(t *testing.T) 
 		if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
 			t.Fatal(err)
 		}
-		if result.Total != 2 || result.Limit != 1 || result.Offset != page || len(result.Items) != 1 || result.Items[0].Title != title {
-			t.Fatalf("page %d = %+v, want %s", page, result, title)
+		if result.Total != 2 || result.Limit != 1 || result.Offset != page || len(result.Items) != 1 || result.Items[0].Title != title || result.Items[0].ForeignBookID != "OL-"+title {
+			t.Fatalf("page %d = %+v, want owned book %s with its add id", page, result, title)
 		}
 		if page == 0 {
 			want := []string{"ebook/eng/imported/verified", "ebook/rum/wanted/"}
@@ -428,8 +476,8 @@ func TestVariantRequesterLibraryReassignmentBetweenReads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(items) != 1 || len(items[0].Variants) != 0 || len(items[0].LegacyFiles) != 0 {
-		t.Fatalf("old owner's paginated book exposed new owner's status: %+v", items)
+	if len(items) != 1 || len(items[0].Variants) != 0 || len(items[0].LegacyFiles) != 0 || items[0].ForeignBookID != "" {
+		t.Fatalf("old owner's paginated book exposed new owner's status or add id: %+v", items)
 	}
 	payload, err := json.Marshal(items)
 	if err != nil {
@@ -441,8 +489,8 @@ func TestVariantRequesterLibraryReassignmentBetweenReads(t *testing.T) {
 	// The new owner still sees the copies, but never a filesystem path.
 	otherCtx := asUser(httptest.NewRequest(http.MethodGet, "/api/v1/requests/library", nil), f.other).Context()
 	owned, err := f.h.projectLibrary(otherCtx, rows)
-	if err != nil || len(owned) != 1 || len(owned[0].Variants) != 1 || len(owned[0].LegacyFiles) != 1 {
-		t.Fatalf("new owner status: items=%+v err=%v", owned, err)
+	if err != nil || len(owned) != 1 || len(owned[0].Variants) != 1 || len(owned[0].LegacyFiles) != 1 || owned[0].ForeignBookID != "OL-LIB-RACE" {
+		t.Fatalf("new owner status and add id: items=%+v err=%v", owned, err)
 	}
 	ownedJSON, err := json.Marshal(owned)
 	if err != nil {

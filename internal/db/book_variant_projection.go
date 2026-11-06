@@ -33,6 +33,44 @@ type BookStatusAccess struct {
 	OwnerUserID int64
 }
 
+// BookForeignAccess identifies a book only when it is still owned by the
+// requester's account. A pending request has no result_book_id yet.
+type BookForeignAccess struct {
+	ForeignID   string
+	OwnerUserID int64
+}
+
+// ListOwnedByForeignIDs resolves pending requests in one query without
+// exposing variants from another account's book with the same provider id.
+func (r *BookVariantRepo) ListOwnedByForeignIDs(ctx context.Context, books []BookForeignAccess) (map[BookForeignAccess]BookStatusAccess, error) {
+	out := make(map[BookForeignAccess]BookStatusAccess, len(books))
+	if len(books) == 0 {
+		return out, nil
+	}
+	marks := strings.TrimSuffix(strings.Repeat("(?,?),", len(books)), ",")
+	args := make([]any, 0, len(books)*2)
+	for _, book := range books {
+		args = append(args, book.ForeignID, book.OwnerUserID)
+	}
+	// #nosec G202 -- VALUES contains only placeholders, never caller text.
+	rows, err := r.db.QueryContext(ctx, `WITH scope(foreign_id, owner_user_id) AS (VALUES `+marks+`)
+		SELECT b.id, scope.foreign_id, scope.owner_user_id FROM scope
+		JOIN books b ON b.foreign_id = scope.foreign_id AND b.owner_user_id = scope.owner_user_id`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("resolve pending request books: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var book BookForeignAccess
+		var id int64
+		if err := rows.Scan(&id, &book.ForeignID, &book.OwnerUserID); err != nil {
+			return nil, fmt.Errorf("scan pending request books: %w", err)
+		}
+		out[book] = BookStatusAccess{BookID: id, OwnerUserID: book.OwnerUserID}
+	}
+	return out, rows.Err()
+}
+
 func bookAccessValues(books []BookStatusAccess) (string, []any) {
 	args := make([]any, 0, len(books)*2)
 	for _, book := range books {

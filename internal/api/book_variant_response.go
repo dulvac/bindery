@@ -48,8 +48,30 @@ func requestFormats(req models.LibraryRequest) []string {
 	return models.RequestedMediaTypes(mediaType)
 }
 
-// Request status reports only the selected format/language pairs, rather
-// than treating another copy of the same book as satisfying this request.
+// A pending request has not created its missing variants yet. Show each
+// selected pair, retaining real status/evidence on copies already owned.
+func pendingRequestedVariants(req models.LibraryRequest, rows []db.BookVariantStatus) []variantResponse {
+	byPair := make(map[string]db.BookVariantStatus, len(rows))
+	for _, v := range rows {
+		byPair[v.MediaType+"/"+v.Language] = v
+	}
+	out := make([]variantResponse, 0, len(requestFormats(req))*len(req.Languages))
+	for _, format := range requestFormats(req) {
+		for _, language := range req.Languages {
+			if v, ok := byPair[format+"/"+language]; ok {
+				out = append(out, variantResponse{ID: v.ID, MediaType: v.MediaType, Language: v.Language,
+					Status: v.Status, Verification: v.Verification})
+			} else {
+				out = append(out, variantResponse{ID: -int64(len(out) + 1), MediaType: format,
+					Language: language, Status: models.VariantWanted})
+			}
+		}
+	}
+	return out
+}
+
+// Approved request status reports only selected format/language pairs, rather
+// than treating another copy of the same book as satisfying the request.
 func requestedVariants(req models.LibraryRequest, rows []db.BookVariantStatus) []variantResponse {
 	formats := make(map[string]bool)
 	for _, format := range requestFormats(req) {

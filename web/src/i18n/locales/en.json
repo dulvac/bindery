@@ -2811,7 +2811,8 @@
       "noMatches": "Nothing in the library matches. Try requesting it.",
       "loadFailed": "Could not load the library",
       "seriesWithPosition": "{{series}} #{{position}}",
-      "notYetAvailable": "Not available yet"
+      "notYetAvailable": "Not available yet",
+      "languageRequested": "Language request sent"
     },
     "admin": {
       "title": "Requests",

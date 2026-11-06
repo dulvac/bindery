@@ -30,12 +30,30 @@ function requestFormatsFromRequest(request: LibraryRequest, overrideMediaType: s
   return ['ebook']
 }
 
+function pendingVariants(request: LibraryRequest): NonNullable<LibraryRequest['variants']> {
+  const existing = new Map((request.variants ?? []).map(v => [`${v.mediaType}/${v.language}`, v]))
+  const rows: NonNullable<LibraryRequest['variants']> = []
+  for (const format of requestFormatsFromMediaType(request.mediaType)) {
+    for (const language of request.languages ?? []) {
+      rows.push(existing.get(`${format}/${language}`) ?? {
+        id: -(rows.length + 1), mediaType: format, language, status: 'wanted', verification: '',
+      })
+    }
+  }
+  return rows
+}
+
 function hasMissingSelection(request: LibraryRequest, mediaType: string, languages: string[]): boolean {
   if (languages.length === 0) return false
   const formats = requestFormatsFromRequest(request, mediaType)
   const existing = new Set(
     (request.variants ?? []).map(v => `${v.mediaType}/${(v.language || '').trim().toLowerCase()}`),
   )
+  if (request.status === 'pending') {
+    for (const format of requestFormatsFromMediaType(request.mediaType)) {
+      for (const language of request.languages ?? []) existing.add(`${format}/${language}`)
+    }
+  }
   return formats.some(format => languages.some(language => !existing.has(`${format}/${language}`)))
 }
 
@@ -105,7 +123,7 @@ export default function MyRequestsPage() {
       const created = await api.createRequest('book', request.foreignId, editMediaType, editLanguages)
       setItems(prev => prev.map(item =>
         (item.id === request.id || (item.kind === 'book' && item.foreignId === request.foreignId))
-          ? created
+          ? { ...created, variants: created.variants ?? item.variants, legacyFiles: created.legacyFiles ?? item.legacyFiles }
           : item,
       ))
       setEditingRequestId(null)
@@ -147,7 +165,7 @@ export default function MyRequestsPage() {
                 {r.status === 'declined' && r.declineReason && (
                   <p className="text-xs mt-1 text-slate-700 dark:text-zinc-300">{t('requests.mine.reason', { reason: r.declineReason })}</p>
                 )}
-                {r.kind === 'book' && <BookVariantStatus variants={r.variants} legacyFiles={r.legacyFiles} className="mt-2" />}
+                {r.kind === 'book' && <BookVariantStatus variants={r.status === 'pending' ? pendingVariants(r) : r.variants} legacyFiles={r.legacyFiles} className="mt-2" />}
                 {r.kind === 'book' && r.status !== 'declined' && (
                   <button
                     type="button"

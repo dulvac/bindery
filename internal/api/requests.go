@@ -1010,14 +1010,31 @@ func (h *RequestHandler) maxPendingPerUser(ctx context.Context) int {
 func (h *RequestHandler) projectRequests(ctx context.Context, items []models.LibraryRequest, admin bool) ([]requestResponse, error) {
 	accesses := make([]db.BookStatusAccess, 0, len(items))
 	seen := make(map[db.BookStatusAccess]bool)
+	pending := make([]db.BookForeignAccess, 0)
 	for _, req := range items {
-		if req.Kind == models.RequestKindBook && req.Status == models.RequestStatusApproved && req.ResultBookID != nil &&
+		if req.Kind != models.RequestKindBook {
+			continue
+		}
+		if req.Status == models.RequestStatusPending || req.Status == models.RequestStatusApproving {
+			pending = append(pending, db.BookForeignAccess{ForeignID: req.ForeignID, OwnerUserID: req.OwnerUserID})
+		}
+		if req.Status == models.RequestStatusApproved && req.ResultBookID != nil &&
 			(req.BookOwnerUserID == 0 || req.BookOwnerUserID == req.OwnerUserID) {
 			access := db.BookStatusAccess{BookID: *req.ResultBookID, OwnerUserID: req.OwnerUserID}
 			if !seen[access] {
 				seen[access] = true
 				accesses = append(accesses, access)
 			}
+		}
+	}
+	pendingBooks, err := h.variants.ListOwnedByForeignIDs(ctx, pending)
+	if err != nil {
+		return nil, err
+	}
+	for _, access := range pendingBooks {
+		if !seen[access] {
+			seen[access] = true
+			accesses = append(accesses, access)
 		}
 	}
 	statuses, err := h.variants.ListStatusByBooks(ctx, accesses)
@@ -1027,24 +1044,39 @@ func (h *RequestHandler) projectRequests(ctx context.Context, items []models.Lib
 	out := make([]requestResponse, 0, len(items))
 	for _, req := range items {
 		response := toRequestResponse(req, admin)
-		if req.Kind == models.RequestKindBook && req.Status == models.RequestStatusApproved && req.ResultBookID != nil &&
-			(req.BookOwnerUserID == 0 || req.BookOwnerUserID == req.OwnerUserID) {
-			projection := statuses[db.BookStatusAccess{BookID: *req.ResultBookID, OwnerUserID: req.OwnerUserID}]
-			response.Variants = requestedVariants(req, projection.Variants)
-			// Fulfillment from the earlier page query may be stale if the book
-			// changed owners before this status read.
-			response.Fulfilled = req.BookFulfilled && len(response.Variants) == len(requestFormats(req))*len(req.Languages)
-			for _, variant := range response.Variants {
-				if variant.Status != models.VariantImported {
-					response.Fulfilled = false
-				}
+		if req.Kind == models.RequestKindBook {
+			var access db.BookStatusAccess
+			switch {
+			case req.Status == models.RequestStatusPending || req.Status == models.RequestStatusApproving:
+				access = pendingBooks[db.BookForeignAccess{ForeignID: req.ForeignID, OwnerUserID: req.OwnerUserID}]
+			case req.Status == models.RequestStatusApproved && req.ResultBookID != nil &&
+				(req.BookOwnerUserID == 0 || req.BookOwnerUserID == req.OwnerUserID):
+				access = db.BookStatusAccess{BookID: *req.ResultBookID, OwnerUserID: req.OwnerUserID}
 			}
-			for _, file := range projection.LegacyFiles {
-				for _, format := range requestFormats(req) {
-					if file.MediaType == format {
-						response.LegacyFiles = append(response.LegacyFiles, legacyFileResponse{
-							MediaType: format, Status: models.VariantImported, Verification: "unverified",
-						})
+			projection := statuses[access]
+			if req.Status == models.RequestStatusPending || req.Status == models.RequestStatusApproving {
+				response.Variants = pendingRequestedVariants(req, projection.Variants)
+			} else if access.BookID != 0 {
+				response.Variants = requestedVariants(req, projection.Variants)
+				// Fulfillment from the earlier page query may be stale if the book
+				// changed owners before this status read.
+				response.Fulfilled = req.BookFulfilled && len(response.Variants) == len(requestFormats(req))*len(req.Languages)
+				for _, variant := range response.Variants {
+					if variant.Status != models.VariantImported {
+						response.Fulfilled = false
+					}
+				}
+			} else {
+				response.Fulfilled = false
+			}
+			if access.BookID != 0 {
+				for _, file := range projection.LegacyFiles {
+					for _, format := range requestFormats(req) {
+						if file.MediaType == format {
+							response.LegacyFiles = append(response.LegacyFiles, legacyFileResponse{
+								MediaType: format, Status: models.VariantImported, Verification: "unverified",
+							})
+						}
 					}
 				}
 			}

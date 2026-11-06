@@ -13,6 +13,8 @@ export interface BookFile {
 
 // One requested format/language copy and its current state.
 export interface BookVariantStatus {
+  // Pending requests use negative ids for selected copies not yet in the book.
+  // They are display-only, not targets for variant actions.
   id: number
   mediaType: 'ebook' | 'audiobook'
   language: string

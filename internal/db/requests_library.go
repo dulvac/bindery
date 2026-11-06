@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/vavallee/bindery/internal/textutil"
 )
@@ -22,6 +23,37 @@ type LibraryProjectionRow struct {
 	Status         string
 	HasEbook       bool
 	HasAudiobook   bool
+}
+
+// ListOwnedLibraryForeignIDs resolves add-language ids only for books the
+// requester still owns after the page query. Shared and unowned library rows
+// remain browsable but cannot be extended through another person's account.
+func (r *RequestRepo) ListOwnedLibraryForeignIDs(ctx context.Context, ownerID int64, bookIDs []int64) (map[int64]string, error) {
+	out := make(map[int64]string)
+	if ownerID <= 0 || len(bookIDs) == 0 {
+		return out, nil
+	}
+	marks := strings.TrimSuffix(strings.Repeat("?,", len(bookIDs)), ",")
+	args := make([]any, 0, len(bookIDs)+1)
+	args = append(args, ownerID)
+	for _, id := range bookIDs {
+		args = append(args, id)
+	}
+	// #nosec G202 -- IN contains only placeholders, never caller text.
+	rows, err := r.db.QueryContext(ctx, `SELECT id, foreign_id FROM books WHERE owner_user_id = ? AND id IN (`+marks+`)`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("load owned library add ids: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var foreignID string
+		if err := rows.Scan(&id, &foreignID); err != nil {
+			return nil, fmt.Errorf("scan owned library add ids: %w", err)
+		}
+		out[id] = foreignID
+	}
+	return out, rows.Err()
 }
 
 // ListLibraryProjection returns one page of non excluded books in title

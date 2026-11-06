@@ -427,6 +427,7 @@ function BookDetailPageInner() {
   const [addVariantLanguages, setAddVariantLanguages] = useState<string[]>(['eng'])
   const [addingVariant, setAddingVariant] = useState(false)
   const [showAddVariantForm, setShowAddVariantForm] = useState(false)
+  const initializedVariantBookID = useRef<number | null>(null)
 
   useEffect(() => {
     if (book?.title) {
@@ -436,7 +437,8 @@ function BookDetailPageInner() {
   }, [book?.title])
 
   useEffect(() => {
-    if (!book) return
+    if (!book || initializedVariantBookID.current === book.id) return
+    initializedVariantBookID.current = book.id
     const mediaType: MediaType = book.mediaType === 'audiobook' || book.mediaType === 'both' ? book.mediaType : 'ebook'
     setAddVariantMediaType(mediaType)
     const formats = requestedFormats(mediaType)

@@ -1356,6 +1356,29 @@ describe('BookDetailPage — danger zone', () => {
 // the server sets from the book's download rows (TestBookGet_ImportInFlight
 // pins that side).
 describe('BookDetailPage live refresh while an import is in flight (#2423)', () => {
+  it('keeps an open add-language form and its draft selection across a polling refresh of the same book', async () => {
+    vi.useFakeTimers()
+    try {
+      const existing = [{ id: 1, mediaType: 'ebook' as const, language: 'eng', status: 'imported', verification: 'verified' }]
+      vi.mocked(api.getBook)
+        .mockResolvedValueOnce(makeBook({ importInFlight: true, variants: existing }))
+        .mockResolvedValue(makeBook({ importInFlight: true, variants: existing, status: 'imported' }))
+      renderBookDetailPage()
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+
+      fireEvent.click(screen.getByRole('button', { name: 'Add another language' }))
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Romanian' }))
+      expect(screen.getByRole('button', { name: 'Submit language request' })).toBeEnabled()
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+
+      expect(api.getBook).toHaveBeenCalledTimes(2)
+      expect(screen.getByRole('checkbox', { name: 'Romanian' })).toBeChecked()
+      expect(screen.getByRole('button', { name: 'Submit language request' })).toBeEnabled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('reloads the book every 5s while importInFlight is set, and stops once the import lands', async () => {
     vi.useFakeTimers()
     try {

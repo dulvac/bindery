@@ -78,10 +78,10 @@ A requester asks for books; an admin decides. It is the role for people who shar
 
 **What a requester can do**
 
-- Browse the library read only. The Library page lists each book's title, author, series, cover, status and which formats are on disk. It comes from `GET /api/v1/requests/library`, a projection built field by field, so it carries no file paths, owner ids, provider ids or links into book pages.
+- Browse the library without downloads or edits. The Library page lists each book's title, author, series, cover, format and language status. It comes from `GET /api/v1/requests/library`, a projection built field by field: no file paths, owner ids or links into book pages are returned. Only a book the requester owns includes its provider id for a direct language request.
 - Search the metadata providers from the Request page, the same search the Add dialog runs. Those searches spend provider quota, so each requester is limited to a burst of 20 and then one every 3 seconds; creating a request looks the item up too and spends the same allowance. Cover images have a separate, larger allowance.
-- Request a book or an author, choosing only the format. Bindery looks the item up itself and stores the title and author the provider reports; nothing else the requester sends is kept. A request for something already in the library, or already requested by the same person, is refused with a sentence saying so.
-- Follow their own requests on My requests: waiting, approved, available once a file is imported (for an author, how many of the author's books are in), or declined with the admin's reason. A pending request can be withdrawn.
+- Request a book or an author. Book requests select a format and one or more languages, with English selected by default. From an owned book in Library or My requests, Add another language sends a request for a missing format/language pair without creating another book. Bindery looks the item up and stores the title and author reported by the provider. Requests for copies already selected are refused.
+- Follow their own requests on My requests: waiting, approved, available once every requested format and language is imported (for an author, how many of the author's books are in), or declined with the admin's reason. A pending request can be withdrawn.
 - Change their own password, and sign in and out.
 
 **What a requester cannot do**

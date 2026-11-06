@@ -16,10 +16,11 @@ import (
 // later cannot reach a requester unless someone adds it here, and
 // TestRequesterLibraryBook_FieldAllowList fails when they do.
 //
-// There are no file paths, no owner, no provider ids, no monitored flag and
-// no download or file links.
+// There are no file paths, no owner, no monitored flag and no download or
+// file links. The add-language provider id is present only for owned books.
 type requesterLibraryBook struct {
 	ID             int64                `json:"id"`
+	ForeignBookID  string               `json:"foreignBookId,omitempty"`
 	Title          string               `json:"title"`
 	AuthorName     string               `json:"authorName"`
 	Series         string               `json:"series,omitempty"`
@@ -68,8 +69,14 @@ func (h *RequestHandler) Library(w http.ResponseWriter, r *http.Request) {
 func (h *RequestHandler) projectLibrary(ctx context.Context, rows []db.LibraryProjectionRow) ([]requesterLibraryBook, error) {
 	scopeUserID := auth.ListScopeUserID(ctx)
 	accesses := make([]db.BookStatusAccess, 0, len(rows))
+	bookIDs := make([]int64, 0, len(rows))
 	for _, row := range rows {
 		accesses = append(accesses, db.BookStatusAccess{BookID: row.ID, OwnerUserID: scopeUserID})
+		bookIDs = append(bookIDs, row.ID)
+	}
+	foreignIDs, err := h.requests.ListOwnedLibraryForeignIDs(ctx, auth.UserIDFromContext(ctx), bookIDs)
+	if err != nil {
+		return nil, err
 	}
 	statuses, err := h.variants.ListStatusByBooks(ctx, accesses)
 	if err != nil {
@@ -87,6 +94,7 @@ func (h *RequestHandler) projectLibrary(ctx context.Context, rows []db.LibraryPr
 		projection := statuses[db.BookStatusAccess{BookID: row.ID, OwnerUserID: scopeUserID}]
 		items = append(items, requesterLibraryBook{
 			ID:             row.ID,
+			ForeignBookID:  foreignIDs[row.ID],
 			Title:          row.Title,
 			AuthorName:     row.AuthorName,
 			Series:         row.SeriesTitle,

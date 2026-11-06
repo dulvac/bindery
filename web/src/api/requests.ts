@@ -45,6 +45,8 @@ export interface LibraryRequestList {
 // no links into the admin library pages.
 export interface RequesterLibraryBook {
   id: number
+  // Present only when this requester owns the book and may request a new copy.
+  foreignBookId?: string
   title: string
   authorName: string
   series?: string

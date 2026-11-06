@@ -612,6 +612,7 @@ func TestRequestsApprove_AuthorSearchOnAddKeepsTheSync(t *testing.T) {
 // the point: every field a requester can see is a decision.
 var requesterLibraryBookFields = map[string]string{
 	"ID":             "id",
+	"ForeignBookID":  "foreignBookId",
 	"Title":          "title",
 	"AuthorName":     "authorName",
 	"Series":         "series",
@@ -700,6 +701,60 @@ func TestRequestsLibrary_ProjectionCarriesNoPaths(t *testing.T) {
 	if item.Title != "The War of the Worlds" || item.AuthorName != "H. G. Wells" || item.Status != "imported" ||
 		!reflect.DeepEqual(item.Formats, []string{"ebook", "audiobook"}) || !strings.Contains(item.CoverURL, "/api/v1/images?url=") {
 		t.Fatalf("item = %+v", item)
+	}
+}
+
+// The add-language button needs the provider id of an owned book. The shared
+// library still lists other users' books, but must not hand out their add ids.
+func TestRequestsLibraryForeignBookIDOnlyForCurrentOwner(t *testing.T) {
+	auth.SetEnforceTenancyForTests(t, false)
+	f := newRequestsFixture(t, wellsRequestStub(), &fakeAdder{})
+	ctx := context.Background()
+	author := seedWells(t, f.authors)
+	for _, row := range []struct {
+		foreignID, title string
+		owner            int64
+	}{
+		{"OL-OWN-1W", "Own book", f.requester.ID},
+		{"OL-OTHER-1W", "Other book", f.other.ID},
+		{"OL-UNOWNED-1W", "Unowned book", 0},
+	} {
+		book := &models.Book{ForeignID: row.foreignID, AuthorID: author.ID, OwnerUserID: row.owner,
+			Title: row.title, SortTitle: row.title, Status: models.BookStatusWanted}
+		if err := f.books.Create(ctx, book); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec := httptest.NewRecorder()
+	f.h.Library(rec, asUser(httptest.NewRequest(http.MethodGet, "/api/v1/requests/library", nil), f.requester))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("library: %d %s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		Items []struct {
+			Title         string `json:"title"`
+			ForeignBookID string `json:"foreignBookId"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Items) != 3 {
+		t.Fatalf("shared library: %s", rec.Body.String())
+	}
+	for _, item := range got.Items {
+		want := ""
+		if item.Title == "Own book" {
+			want = "OL-OWN-1W"
+		}
+		if item.ForeignBookID != want {
+			t.Errorf("%s: add-language id %q, want %q", item.Title, item.ForeignBookID, want)
+		}
+	}
+	for _, forbidden := range []string{"OL-OTHER-1W", "OL-UNOWNED-1W", "filePath", "/private/"} {
+		if strings.Contains(rec.Body.String(), forbidden) {
+			t.Fatalf("shared library leaked %q: %s", forbidden, rec.Body.String())
+		}
 	}
 }
 

@@ -29,6 +29,7 @@ vi.mock('react-i18next', () => {
     'requests.library.noMatches': 'Nothing in the library matches. Try requesting it.',
     'requests.library.loadFailed': 'Could not load the library',
     'requests.library.notYetAvailable': 'Not available yet',
+    'requests.library.languageRequested': 'Language request sent',
     'requests.library.seriesWithPosition': '{{series}} #{{position}}',
     'requests.confirm.format': 'Format',
     'requests.confirm.formatLabel': 'Format to request',
@@ -175,10 +176,8 @@ describe('MyRequestsPage', () => {
         status: 'pending',
         fulfilled: false,
         languages: ['eng', 'rum'],
-        variants: [
-          { id: 31, mediaType: 'ebook', language: 'eng', status: 'imported', verification: 'verified' },
-          { id: 32, mediaType: 'ebook', language: 'rum', status: 'wanted', verification: '' },
-        ],
+        // POST /requests answers the pending row before any projection is loaded.
+        variants: undefined,
       }),
     )
 
@@ -195,15 +194,113 @@ describe('MyRequestsPage', () => {
     fireEvent.click(submit)
     await waitFor(() => expect(api.createRequest).toHaveBeenCalledWith('book', 'OL1W', 'ebook', ['eng', 'rum']))
     expect(await screen.findByText('Waiting for an admin')).toBeInTheDocument()
+    const english = screen.getByTestId('book-variant-status-variant-31')
+    expect(english).toHaveTextContent('English')
+    expect(english).toHaveTextContent('In library')
+    expect(screen.getByTestId('book-variant-status-variant--2')).toHaveTextContent('Romanian')
 
     fireEvent.click(screen.getByRole('button', { name: 'Add another language' }))
     fireEvent.click(screen.getByRole('checkbox', { name: 'English' }))
     expect(screen.getByRole('button', { name: 'Send language request' })).toBeDisabled()
   })
+
+  it('shows partial approval until every requested format and language is imported, then available on reload', async () => {
+    const english = { id: 31, mediaType: 'ebook' as const, language: 'eng', status: 'imported', verification: 'verified' }
+    const partial = req({
+      id: 3, status: 'approved', mediaType: 'both', languages: ['eng', 'rum'], fulfilled: false,
+      variants: [english,
+        { id: 32, mediaType: 'ebook', language: 'rum', status: 'wanted', verification: '' },
+        { id: 33, mediaType: 'audiobook', language: 'eng', status: 'review', verification: '' },
+        { id: 34, mediaType: 'audiobook', language: 'rum', status: 'imported', verification: 'unverified' },
+      ],
+    })
+    const complete = req({
+      ...partial, fulfilled: true,
+      variants: [english,
+        { id: 32, mediaType: 'ebook', language: 'rum', status: 'imported', verification: 'verified' },
+        { id: 33, mediaType: 'audiobook', language: 'eng', status: 'imported', verification: 'verified' },
+        { id: 34, mediaType: 'audiobook', language: 'rum', status: 'imported', verification: 'unverified' },
+      ],
+    })
+    vi.mocked(api.listMyRequests)
+      .mockResolvedValueOnce({ items: [partial], total: 1, limit: 50, offset: 0 })
+      .mockResolvedValueOnce({ items: [complete], total: 1, limit: 50, offset: 0 })
+
+    const view = render(<MemoryRouter><MyRequestsPage /></MemoryRouter>)
+    expect(await screen.findByText('Approved, not here yet')).toBeInTheDocument()
+    expect(screen.queryByText('Available')).not.toBeInTheDocument()
+    expect(screen.getByText('Review')).toBeInTheDocument()
+    expect(screen.getByText('Unverified')).toBeInTheDocument()
+    view.unmount()
+
+    render(<MemoryRouter><MyRequestsPage /></MemoryRouter>)
+    expect(await screen.findByText('Available')).toBeInTheDocument()
+    expect(screen.queryByText('Approved, not here yet')).not.toBeInTheDocument()
+    expect(screen.queryByText('Review')).not.toBeInTheDocument()
+    expect(screen.getByText('Unverified')).toBeInTheDocument()
+  })
+
+  it('shows every requested pair for a pending request before a book exists', async () => {
+    vi.mocked(api.listMyRequests).mockResolvedValue({
+      items: [req({ id: 8, mediaType: 'both', languages: ['eng', 'rum'], variants: undefined })],
+      total: 1, limit: 50, offset: 0,
+    })
+    render(<MemoryRouter><MyRequestsPage /></MemoryRouter>)
+
+    const list = await screen.findByRole('list', { name: 'My requests' })
+    expect(within(list).getAllByText('English')).toHaveLength(2)
+    expect(within(list).getAllByText('Romanian')).toHaveLength(2)
+    expect(within(list).getAllByText('Wanted')).toHaveLength(4)
+    expect(within(list).getByText('Waiting for an admin')).toBeInTheDocument()
+  })
+
+  it('disables a pending duplicate-only selection even without a variants projection', async () => {
+    vi.mocked(api.listMyRequests).mockResolvedValue({
+      items: [req({ id: 8, mediaType: 'ebook', languages: ['eng'], status: 'pending', variants: undefined })],
+      total: 1, limit: 50, offset: 0,
+    })
+    render(<MemoryRouter><MyRequestsPage /></MemoryRouter>)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Add another language' }))
+    const submit = screen.getByRole('button', { name: 'Send language request' })
+    expect(submit).toBeDisabled()
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Romanian' }))
+    expect(submit).toBeEnabled()
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Romanian' }))
+    expect(submit).toBeDisabled()
+    expect(api.createRequest).not.toHaveBeenCalled()
+  })
 })
 
 describe('RequesterLibraryPage', () => {
   beforeEach(() => vi.clearAllMocks())
+
+  it('offers an owned library book a direct add-language request without a My Requests row', async () => {
+    vi.mocked(api.requesterLibrary).mockResolvedValue({
+      items: [{
+        id: 1, title: 'Dune', authorName: 'Frank Herbert', status: 'imported', formats: ['ebook'],
+        ...{ foreignBookId: 'OL1W' },
+        variants: [{ id: 31, mediaType: 'ebook', language: 'eng', status: 'imported', verification: 'verified' }],
+      }],
+      total: 1, limit: 60, offset: 0,
+    })
+    vi.mocked(api.createRequest).mockResolvedValue(req({ id: 12, status: 'pending', languages: ['eng', 'rum'] }))
+    render(<MemoryRouter><RequesterLibraryPage /></MemoryRouter>)
+
+    const book = (await screen.findByText('Dune')).closest('li') as HTMLElement
+    fireEvent.click(within(book).getByRole('button', { name: 'Add another language' }))
+    const submit = within(book).getByRole('button', { name: 'Send language request' })
+    expect(submit).toBeDisabled()
+    fireEvent.click(within(book).getByRole('checkbox', { name: 'English' }))
+    expect(submit).toBeDisabled()
+    fireEvent.click(within(book).getByRole('checkbox', { name: 'English' }))
+    fireEvent.click(within(book).getByRole('checkbox', { name: 'Romanian' }))
+    expect(submit).toBeEnabled()
+    fireEvent.click(submit)
+    await waitFor(() => expect(api.createRequest).toHaveBeenCalledWith('book', 'OL1W', 'ebook', ['eng', 'rum']))
+    expect(await within(book).findByRole('status')).toHaveTextContent('Language request sent')
+    expect(api.listMyRequests).not.toHaveBeenCalled()
+  })
 
   it('shows variant status labels without exposing any file paths', async () => {
     vi.mocked(api.requesterLibrary).mockResolvedValue({
@@ -214,6 +311,7 @@ describe('RequesterLibraryPage', () => {
           authorName: 'Frank Herbert',
           status: 'imported',
           formats: ['ebook'],
+          ...{ filePath: '/private/book-alpha-eng.epub', bookFiles: [{ path: '/private/book-alpha-eng.epub' }] },
           variants: [
             { id: 1, mediaType: 'ebook', language: 'eng', status: 'imported', verification: 'verified' },
             { id: 2, mediaType: 'ebook', language: 'rum', status: 'wanted', verification: '' },
@@ -235,7 +333,7 @@ describe('RequesterLibraryPage', () => {
     expect(screen.getByText('Review')).toBeInTheDocument()
     expect(screen.getByText('Unverified')).toBeInTheDocument()
     expect(screen.getByText('Language unknown')).toBeInTheDocument()
-    expect(screen.queryByText('/private/book-alpha-eng.epub')).not.toBeInTheDocument()
+    expect(screen.getByRole('list', { name: 'Library' })).not.toHaveTextContent('/private/book-alpha-eng.epub')
   })
 })
 
