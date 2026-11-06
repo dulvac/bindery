@@ -1336,17 +1336,28 @@ func TestDownloadRepoCRUD(t *testing.T) {
 		t.Errorf("GetByNzoID: unexpected %v", byNzo)
 	}
 
-	// SetError
-	if err := repo.SetError(ctx, dl.ID, "something went wrong"); err != nil {
-		t.Errorf("SetError: %v", err)
-	}
-
-	// SetErrorWithStatus — transitions from StateFailed must reject (no valid
-	// transitions from StateFailed) but setting to the same state should succeed.
-	if err := repo.SetErrorWithStatus(ctx, dl.ID, models.StateFailed, "still broken"); err != nil {
-		t.Errorf("SetErrorWithStatus same-state: %v", err)
+	// A stale client error cannot reopen a finished import.
+	if err := repo.SetError(ctx, dl.ID, "something went wrong"); err == nil {
+		t.Error("SetError accepted an imported download")
 	}
 	got, getErr := repo.GetByGUID(ctx, dl.GUID)
+	if getErr != nil || got == nil || got.Status != models.StateImported {
+		t.Fatalf("stale error rewrote imported download: %+v %v", got, getErr)
+	}
+
+	// An active attempt can fail. SetErrorWithStatus may then update that
+	// failed row's message without allowing a transition back to active work.
+	active := &models.Download{GUID: "test-guid-failed", Title: "Failed Book", Status: models.StateGrabbed, Protocol: "usenet"}
+	if err := repo.Create(ctx, active); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetError(ctx, active.ID, "something went wrong"); err != nil {
+		t.Errorf("SetError on active row: %v", err)
+	}
+	if err := repo.SetErrorWithStatus(ctx, active.ID, models.StateFailed, "still broken"); err != nil {
+		t.Errorf("SetErrorWithStatus same-state: %v", err)
+	}
+	got, getErr = repo.GetByGUID(ctx, active.GUID)
 	if getErr != nil || got == nil {
 		t.Fatalf("reload after SetErrorWithStatus: %v", getErr)
 	}
@@ -1355,6 +1366,9 @@ func TestDownloadRepoCRUD(t *testing.T) {
 	}
 
 	// Delete
+	if err := repo.Delete(ctx, active.ID); err != nil {
+		t.Fatalf("delete failed attempt: %v", err)
+	}
 	if err := repo.Delete(ctx, dl.ID); err != nil {
 		t.Fatalf("delete: %v", err)
 	}

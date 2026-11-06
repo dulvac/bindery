@@ -903,10 +903,12 @@ func (s *Scanner) downloadByID(ctx context.Context, id int64) (*models.Download,
 	return s.downloads.GetByID(ctx, id)
 }
 
-func (s *Scanner) setDownloadError(ctx context.Context, id int64, message string) {
+func (s *Scanner) setDownloadError(ctx context.Context, id int64, message string) bool {
 	if err := s.downloads.SetError(ctx, id, message); err != nil {
 		slog.Warn("failed to persist download error", "download_id", id, "error", err)
+		return false
 	}
+	return true
 }
 
 func (s *Scanner) updateDownloadStatus(ctx context.Context, id int64, status models.DownloadState) {
@@ -1101,7 +1103,9 @@ func (s *Scanner) applyEmbeddedLanguage(ctx context.Context, book *models.Book, 
 }
 
 func (s *Scanner) markDownloadFailed(ctx context.Context, dl *models.Download, message string) {
-	s.setDownloadError(ctx, dl.ID, message)
+	if !s.setDownloadError(ctx, dl.ID, message) {
+		return // stale poll or DB failure: no false history or webhook
+	}
 	s.createHistoryEvent(ctx, models.HistoryEventDownloadFailed, dl.Title, dl.BookID, map[string]string{"guid": dl.GUID, "message": message})
 	s.notify(ctx, notifierEventDownloadFailed, map[string]interface{}{
 		"title":   dl.Title,

@@ -849,16 +849,29 @@ func (r *DownloadRepo) SetImportPath(ctx context.Context, id int64, path string)
 	return err
 }
 
-// SetError marks the download failed with the message that killed it, and
-// stamps dead_at: this is the moment the attempt ended, and the scheduler's
-// re-grab cooldown measures from it (#2710). Nothing else on the row moves
-// here, which is why the cooldown cannot be read off added_at or grabbed_at.
+// SetError marks an active download failed and stamps dead_at for the re-grab
+// cooldown (#2710). The status predicate is the write-time guard: a poll with
+// an old snapshot must not turn a parked importBlocked torrent into failed,
+// erase its import reason, or undo a named review decision. Exhausted
+// importFailed rows are also no longer active. Only release the variant when
+// the guarded download update actually succeeds.
 func (r *DownloadRepo) SetError(ctx context.Context, id int64, errMsg string) error {
-	_, err := r.db.ExecContext(ctx,
-		"UPDATE downloads SET status=?, error_message=?, dead_at=? WHERE id=?",
+	result, err := r.db.ExecContext(ctx,
+		"UPDATE downloads SET status=?, error_message=?, dead_at=? WHERE id=? AND "+variantActiveSQL,
 		models.StateFailed, errMsg, time.Now().UTC(), id)
 	if err != nil {
 		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("set download error rows affected: %w", err)
+	}
+	if affected == 0 {
+		var current models.DownloadState
+		if err := r.db.QueryRowContext(ctx, "SELECT status FROM downloads WHERE id=?", id).Scan(&current); err != nil {
+			return fmt.Errorf("lookup download after rejected error: %w", err)
+		}
+		return models.ErrInvalidTransition{From: current, To: models.StateFailed}
 	}
 	return r.releaseFailedVariant(ctx, id)
 }
