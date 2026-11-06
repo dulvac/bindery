@@ -99,6 +99,16 @@ describe('booksApi request shapes', () => {
     expect(new URLSearchParams(seen[1].query).get('authorId')).toBe('9')
   })
 
+  it('scopes a manual book search to one requested format and language, and posts a reviewed retry reason', async () => {
+    const seen = record()
+    await booksApi.searchBook(42, { mediaType: 'ebook', language: 'rum' })
+    await booksApi.retryReviewedVariant(42, 17, 'Wrong-language import reviewed')
+    expect(seen.map(s => [s.method, s.path + s.query, s.body])).toEqual([
+      ['POST', '/book/42/search?mediaType=ebook&language=rum', undefined],
+      ['POST', '/book/42/variants/17/retry', { reason: 'Wrong-language import reviewed' }],
+    ])
+  })
+
   it('maps the single book actions onto the right verbs and bodies', async () => {
     const seen = record({
       'DELETE /book/4': () => new HttpResponse(null, { status: 204 }),

@@ -659,8 +659,15 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	requestedByFormat := make(map[string]string)
-	var selectedLanguage string
+	var selectedLanguage, selectedFormat string
 	selectedFound := false
+	if raw, present := r.URL.Query()["mediaType"]; present {
+		if len(raw) != 1 || (raw[0] != models.MediaTypeEbook && raw[0] != models.MediaTypeAudiobook) || len(r.URL.Query()["language"]) != 1 || (book.MediaType != models.MediaTypeBoth && book.MediaType != raw[0]) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "choose one requested format and language"})
+			return
+		}
+		selectedFormat = raw[0]
+	}
 	if raw, present := r.URL.Query()["language"]; present {
 		if len(raw) != 1 {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "choose one requested language"})
@@ -674,12 +681,15 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 		selectedLanguage = codes[0]
 	}
 	for _, format := range models.RequestedMediaTypes(book.MediaType) {
+		if selectedFormat != "" && format != selectedFormat {
+			continue
+		}
 		foundWanted := false
 		for _, v := range variants {
 			if v.MediaType != format {
 				continue
 			}
-			if selectedLanguage != "" && v.Language == selectedLanguage {
+			if selectedLanguage != "" && v.Language == selectedLanguage && (selectedFormat == "" || v.Status == models.VariantWanted) {
 				requestedByFormat[format] = v.Language
 				selectedFound = true
 				break
@@ -781,7 +791,7 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 	// Releases the relevance stage dropped, kept whole for the "filtered"
 	// section (#2334). Never mixed into results: only this handler reads them.
 	var relDropped []indexer.DroppedRelease
-	if book.MediaType == models.MediaTypeBoth {
+	if book.MediaType == models.MediaTypeBoth && selectedFormat == "" {
 		// Both legs copy crit, so each carries the profile and ranks by its
 		// own list: ebooks by the ebook list, audiobooks by the audiobook list.
 		ebookCrit := crit
@@ -859,7 +869,17 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 			dbg.Query.MediaType = book.MediaType
 		}
 	} else {
+		if selectedFormat != "" {
+			crit.MediaType = selectedFormat
+			crit.RequestedLanguage = selectedLanguage
+		}
 		results, dbg = h.searcher.SearchBookWithDebug(r.Context(), idxs, crit)
+		if selectedFormat != "" {
+			for i := range results {
+				results[i].MediaType = selectedFormat
+			}
+			stampDropped(dbg, selectedFormat)
+		}
 		if dbg != nil {
 			relDropped = dbg.Dropped
 		}
@@ -867,8 +887,8 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 	if dbg != nil {
 		// The debug log keeps this payload; it must not keep raw URLs.
 		dbg.Dropped = nil
-		if book.MediaType != models.MediaTypeBoth {
-			dbg.Query.RequestedLanguage = requestedByFormat[book.MediaType]
+		if book.MediaType != models.MediaTypeBoth || selectedFormat != "" {
+			dbg.Query.RequestedLanguage = requestedByFormat[crit.MediaType]
 		} else if requestedByFormat[models.MediaTypeEbook] == requestedByFormat[models.MediaTypeAudiobook] {
 			dbg.Query.RequestedLanguage = requestedByFormat[models.MediaTypeEbook]
 		}
@@ -882,7 +902,7 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 	// Unknown releases remain eligible, but a known mismatch cannot fill the
 	// selected variant. Dual-format searches retain each leg's quality order.
 	var variantDropped []indexer.DroppedRelease
-	if book.MediaType == models.MediaTypeBoth {
+	if book.MediaType == models.MediaTypeBoth && selectedFormat == "" {
 		var matched []newznab.SearchResult
 		for _, format := range models.RequestedMediaTypes(book.MediaType) {
 			var group []newznab.SearchResult
@@ -900,7 +920,7 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 		}
 		results = matched
 	} else {
-		results, variantDropped = indexer.SplitForRequestedLanguage(results, requestedByFormat[book.MediaType], crit)
+		results, variantDropped = indexer.SplitForRequestedLanguage(results, requestedByFormat[crit.MediaType], crit)
 	}
 	if dbg != nil {
 		for _, dropped := range variantDropped {

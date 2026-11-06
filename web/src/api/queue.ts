@@ -93,6 +93,8 @@ export interface GrabRequest {
   indexerId?: number
   protocol?: string
   mediaType?: string
+  variantId?: number
+  languageOverrideReason?: string
   // force grabs a release Bindery already imported once, after the user
   // confirmed it (#2289). See util/forceGrab.
   force?: boolean
@@ -102,6 +104,7 @@ export interface PendingRelease {
   id: number
   bookId: number
   title: string
+  mediaType?: 'ebook' | 'audiobook'
   indexerId?: number
   guid: string
   protocol: string
@@ -185,5 +188,6 @@ export const queueApi = {
   // Pending releases
   listPending: () => request<PendingRelease[]>('/pending'),
   dismissPending: (id: number) => request<void>(`/pending/${id}`, { method: 'DELETE' }),
-  grabPending: (id: number) => request<Download>(`/pending/${id}/grab`, { method: 'POST' }),
+  grabPending: (id: number, selection?: { variantId: number; languageOverrideReason?: string }) =>
+    request<Download>(`/pending/${id}/grab`, { method: 'POST', ...(selection ? { body: JSON.stringify(selection) } : {}) }),
 }

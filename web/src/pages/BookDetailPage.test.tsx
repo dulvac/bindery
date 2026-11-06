@@ -49,6 +49,7 @@ vi.mock('../api/client', async importOriginal => {
       getBook: vi.fn(),
       listHistory: vi.fn(),
       searchBook: vi.fn(),
+      retryReviewedVariant: vi.fn(),
       searchBookAutomatic: vi.fn(),
       listIndexers: vi.fn(),
       grab: vi.fn(),
@@ -722,6 +723,114 @@ describe('BookDetailPage — file section actions', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: 'English' }))
     fireEvent.click(screen.getByRole('checkbox', { name: 'Romanian' }))
     expect(screen.getByRole('button', { name: 'Submit language request' })).toBeDisabled()
+  })
+})
+
+describe('BookDetailPage — real variant manual actions', () => {
+  const variants = [
+    { id: 17, mediaType: 'ebook' as const, language: 'rum', status: 'wanted', verification: '' },
+    { id: 18, mediaType: 'audiobook' as const, language: 'eng', status: 'wanted', verification: '' },
+  ]
+
+  it('searches and grabs only the selected Romanian ebook, never an English audio result', async () => {
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({ title: 'Dune', mediaType: 'both', variants }))
+    vi.mocked(api.searchBook).mockResolvedValue({ results: [
+      makeResult({ guid: 'ebook-ro', title: 'Dune [ROM / EPUB]', mediaType: 'ebook' }),
+      makeResult({ guid: 'audio-en', title: 'Dune [ENG / M4B]', mediaType: 'audiobook' }),
+      makeResult({ guid: 'unknown', title: 'Dune.epub', mediaType: 'ebook' }),
+    ], debug: null })
+    renderBookDetailPage()
+    fireEvent.change(await screen.findByRole('combobox', { name: 'Wanted copy for manual search' }), { target: { value: '17' } })
+    fireEvent.click(screen.getByRole('button', { name: /Search .* indexers/ }))
+    await waitFor(() => expect(api.searchBook).toHaveBeenCalledWith(42, { mediaType: 'ebook', language: 'rum' }))
+    expect(await screen.findByText('Dune [ROM / EPUB]')).toBeInTheDocument()
+    expect(screen.queryByText('Dune [ENG / M4B]')).not.toBeInTheDocument()
+    expect(screen.getByText(/Unverified language/)).toBeInTheDocument()
+    const row = screen.getByText('Dune [ROM / EPUB]').closest('div.flex.items-center.justify-between') as HTMLElement
+    fireEvent.click(within(row).getByRole('button', { name: 'Grab' }))
+    await waitFor(() => expect(api.grab).toHaveBeenCalledWith(expect.objectContaining({ guid: 'ebook-ro', bookId: 42, mediaType: 'ebook', variantId: 17 })))
+  })
+
+  it('accepts a French FRA marker for the requested fre variant without an override', async () => {
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({ variants: [{ ...variants[0], id: 33, language: 'fre' }] }))
+    vi.mocked(api.searchBook).mockResolvedValue({ results: [makeResult({ guid: 'fr', title: 'Dune [FRA / EPUB]', mediaType: 'ebook' })], debug: null })
+    renderBookDetailPage()
+    fireEvent.click(await screen.findByRole('button', { name: /Search ebook indexers/ }))
+    const row = (await screen.findByText('Dune [FRA / EPUB]')).closest('div.flex.items-center.justify-between') as HTMLElement
+    fireEvent.click(within(row).getByRole('button', { name: 'Grab' }))
+    await waitFor(() => expect(api.grab).toHaveBeenCalledWith(expect.objectContaining({ guid: 'fr', variantId: 33 })))
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
+  it('does not show an explicitly audio release in an ebook-only search even without a mediaType field', async () => {
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({ variants: [{ ...variants[0] }] }))
+    vi.mocked(api.searchBook).mockResolvedValue({ results: [makeResult({ guid: 'audio', title: 'Dune [ROM / M4B]' })], debug: null })
+    renderBookDetailPage()
+    fireEvent.click(await screen.findByRole('button', { name: /Search ebook indexers/ }))
+    await waitFor(() => expect(api.searchBook).toHaveBeenCalledWith(42, { mediaType: 'ebook', language: 'rum' }))
+    expect(screen.queryByText('Dune [ROM / M4B]')).not.toBeInTheDocument()
+    expect(api.grab).not.toHaveBeenCalled()
+  })
+
+  it('does not offer a wanted copy for a format the book no longer requests', async () => {
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({ mediaType: 'ebook', variants: [{ ...variants[1] }] }))
+    renderBookDetailPage()
+    expect(await screen.findByTestId('book-variant-statuses')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Search ebook indexers/ })).toBeDisabled()
+    expect(api.searchBook).not.toHaveBeenCalled()
+  })
+
+  it('does not send an unbound grab when only synthetic or non-wanted statuses exist', async () => {
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({ variants: [{ ...variants[0], id: -17 }, { ...variants[1], status: 'review' }] }))
+    renderBookDetailPage()
+    expect(await screen.findByTestId('book-variant-statuses')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Search ebook indexers/ })).toBeDisabled()
+    expect(api.grab).not.toHaveBeenCalled()
+  })
+
+  it('requires an admin reason and confirmation for a known wrong-language filtered release', async () => {
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({ variants: [variants[0]] }))
+    vi.mocked(api.searchBook).mockResolvedValue({ results: [], filtered: [makeResult({ guid: 'en', title: 'Dune [ENG / EPUB]', mediaType: 'ebook', rejection: 'release language eng does not match requested variant rum' })], debug: null })
+    renderBookDetailPage()
+    fireEvent.click(await screen.findByRole('button', { name: /Search ebook indexers/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /Filtered/ }))
+    const row = screen.getByText('Dune [ENG / EPUB]').closest('div.flex.items-center.justify-between') as HTMLElement
+    fireEvent.click(within(row).getByRole('button', { name: 'Grab' }))
+    expect(api.grab).not.toHaveBeenCalled()
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(/wrong-language/)).toBeInTheDocument()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm' }))
+    expect(api.grab).not.toHaveBeenCalled()
+    fireEvent.click(await within(row).findByRole('button', { name: 'Grab' }))
+    fireEvent.change(within(await screen.findByRole('dialog')).getByRole('textbox', { name: 'Reason for language override' }), { target: { value: 'Owner inspected this bilingual release' } })
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Confirm' }))
+    await waitFor(() => expect(api.grab).toHaveBeenCalledWith(expect.objectContaining({ variantId: 17, languageOverrideReason: 'Owner inspected this bilingual release' })))
+  })
+
+  it('allows only an admin to mark a reviewed real variant wanted after reason and confirmation', async () => {
+    vi.mocked(api.getBook).mockResolvedValueOnce(makeBook({ variants: [{ ...variants[0], status: 'review' }] }))
+      .mockResolvedValue(makeBook({ variants: [{ ...variants[0], status: 'wanted' }] }))
+    vi.mocked(api.retryReviewedVariant).mockResolvedValue({ status: 'wanted' })
+    renderBookDetailPage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Search again' }))
+    expect(api.retryReviewedVariant).not.toHaveBeenCalled()
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Mark wanted' }))
+    expect(api.retryReviewedVariant).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Search again' }))
+    fireEvent.change(within(await screen.findByRole('dialog')).getByRole('textbox', { name: 'Reason for retry' }), { target: { value: 'Rejected wrong copy; search for a new one' } })
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Mark wanted' }))
+    await waitFor(() => expect(api.retryReviewedVariant).toHaveBeenCalledWith(42, 17, 'Rejected wrong copy; search for a new one'))
+    await waitFor(() => expect(api.getBook).toHaveBeenCalledTimes(2))
+    expect(api.grab).not.toHaveBeenCalled()
+  })
+
+  it('hides review retry from requesters', async () => {
+    asAnotherUser()
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({ variants: [{ ...variants[0], status: 'review' }] }))
+    renderBookDetailPage()
+    expect(await screen.findByTestId('book-variant-statuses')).toHaveTextContent('Review')
+    expect(screen.queryByRole('button', { name: 'Search again' })).not.toBeInTheDocument()
   })
 })
 

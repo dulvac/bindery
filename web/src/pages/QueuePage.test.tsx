@@ -5,7 +5,7 @@ import QueuePage, { MatchBookControl } from './QueuePage'
 import { summarizeError, ERROR_SUMMARY_LEN } from './queueError'
 import { api } from '../api/client'
 import { acceptConfirm, clickBulkAction } from '../test-utils'
-import type { Download, PendingRelease, QueueItem, QueueListResponse } from '../api/client'
+import type { Book, Download, PendingRelease, QueueItem, QueueListResponse } from '../api/client'
 
 vi.mock('../api/client', async importOriginal => {
   const actual = await importOriginal<typeof import('../api/client')>()
@@ -15,6 +15,7 @@ vi.mock('../api/client', async importOriginal => {
       ...actual.api,
       listQueue: vi.fn(),
       listPending: vi.fn(),
+      getBook: vi.fn(),
       deleteFromQueue: vi.fn(),
       bulkDeleteQueue: vi.fn(),
       retryImport: vi.fn(),
@@ -78,6 +79,19 @@ vi.mock('react-i18next', () => ({
         'importHints.manualImport': 'Import them',
         'importHints.scanLibrary': 'Scan Library',
         'queue.pendingGrab': 'Grab Now',
+        'bookLanguages.romanian': 'Romanian',
+        'bookLanguages.english': 'English',
+        'common.ebook': 'Ebook',
+        'common.audiobook': 'Audiobook',
+        'variants.choose': 'Wanted copy for manual search',
+        'variants.choosePending': 'Wanted copy for pending grab',
+        'variants.select': 'Select a wanted copy',
+        'variants.pendingTitle': 'Confirm grab',
+        'variants.confirmGrab': 'Confirm grab',
+        'variants.acknowledgeCost': 'I understand this grab may cost ratio',
+        'variants.pendingCost': 'This release may cost ratio. No wedges or bonus points are spent automatically.',
+        'variants.stale': 'This copy is no longer wanted. Refresh and search again.',
+        'variants.unverified': 'Unverified language',
         'queue.importRequeued': 'Queued for another import attempt — the scanner picks it up on its next check.',
         'common.dismiss': 'Dismiss',
         'queue.pendingGrabbing': 'Grabbing…',
@@ -164,6 +178,7 @@ beforeEach(() => {
   document.title = 'Bindery'
   vi.mocked(api.listQueue).mockResolvedValue({ items: [] })
   vi.mocked(api.listPending).mockResolvedValue([])
+  vi.mocked(api.getBook).mockResolvedValue({ id: 42, title: 'Dune', mediaType: 'ebook', variants: [] } as unknown as Book)
   vi.mocked(api.deleteFromQueue).mockResolvedValue(undefined)
   vi.mocked(api.bulkDeleteQueue).mockResolvedValue({ results: {} })
   vi.mocked(api.retryImport).mockResolvedValue({ ok: true })
@@ -175,6 +190,82 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers()
+})
+
+describe('QueuePage — pending variant safety', () => {
+  const real = { id: 27, mediaType: 'ebook' as const, language: 'rum', status: 'wanted', verification: '' }
+  const book = { id: 42, title: 'Dune', mediaType: 'both', variants: [real, { id: 28, mediaType: 'audiobook', language: 'eng', status: 'wanted', verification: '' }] } as Book
+  const pending = makePendingRelease({ mediaType: 'ebook', title: 'Dune [ROM / EPUB]', reason: 'Delayed for ratio' })
+
+  it('waits for explicit ratio confirmation and sends the selected real wanted variant', async () => {
+    vi.mocked(api.listPending).mockResolvedValue([pending])
+    vi.mocked(api.getBook).mockResolvedValue(book)
+    renderQueuePage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Grab Now' }))
+    const dialog = await screen.findByRole('dialog')
+    expect(dialog).toHaveTextContent('Dune')
+    expect(dialog).toHaveTextContent('Romanian')
+    expect(dialog).toHaveTextContent('ratio')
+    expect(api.grabPending).not.toHaveBeenCalled()
+    expect(within(dialog).getByRole('button', { name: 'Confirm grab' })).toBeDisabled()
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: /cost ratio/ }))
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm grab' }))
+    await waitFor(() => expect(api.grabPending).toHaveBeenCalledWith(10, { variantId: 27 }))
+  })
+
+  it('requires an explicit choice when two ebook languages are wanted for one pending release', async () => {
+    const twoEbooks = { ...book, variants: [real, { ...real, id: 29, language: 'eng' }] }
+    vi.mocked(api.listPending).mockResolvedValue([pending])
+    vi.mocked(api.getBook).mockResolvedValue(twoEbooks)
+    renderQueuePage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Grab Now' }))
+    const picker = await screen.findByRole('combobox', { name: 'Wanted copy for pending grab' })
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(api.grabPending).not.toHaveBeenCalled()
+    fireEvent.change(picker, { target: { value: '27' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Grab Now' }))
+    const dialog = await screen.findByRole('dialog')
+    expect(dialog).toHaveTextContent('Romanian')
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: /cost ratio/ }))
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm grab' }))
+    await waitFor(() => expect(api.grabPending).toHaveBeenCalledWith(10, { variantId: 27 }))
+  })
+
+  it('refuses synthetic pending status IDs and reports a stale wanted copy', async () => {
+    vi.mocked(api.listPending).mockResolvedValue([pending])
+    vi.mocked(api.getBook).mockResolvedValue({ ...book, variants: [{ ...real, id: -27 }] })
+    renderQueuePage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Grab Now' }))
+    expect(await screen.findByText(/no longer wanted/i)).toBeInTheDocument()
+    expect(api.grabPending).not.toHaveBeenCalled()
+  })
+
+  it('reports a stale status when the server rejects a grab after the last preflight check', async () => {
+    vi.mocked(api.listPending).mockResolvedValue([pending])
+    vi.mocked(api.getBook).mockResolvedValueOnce(book).mockResolvedValueOnce(book)
+      .mockResolvedValue({ ...book, variants: [{ ...real, status: 'review' }] })
+    vi.mocked(api.grabPending).mockRejectedValue(new Error('variant unavailable'))
+    renderQueuePage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Grab Now' }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: /cost ratio/ }))
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm grab' }))
+    expect(await screen.findByText(/no longer wanted/i)).toBeInTheDocument()
+    expect(api.getBook).toHaveBeenCalledTimes(3)
+    expect(api.grabPending).toHaveBeenCalledTimes(1)
+  })
+
+  it('refetches status after confirmation and refuses a variant that moved to review', async () => {
+    vi.mocked(api.listPending).mockResolvedValue([pending])
+    vi.mocked(api.getBook).mockResolvedValueOnce(book).mockResolvedValue({ ...book, variants: [{ ...real, status: 'review' }] })
+    renderQueuePage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Grab Now' }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: /cost ratio/ }))
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm grab' }))
+    expect(await screen.findByText(/no longer wanted/i)).toBeInTheDocument()
+    expect(api.grabPending).not.toHaveBeenCalled()
+  })
 })
 
 describe('summarizeError', () => {
@@ -412,8 +503,12 @@ describe('QueuePage', () => {
     expect(screen.getByText('torrent')).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: 'Grab Now' }))
-    expect(screen.getByRole('button', { name: 'Grabbing…' })).toBeDisabled()
-    expect(api.grabPending).toHaveBeenCalledWith(10)
+    expect(api.grabPending).not.toHaveBeenCalled()
+    const dialog = await screen.findByRole('dialog')
+    expect(dialog).toHaveTextContent('Dune')
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: /cost ratio/ }))
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm grab' }))
+    await waitFor(() => expect(api.grabPending).toHaveBeenCalledWith(10, undefined))
 
     await act(async () => {
       resolveGrab(makeDownload())

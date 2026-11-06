@@ -289,7 +289,14 @@ export const booksApi = {
   deleteBook: (id: number, deleteFiles = false) =>
     request<void>(`/book/${id}${deleteFiles ? '?deleteFiles=true' : ''}`, { method: 'DELETE' }),
   deleteBookFile: (id: number, queryParams = '') => request<Book>(`/book/${id}/file${queryParams}`, { method: 'DELETE' }),
-  searchBook: (id: number) => request<SearchBookResponse>(`/book/${id}/search`, { method: 'POST' }),
+  searchBook: (id: number, variant?: Pick<BookVariantStatus, 'mediaType' | 'language'>) => {
+    const q = variant ? `?${new URLSearchParams({ mediaType: variant.mediaType, language: variant.language })}` : ''
+    return request<SearchBookResponse>(`/book/${id}/search${q}`, { method: 'POST' })
+  },
+  retryReviewedVariant: (bookId: number, variantId: number, reason: string) =>
+    request<{ status: string }>(`/book/${bookId}/variants/${variantId}/retry`, {
+      method: 'POST', body: JSON.stringify({ reason }),
+    }),
   getLastSearchDebug: () => request<SearchDebug>(`/search/last-debug`),
   enrichAudiobook: (id: number) => request<Book>(`/book/${id}/enrich-audiobook`, { method: 'POST' }),
   toggleExcluded: (id: number) => request<Book>(`/book/${id}/exclude`, { method: 'PUT' }),

@@ -16,6 +16,7 @@ vi.mock('../api/client', async importOriginal => {
       ...actual.api,
       listWantedPage: vi.fn(),
       searchBook: vi.fn(),
+      getBook: vi.fn(),
       grab: vi.fn(),
       updateBook: vi.fn(),
       bulkActionWanted: vi.fn(),
@@ -72,6 +73,10 @@ vi.mock('react-i18next', () => ({
         'wanted.authorUnknown': 'Author unknown',
         'wanted.authorNotMonitored': 'Author not monitored, so this is not searched automatically',
         'search.autoGrabDisabled': 'No search was run. Automatic grabbing is off.',
+        'variants.choose': 'Wanted copy for manual search',
+        'variants.select': 'Select a wanted copy',
+        'variants.unverified': 'Unverified language',
+        'variants.stale': 'This copy is no longer wanted. Refresh and search again.',
       }
       return labels[key] ?? key
     },
@@ -188,6 +193,7 @@ beforeEach(() => {
   document.title = 'Bindery'
   vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([]))
   vi.mocked(api.searchBook).mockResolvedValue({ results: [], debug: null })
+  vi.mocked(api.getBook).mockImplementation(async id => makeBook({ id, title: 'Dune' }))
   vi.mocked(api.grab).mockResolvedValue(makeDownload())
   vi.mocked(api.updateBook).mockImplementation(async (id, patch) => makeBook({ id, title: 'Updated Book', ...patch }))
   vi.mocked(api.bulkActionWanted).mockResolvedValue({ results: {} })
@@ -195,6 +201,77 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers()
+})
+
+describe('WantedPage — bound manual grabs', () => {
+  it('resolves a real wanted variant from book detail rather than sending a synthetic list id', async () => {
+    const variants = [{ id: -901, mediaType: 'ebook' as const, language: 'rum', status: 'wanted', verification: '' }]
+    const book = makeBook({ id: 1, title: 'Dune', variants })
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([book]))
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({ id: 1, title: 'Dune', variants: [{ ...variants[0], id: 25 }] }))
+    vi.mocked(api.searchBook).mockResolvedValue({ results: [makeResult({ guid: 'ro', title: 'Dune [ROM / EPUB]', mediaType: 'ebook' })], debug: null })
+    renderWantedPage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Search' }))
+    await waitFor(() => expect(api.getBook).toHaveBeenCalledWith(1))
+    await waitFor(() => expect(api.searchBook).toHaveBeenCalledWith(1, { mediaType: 'ebook', language: 'rum' }))
+    const row = (await screen.findByText('Dune [ROM / EPUB]')).closest('div.flex.items-center.justify-between') as HTMLElement
+    fireEvent.click(within(row).getByRole('button', { name: 'Grab' }))
+    await waitFor(() => expect(api.grab).toHaveBeenCalledWith(expect.objectContaining({ guid: 'ro', bookId: 1, mediaType: 'ebook', variantId: 25 })))
+  })
+
+  it('offers format/language choices, and refuses a forged audio result for the chosen ebook', async () => {
+    const variants = [
+      { id: 25, mediaType: 'ebook' as const, language: 'rum', status: 'wanted', verification: '' },
+      { id: 26, mediaType: 'audiobook' as const, language: 'eng', status: 'wanted', verification: '' },
+    ]
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([makeBook({ id: 1, title: 'Dune', mediaType: 'both', variants })]))
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({ id: 1, title: 'Dune', mediaType: 'both', variants }))
+    vi.mocked(api.searchBook).mockResolvedValue({ results: [
+      makeResult({ guid: 'audio', title: 'Dune [ENG / M4B]', mediaType: 'audiobook' }),
+      makeResult({ guid: 'unknown', title: 'Dune.epub', mediaType: 'ebook' }),
+    ], debug: null })
+    renderWantedPage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Search' }))
+    fireEvent.change(await screen.findByRole('combobox', { name: 'Wanted copy for manual search' }), { target: { value: '25' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    expect(await screen.findByText('Dune.epub')).toBeInTheDocument()
+    expect(screen.getByText('Unverified language')).toBeInTheDocument()
+    expect(screen.queryByText('Dune [ENG / M4B]')).not.toBeInTheDocument()
+    expect(api.searchBook).toHaveBeenCalledWith(1, { mediaType: 'ebook', language: 'rum' })
+  })
+
+  it('does not present an indexer language attribute as verified for an unmarked release', async () => {
+    const variants = [{ id: 25, mediaType: 'ebook' as const, language: 'rum', status: 'wanted', verification: '' }]
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([makeBook({ id: 1, title: 'Dune', variants })]))
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({ id: 1, title: 'Dune', variants }))
+    vi.mocked(api.searchBook).mockResolvedValue({ results: [makeResult({ guid: 'unknown', title: 'Dune.epub', language: 'en', mediaType: 'ebook' })], debug: null })
+    renderWantedPage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Search' }))
+    const row = (await screen.findByText('Dune.epub')).closest('div.flex.items-center.justify-between') as HTMLElement
+    expect(within(row).getByText('Unverified language')).toBeInTheDocument()
+    expect(within(row).queryByText('en')).not.toBeInTheDocument()
+  })
+
+  it('refuses an unbound search when a synthetic list row has no real detail variant', async () => {
+    const variants = [{ id: -5, mediaType: 'ebook' as const, language: 'rum', status: 'wanted', verification: '' }]
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([makeBook({ id: 1, title: 'Dune', variants })]))
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({ id: 1, title: 'Dune', variants: [] }))
+    renderWantedPage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Search' }))
+    expect(await screen.findByText(/no longer wanted/i)).toBeInTheDocument()
+    expect(api.searchBook).not.toHaveBeenCalled()
+  })
+
+  it('blocks manual search when detail has only a negative synthetic ID', async () => {
+    const variants = [{ id: -5, mediaType: 'ebook' as const, language: 'rum', status: 'wanted', verification: '' }]
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([makeBook({ id: 1, title: 'Dune', variants })]))
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({ id: 1, title: 'Dune', variants }))
+    renderWantedPage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Search' }))
+    await waitFor(() => expect(api.getBook).toHaveBeenCalled())
+    expect(api.searchBook).not.toHaveBeenCalled()
+    expect(api.grab).not.toHaveBeenCalled()
+  })
 })
 
 describe('WantedPage', () => {

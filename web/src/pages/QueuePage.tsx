@@ -3,6 +3,9 @@ import { useTranslation } from 'react-i18next'
 import { useSearchParams } from 'react-router'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { api, Book, PendingRelease, QueueItem } from '../api/client'
+import { useIsAdmin } from '../auth/AuthContext'
+import ChooseBookVariant from '../components/ChooseBookVariant'
+import { releaseMarkerLanguages, variantLabel, wantedCopies } from '../util/bookVariant'
 import BookAuthorLink from '../components/BookAuthorLink'
 import ImportHints from '../components/ImportHints'
 import Pagination from '../components/Pagination'
@@ -23,6 +26,7 @@ import Checkbox from '../components/Checkbox'
 
 export default function QueuePage() {
   const { t } = useTranslation()
+  const isAdmin = useIsAdmin()
   const { confirm, confirmDialog } = useConfirmDialog()
   const [queue, setQueue] = useState<QueueItem[]>([])
   // The queue envelope's partial flag and the clients behind it (#2376). The
@@ -34,6 +38,10 @@ export default function QueuePage() {
   const [pending, setPending] = useState<PendingRelease[]>([])
   const [loading, setLoading] = useState(true)
   const [grabbingPending, setGrabbingPending] = useState<number | null>(null)
+  const [pendingBook, setPendingBook] = useState<Book | null>(null)
+  const [pendingBookForId, setPendingBookForId] = useState<number | null>(null)
+  const [pendingVariantId, setPendingVariantId] = useState<number | null>(null)
+  const [pendingError, setPendingError] = useState<Record<number, string>>({})
   const [retryingImportIds, setRetryingImportIds] = useState<Set<number>>(() => new Set())
   const [retryImportErrors, setRetryImportErrors] = useState<Record<number, string>>({})
   const [matchMessages, setMatchMessages] = useState<Record<number, string>>({})
@@ -176,13 +184,80 @@ export default function QueuePage() {
     load()
   }
 
-  const handleGrabPending = async (id: number) => {
-    setGrabbingPending(id)
+  const handleGrabPending = async (item: PendingRelease) => {
+    if (grabbingPending !== null) return
+    setGrabbingPending(item.id)
+    setPendingError(prev => { const next = { ...prev }; delete next[item.id]; return next })
+    let chosenVariantId: number | null = null
     try {
-      await api.grabPending(id)
+      const book = await api.getBook(item.bookId)
+      setPendingBook(book)
+      setPendingBookForId(item.id)
+      const forFormat = wantedCopies(book).filter(v => v.mediaType === item.mediaType)
+      const selected = forFormat.find(v => v.id === pendingVariantId) ?? (forFormat.length === 1 ? forFormat[0] : null)
+      chosenVariantId = selected?.id ?? null
+      if ((book.variants?.length ?? 0) > 0 && !selected) {
+        if (forFormat.length > 1) return // Choose a real copy before confirmation.
+        setPendingError(prev => ({ ...prev, [item.id]: t('variants.stale', 'This copy is no longer wanted. Refresh and search again.') }))
+        load()
+        return
+      }
+      const codes = releaseMarkerLanguages(item.title)
+      const mismatch = selected && codes.length > 0 && (codes.length !== 1 || codes[0] !== selected.language)
+      if (mismatch && !isAdmin) {
+        setPendingError(prev => ({ ...prev, [item.id]: t('variants.adminOnly', 'Only an admin can approve a wrong-language release.') }))
+        return
+      }
+      let reason = ''
+      const confirmed = await confirm({
+        title: t('variants.pendingTitle', 'Confirm grab'),
+        body: <div className="space-y-2">
+          <p className="[overflow-wrap:anywhere]">{book.title} · {selected ? variantLabel(selected, t) : (item.mediaType ? t(`common.${item.mediaType}`, item.mediaType) : t('common.ebook', 'Ebook'))}</p>
+          <p className="[overflow-wrap:anywhere]">{item.title}</p>
+          <p>{t('variants.pendingCost', 'This release may cost ratio. Confirm before sending it to the download client; no wedges or bonus points are spent automatically.')}</p>
+          {selected && codes.length === 0 && <p>{t('variants.unverified', 'Unverified language')}</p>}
+          {mismatch && <label>{t('variants.overrideWarning', 'This wrong-language release needs a named admin reason before grabbing it.')}
+            <input aria-label={t('variants.overrideReason', 'Reason for language override')} className="block w-full border rounded p-2" onChange={e => { reason = e.target.value }} />
+          </label>}
+        </div>,
+        acknowledgeLabel: t('variants.acknowledgeCost', 'I understand this grab may cost ratio'),
+        confirmLabel: t('variants.confirmGrab', 'Confirm grab'),
+      })
+      if (!confirmed) return
+      if (mismatch && !reason.trim()) {
+        setPendingError(prev => ({ ...prev, [item.id]: t('variants.reasonRequired', 'A reason is required.') }))
+        return
+      }
+      const fresh = await api.getBook(item.bookId)
+      if (selected && !wantedCopies(fresh).some(v => v.id === selected.id && v.mediaType === selected.mediaType && v.language === selected.language)) {
+        setPendingError(prev => ({ ...prev, [item.id]: t('variants.stale', 'This copy is no longer wanted. Refresh and search again.') }))
+        setPendingBook(fresh)
+        load()
+        return
+      }
+      if (!selected && (fresh.variants?.length ?? 0) > 0) {
+        setPendingError(prev => ({ ...prev, [item.id]: t('variants.stale', 'This copy is no longer wanted. Refresh and search again.') }))
+        setPendingBook(fresh)
+        load()
+        return
+      }
+      await api.grabPending(item.id, selected ? { variantId: selected.id, ...(reason.trim() ? { languageOverrideReason: reason.trim() } : {}) } : undefined)
+      setPendingBook(null)
+      setPendingBookForId(null)
       load()
     } catch (e) {
-      console.error(e)
+      let message = errorText(e, t('wanted.grabFailed', 'Grab failed'))
+      if (chosenVariantId) {
+        const fresh = await api.getBook(item.bookId).catch(() => null)
+        if (fresh) {
+          setPendingBook(fresh)
+          if (!wantedCopies(fresh).some(v => v.id === chosenVariantId)) {
+            message = t('variants.stale', 'This copy is no longer wanted. Refresh and search again.')
+          }
+        }
+      }
+      setPendingError(prev => ({ ...prev, [item.id]: message }))
+      load()
     } finally {
       setGrabbingPending(null)
     }
@@ -697,10 +772,15 @@ export default function QueuePage() {
                         )}
                         <span className="text-fg-muted">{item.protocol}</span>
                       </div>
+                      {pendingBookForId === item.id && pendingBook && wantedCopies(pendingBook).filter(v => v.mediaType === item.mediaType).length > 1 && (
+                        <ChooseBookVariant variants={wantedCopies(pendingBook).filter(v => v.mediaType === item.mediaType)}
+                          value={pendingVariantId} onChange={setPendingVariantId} pending />
+                      )}
+                      {pendingError[item.id] && <p role="alert" className="text-red-600 text-xs">{pendingError[item.id]}</p>}
                     </div>
                     <div className="ml-4 flex items-center gap-2 flex-shrink-0">
                       <button
-                        onClick={() => handleGrabPending(item.id)}
+                        onClick={() => handleGrabPending(item)}
                         disabled={grabbingPending !== null}
                         className={`px-3 py-1.5 text-xs ${primaryFill} disabled:opacity-50 rounded font-medium`}
                       >

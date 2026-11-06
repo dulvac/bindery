@@ -2,6 +2,10 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 import { Link } from 'react-router'
 import { useTranslation } from 'react-i18next'
 import { api, Book, SearchResult } from '../api/client'
+import type { BookVariantStatus } from '../api/client'
+import { useIsAdmin } from '../auth/AuthContext'
+import ChooseBookVariant from '../components/ChooseBookVariant'
+import { matchesVariantFormat, releaseMarkerLanguages, wantedCopies, wrongLanguage } from '../util/bookVariant'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { grabWithForceConfirm } from '../util/forceGrab'
 import BulkActionBar from '../components/BulkActionBar'
@@ -45,6 +49,7 @@ const MEDIA_FILTERS = ['', 'ebook', 'audiobook', 'both'] as const
 
 export default function WantedPage() {
   const { t } = useTranslation()
+  const isAdmin = useIsAdmin()
   const { confirm, confirmDialog } = useConfirmDialog()
 
   // The current page of wanted books, and how many match the search in all.
@@ -53,6 +58,9 @@ export default function WantedPage() {
   const [loading, setLoading] = useState(true)
   const [searchingId, setSearchingId] = useState<number | null>(null)
   const [results, setResults] = useState<SearchResult[]>([])
+  const [detailBook, setDetailBook] = useState<Book | null>(null)
+  const [selectedVariantId, setSelectedVariantId] = useState<number | null>(null)
+  const [searchedVariant, setSearchedVariant] = useState<BookVariantStatus | null>(null)
   // Releases the relevance and language filters dropped (#2334, #3364).
   const [filtered, setFiltered] = useState<SearchResult[]>([])
   const [filteredTotal, setFilteredTotal] = useState<number | undefined>(undefined)
@@ -154,13 +162,33 @@ export default function WantedPage() {
   const searchBook = async (book: Book) => {
     setSearchingId(book.id)
     try {
-      const res = await api.searchBook(book.id)
-      setResults(res.results)
-      setFiltered(res.filtered ?? [])
+      // List rows may contain negative pending-request display IDs. Resolve
+      // the real variant from the owner-scoped single-book response instead.
+      const fresh = await api.getBook(book.id)
+      setDetailBook(fresh)
+      const available = wantedCopies(fresh)
+      if (((book.variants?.length ?? 0) > 0 || (fresh.variants?.length ?? 0) > 0) && available.length === 0) {
+        setShowResults(null)
+        showToast(t('variants.stale', 'This copy is no longer wanted. Refresh and search again.'))
+        fetchPage().catch(() => {})
+        return
+      }
+      const choice = available.find(v => v.id === selectedVariantId)
+        ?? (available.length === 1 ? available[0] : null)
+      if (fresh.variants?.length && !choice) {
+        setResults([])
+        setFiltered([])
+        setShowResults(null)
+        return // Choose a format and language, then press Search again.
+      }
+      const res = await (choice ? api.searchBook(book.id, { mediaType: choice.mediaType, language: choice.language }) : api.searchBook(book.id))
+      setSearchedVariant(choice)
+      setResults(choice ? res.results.filter(r => matchesVariantFormat(r, choice, fresh.mediaType === 'both') && !wrongLanguage(r, choice)) : res.results)
+      setFiltered(choice ? (res.filtered ?? []).filter(r => matchesVariantFormat(r, choice, fresh.mediaType === 'both')) : res.filtered ?? [])
       setFilteredTotal(res.filteredTotal)
       setShowResults(book.id)
     } catch (err) {
-      console.error(err)
+      showToast(errorText(err, t('bookDetail.searchFailed', 'Search failed')))
     } finally {
       setSearchingId(null)
     }
@@ -193,8 +221,34 @@ export default function WantedPage() {
   }
 
   const grab = async (result: SearchResult, book: Book) => {
+    const variant = searchedVariant
+    if (variant && (!detailBook || detailBook.id !== book.id || !matchesVariantFormat(result, variant, detailBook.mediaType === 'both'))) return
+    if (variant && wrongLanguage(result, variant) && !isAdmin) return
+    if ((book.variants?.length || detailBook?.variants?.length) && !variant) return
     setGrabbingGuid(result.guid)
     try {
+      let overrideReason: string | undefined
+      if (variant && wrongLanguage(result, variant)) {
+        let reason = ''
+        if (!await confirm({
+          title: t('variants.overrideTitle', 'Wrong-language release'),
+          body: <label className="space-y-2 block">{t('variants.overrideWarning', 'This wrong-language release needs a named admin reason before grabbing it.')}
+            <input aria-label={t('variants.overrideReason', 'Reason for language override')} className="block w-full border rounded p-2" onChange={e => { reason = e.target.value }} />
+          </label>,
+        })) return
+        overrideReason = reason.trim()
+        if (!overrideReason) { showToast(t('variants.reasonRequired', 'A reason is required.')); return }
+      }
+      if (variant) {
+        const fresh = await api.getBook(book.id)
+        setDetailBook(fresh)
+        if (!wantedCopies(fresh).some(v => v.id === variant.id && v.mediaType === variant.mediaType && v.language === variant.language)) {
+          setShowResults(null)
+          showToast(t('variants.stale', 'This copy is no longer wanted. Refresh and search again.'))
+          fetchPage().catch(() => {})
+          return
+        }
+      }
       const dl = await grabWithForceConfirm({
         guid: result.guid,
         title: result.title,
@@ -204,7 +258,9 @@ export default function WantedPage() {
         indexerId: result.indexerId,
         protocol: result.protocol,
         // The result's own media type wins over the book's 'both' (#2933).
-        mediaType: result.mediaType || book.mediaType,
+        mediaType: variant?.mediaType ?? result.mediaType ?? book.mediaType,
+        ...(variant ? { variantId: variant.id } : {}),
+        ...(overrideReason ? { languageOverrideReason: overrideReason } : {}),
       }, confirm, t)
       if (!dl) return
       setGrabbedGuid(result.guid)
@@ -406,6 +462,7 @@ export default function WantedPage() {
 
           {pageItems.map((book, i) => {
             const isSelected = selectedIds.has(book.id)
+            const rowVariants = detailBook?.id === book.id ? wantedCopies(detailBook) : []
             const year = book.releaseDate ? new Date(book.releaseDate).getFullYear() : null
             const authorName = book.author?.authorName
             return (
@@ -514,6 +571,11 @@ export default function WantedPage() {
                   </div>
                 </div>
 
+                {detailBook?.id === book.id && (detailBook.variants?.length ?? 0) > 0 && rowVariants.length > 0 && (
+                  <div className="px-3 py-2"><ChooseBookVariant variants={rowVariants}
+                    value={rowVariants.find(v => v.id === selectedVariantId)?.id ?? (rowVariants.length === 1 ? rowVariants[0].id : null)}
+                    onChange={next => { setSelectedVariantId(next); setShowResults(null); setSearchedVariant(null) }} /></div>
+                )}
                 {showResults === book.id && results.length === 0 && (
                   <div className="px-3 pb-2 text-xs text-fg-muted">
                     {filtered.length > 0
@@ -543,15 +605,16 @@ export default function WantedPage() {
                                 </a>
                               </>
                             )}
-                            {r.language && (
+                            {r.language && !searchedVariant && (
                               <span className="ml-1.5 inline-block px-1 py-0 rounded bg-slate-300 dark:bg-zinc-700 text-[9px] font-medium uppercase tracking-wide">{r.language}</span>
                             )}
+                            {searchedVariant && releaseMarkerLanguages(r.title).length === 0 && <span className="ml-2 text-amber-600">{t('variants.unverified', 'Unverified language')}</span>}
                           </span>
                         </div>
                         <button
                           type="button"
                           onClick={() => grab(r, book)}
-                          disabled={grabbingGuid === r.guid || grabbedGuid === r.guid}
+                          disabled={grabbingGuid === r.guid || grabbedGuid === r.guid || (searchedVariant ? wrongLanguage(r, searchedVariant) && !isAdmin : false)}
                           className={`px-2 py-2 rounded text-[10px] font-medium flex-shrink-0 touch-manipulation transition-colors disabled:cursor-default ${
                             grabbedGuid === r.guid
                               ? 'bg-emerald-700 text-white'
@@ -575,6 +638,8 @@ export default function WantedPage() {
                       bookMediaType={book.mediaType}
                       grabbing={grabbingGuid}
                       onGrab={r => grab(r, book)}
+                      variant={searchedVariant ?? undefined}
+                      canGrab={r => !searchedVariant || (matchesVariantFormat(r, searchedVariant, book.mediaType === 'both') && (!wrongLanguage(r, searchedVariant) || isAdmin))}
                     />
                   </div>
                 )}
