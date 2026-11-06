@@ -51,12 +51,13 @@ func (h *BookHandler) WithRejectionTorrentSource(clients *db.DownloadClientRepo,
 	return h
 }
 
-// RegisterVariantRejectionRoute mounts the route under /api/v1. Keep the
-// middleware at registration, even though the handler also checks the role.
+// RegisterVariantRejectionRoute mounts administrative variant decisions under
+// /api/v1. Keep the middleware at registration; handlers also check the role.
 func RegisterVariantRejectionRoute(r chi.Router, h *BookHandler) {
 	r.Group(func(r chi.Router) {
 		r.Use(auth.RequireAdmin)
 		r.Post("/book/{id}/variants/{variantId}/reject-source", h.RejectVariantSource)
+		r.Post("/book/{id}/variants/{variantId}/retry", h.RetryReviewedVariant)
 	})
 }
 

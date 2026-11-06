@@ -65,7 +65,7 @@ const RequestClaimTTL = 5 * time.Minute
 const requestColumns = `r.id, r.owner_user_id, COALESCE(u.username, ''), r.kind, r.foreign_id, r.media_type,
 	r.title, r.author_name, r.payload_json, r.languages_json, r.status, r.decline_reason, r.decided_by,
 	r.result_book_id, r.result_author_id, r.created_at, r.updated_at, r.decided_at,
-	COALESCE(b.status, ''), COALESCE(b.media_type, ''), r.created_via, r.created_by_user_id, COALESCE(cu.username, '')`
+	COALESCE(b.status, ''), COALESCE(b.media_type, ''), COALESCE(b.owner_user_id, 0), r.created_via, r.created_by_user_id, COALESCE(cu.username, '')`
 
 const requestJoins = `FROM requests r
 	LEFT JOIN users u ON u.id = r.owner_user_id
@@ -82,7 +82,7 @@ func scanRequest(s scanner) (*models.LibraryRequest, error) {
 	if err := s.Scan(&req.ID, &req.OwnerUserID, &req.OwnerUsername, &req.Kind, &req.ForeignID, &req.MediaType,
 		&req.Title, &req.AuthorName, &req.PayloadJSON, &req.LanguagesJSON, &req.Status, &req.DeclineReason, &decidedBy,
 		&resultBook, &resultAuthor, &req.CreatedAt, &req.UpdatedAt, &decidedAt, &req.BookStatus,
-		&req.BookMediaType, &req.CreatedVia, &createdBy, &req.CreatedByUsername); err != nil {
+		&req.BookMediaType, &req.BookOwnerUserID, &req.CreatedVia, &createdBy, &req.CreatedByUsername); err != nil {
 		return nil, err
 	}
 	if req.Kind == models.RequestKindBook {
@@ -303,7 +303,8 @@ func (r *RequestRepo) fillBookProgress(ctx context.Context, page []models.Librar
 	seen := make(map[int64]bool)
 	ids := make([]int64, 0)
 	for _, req := range page {
-		if req.Kind == models.RequestKindBook && req.Status == models.RequestStatusApproved && req.ResultBookID != nil && !seen[*req.ResultBookID] {
+		if req.Kind == models.RequestKindBook && req.Status == models.RequestStatusApproved && req.ResultBookID != nil &&
+			(req.BookOwnerUserID == 0 || req.BookOwnerUserID == req.OwnerUserID) && !seen[*req.ResultBookID] {
 			id := *req.ResultBookID
 			seen[id] = true
 			ids = append(ids, id)
@@ -342,7 +343,8 @@ func (r *RequestRepo) fillBookProgress(ctx context.Context, page []models.Librar
 	}
 	for i := range page {
 		req := &page[i]
-		if req.Kind != models.RequestKindBook || req.Status != models.RequestStatusApproved || req.ResultBookID == nil {
+		if req.Kind != models.RequestKindBook || req.Status != models.RequestStatusApproved || req.ResultBookID == nil ||
+			req.BookOwnerUserID != 0 && req.BookOwnerUserID != req.OwnerUserID {
 			continue
 		}
 		mediaType := req.MediaType

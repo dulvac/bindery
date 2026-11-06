@@ -415,7 +415,17 @@ func (h *BookHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.prepareBookDetail(r.Context(), book)
-	writeBook(w, http.StatusOK, book)
+	status, err := h.books.VariantRepo().ListStatusByBooks(r.Context(), []int64{book.ID})
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	projection := status[book.ID]
+	writeJSON(w, http.StatusOK, struct {
+		*models.Book
+		Variants    []variantResponse    `json:"variants"`
+		LegacyFiles []legacyFileResponse `json:"legacyFiles,omitempty"`
+	}{proxiedBook(book), variantResponses(projection.Variants), legacyFileResponses(projection.LegacyFiles)})
 }
 
 // prepareBookDetail shapes a book as the book page expects it: description

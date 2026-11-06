@@ -619,6 +619,8 @@ var requesterLibraryBookFields = map[string]string{
 	"CoverURL":       "coverUrl",
 	"Status":         "status",
 	"Formats":        "formats",
+	"Variants":       "variants",
+	"LegacyFiles":    "legacyFiles",
 }
 
 func TestRequesterLibraryBook_FieldAllowList(t *testing.T) {

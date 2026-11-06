@@ -304,7 +304,9 @@ type requestResponse struct {
 	DecidedAt     *time.Time `json:"decidedAt,omitempty"`
 	// Fulfilled is true once what was asked for is in the library as a file:
 	// the book imported, or at least one of the author's books imported.
-	Fulfilled bool `json:"fulfilled"`
+	Fulfilled   bool                 `json:"fulfilled"`
+	Variants    []variantResponse    `json:"variants,omitempty"`
+	LegacyFiles []legacyFileResponse `json:"legacyFiles,omitempty"`
 	// For an approved author request: that author's books, and how many are
 	// imported.
 	BooksTotal    int `json:"booksTotal,omitempty"`
@@ -1002,6 +1004,45 @@ func (h *RequestHandler) maxPendingPerUser(ctx context.Context) int {
 	return n
 }
 
+// projectRequests joins statuses only for the already authorized, paginated
+// request rows. A request sees its own selected copies, not every language a
+// different request for the same book happened to add.
+func (h *RequestHandler) projectRequests(ctx context.Context, items []models.LibraryRequest, admin bool) ([]requestResponse, error) {
+	ids := make([]int64, 0, len(items))
+	seen := make(map[int64]bool)
+	for _, req := range items {
+		if req.Kind == models.RequestKindBook && req.Status == models.RequestStatusApproved && req.ResultBookID != nil &&
+			(req.BookOwnerUserID == 0 || req.BookOwnerUserID == req.OwnerUserID) && !seen[*req.ResultBookID] {
+			seen[*req.ResultBookID] = true
+			ids = append(ids, *req.ResultBookID)
+		}
+	}
+	statuses, err := h.variants.ListStatusByBooks(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]requestResponse, 0, len(items))
+	for _, req := range items {
+		response := toRequestResponse(req, admin)
+		if req.Kind == models.RequestKindBook && req.Status == models.RequestStatusApproved && req.ResultBookID != nil &&
+			(req.BookOwnerUserID == 0 || req.BookOwnerUserID == req.OwnerUserID) {
+			projection := statuses[*req.ResultBookID]
+			response.Variants = requestedVariants(req, projection.Variants)
+			for _, file := range projection.LegacyFiles {
+				for _, format := range requestFormats(req) {
+					if file.MediaType == format {
+						response.LegacyFiles = append(response.LegacyFiles, legacyFileResponse{
+							MediaType: format, Status: models.VariantImported, Verification: "unverified",
+						})
+					}
+				}
+			}
+		}
+		out = append(out, response)
+	}
+	return out, nil
+}
+
 // ListMine lists the caller's own requests. GET /requests
 func (h *RequestHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 	owner := auth.UserIDFromContext(r.Context())
@@ -1011,9 +1052,10 @@ func (h *RequestHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, r, err)
 		return
 	}
-	out := make([]requestResponse, 0, len(items))
-	for _, it := range items {
-		out = append(out, toRequestResponse(it, false))
+	out, err := h.projectRequests(r.Context(), items, false)
+	if err != nil {
+		writeServerError(w, r, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, requestListResponse{Items: out, Total: total, Limit: limit, Offset: offset})
 }
@@ -1057,9 +1099,10 @@ func (h *RequestHandler) Queue(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, r, err)
 		return
 	}
-	out := make([]requestResponse, 0, len(items))
-	for _, it := range items {
-		out = append(out, toRequestResponse(it, true))
+	out, err := h.projectRequests(r.Context(), items, true)
+	if err != nil {
+		writeServerError(w, r, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, requestListResponse{Items: out, Total: total, Limit: limit, Offset: offset})
 }

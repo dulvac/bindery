@@ -69,6 +69,7 @@ type LibraryRequest struct {
 	// AuthorBooks and AuthorBooksImported count that author's books.
 	BookStatus          string
 	BookMediaType       string
+	BookOwnerUserID     int64
 	BookFulfilled       bool
 	AuthorBooks         int
 	AuthorBooksImported int

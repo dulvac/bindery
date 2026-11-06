@@ -17,14 +17,16 @@ import (
 // There are no file paths, no owner, no provider ids, no monitored flag and
 // no download or file links.
 type requesterLibraryBook struct {
-	ID             int64    `json:"id"`
-	Title          string   `json:"title"`
-	AuthorName     string   `json:"authorName"`
-	Series         string   `json:"series,omitempty"`
-	SeriesPosition string   `json:"seriesPosition,omitempty"`
-	CoverURL       string   `json:"coverUrl,omitempty"`
-	Status         string   `json:"status"`
-	Formats        []string `json:"formats"`
+	ID             int64                `json:"id"`
+	Title          string               `json:"title"`
+	AuthorName     string               `json:"authorName"`
+	Series         string               `json:"series,omitempty"`
+	SeriesPosition string               `json:"seriesPosition,omitempty"`
+	CoverURL       string               `json:"coverUrl,omitempty"`
+	Status         string               `json:"status"`
+	Formats        []string             `json:"formats"`
+	Variants       []variantResponse    `json:"variants"`
+	LegacyFiles    []legacyFileResponse `json:"legacyFiles,omitempty"`
 }
 
 type requesterLibraryResponse struct {
@@ -52,6 +54,15 @@ func (h *RequestHandler) Library(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, r, err)
 		return
 	}
+	ids := make([]int64, 0, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.ID)
+	}
+	statuses, err := h.variants.ListStatusByBooks(ctx, ids)
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
 	items := make([]requesterLibraryBook, 0, len(rows))
 	for _, row := range rows {
 		formats := make([]string, 0, 2)
@@ -70,6 +81,8 @@ func (h *RequestHandler) Library(w http.ResponseWriter, r *http.Request) {
 			CoverURL:       ProxyImageURL(row.ImageURL),
 			Status:         row.Status,
 			Formats:        formats,
+			Variants:       variantResponses(statuses[row.ID].Variants),
+			LegacyFiles:    legacyFileResponses(statuses[row.ID].LegacyFiles),
 		})
 	}
 	writeJSON(w, http.StatusOK, requesterLibraryResponse{Items: items, Total: total, Limit: limit, Offset: offset})

@@ -3,7 +3,10 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/vavallee/bindery/internal/models"
 )
@@ -113,6 +116,53 @@ func reconcileVariantAfterDetach(ctx context.Context, tx *sql.Tx, variantID sql.
 		return fmt.Errorf("reconcile detached book variant %d: %w", variantID.Int64, err)
 	}
 	return nil
+}
+
+// RetryReviewed moves only a reviewed, fileless, idle copy back to wanted.
+// The status change and named audit are one transaction; failed or duplicate
+// retries leave both untouched. It never writes to downloads or files and
+// never contacts a download client or starts a search.
+func (r *BookVariantRepo) RetryReviewed(ctx context.Context, bookID, variantID, actorID int64, reason string) (bool, error) {
+	reason = strings.TrimSpace(reason)
+	if bookID <= 0 || variantID <= 0 || actorID <= 0 || reason == "" || len(reason) > 500 {
+		return false, fmt.Errorf("review retry requires book, variant, actor and reason (max 500 bytes)")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin reviewed variant retry: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, `UPDATE book_variants SET status = 'wanted'
+		WHERE id = ? AND book_id = ? AND status = 'review'
+		AND NOT EXISTS (SELECT 1 FROM book_files f WHERE f.variant_id = book_variants.id)
+		AND NOT EXISTS (SELECT 1 FROM downloads d WHERE d.variant_id = book_variants.id AND `+variantActiveSQL+`)`,
+		variantID, bookID)
+	if err != nil {
+		return false, fmt.Errorf("retry reviewed variant: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("count reviewed variant retries: %w", err)
+	}
+	if n != 1 {
+		return false, nil
+	}
+	data, err := json.Marshal(struct {
+		ActorUserID int64  `json:"actorUserId"`
+		VariantID   int64  `json:"variantId"`
+		Reason      string `json:"reason"`
+	}{actorID, variantID, reason})
+	if err != nil {
+		return false, fmt.Errorf("encode reviewed variant retry audit: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO history (book_id, event_type, source_title, data, created_at)
+		VALUES (?, 'variantReviewRetried', '', ?, ?)`, bookID, string(data), time.Now().UTC()); err != nil {
+		return false, fmt.Errorf("audit reviewed variant retry: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit reviewed variant retry: %w", err)
+	}
+	return true, nil
 }
 
 // MarkDownloading records a successfully sent grab without overwriting an
