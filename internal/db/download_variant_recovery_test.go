@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -180,8 +181,96 @@ func TestVariantExhaustedRecoveryAllowsSeparateReviewedNewRelease(t *testing.T) 
 		t.Fatalf("exhausted old import blocked a new claim: %v", err)
 	}
 	row, err := repo.GetByID(ctx, old.ID)
-	if err != nil || row == nil || row.Status != models.StateImportFailed || row.ImportRetryCount != ImportRetryLimit || row.TorrentID == nil || *row.TorrentID != "retained-old-hash" {
-		t.Fatalf("new release decision modified old torrent: %+v %v", row, err)
+	if err != nil || row == nil || row.Status != models.StateImportBlocked || row.ImportRetryCount != ImportRetryLimit ||
+		row.TorrentID == nil || *row.TorrentID != "retained-old-hash" || row.ErrorMessage == "" {
+		t.Fatalf("new release decision lost the parked old torrent: %+v %v", row, err)
+	}
+}
+
+// After a new-release decision, an exhausted old import must stop being
+// polled. A stale poll already in progress must not reclaim the wanted copy.
+func TestVariantNewReleaseDecisionMakesExhaustedTorrentInert(t *testing.T) {
+	variants, repo, book, variant, old := downloadingImportFixture(t)
+	ctx := context.Background()
+	const hash = "retained-old-hash"
+	client := &models.DownloadClient{Name: "retained", Type: "qbittorrent", Host: "127.0.0.1", Port: 1}
+	if err := NewDownloadClientRepo(repo.db).Create(ctx, client); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetTorrentID(ctx, old.ID, hash); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.db.ExecContext(ctx, `UPDATE downloads SET import_retry_count=?, download_client_id=? WHERE id=?`, ImportRetryLimit, client.ID, old.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.RecoverInterruptedImports(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before, err := repo.GetByID(ctx, old.ID)
+	if err != nil || before == nil || before.Status != models.StateImportFailed || before.ErrorMessage == "" {
+		t.Fatalf("expected exhausted recovered import: %+v %v", before, err)
+	}
+	approved, err := variants.RetryReviewed(ctx, book.ID, variant.ID, 42, "seek another release")
+	if err != nil || !approved {
+		t.Fatalf("approve new release: %t %v", approved, err)
+	}
+	row, err := repo.GetByID(ctx, old.ID)
+	if err != nil || row == nil || row.Status != models.StateImportBlocked || row.ImportRetryCount != ImportRetryLimit ||
+		row.TorrentID == nil || *row.TorrentID != hash || row.ErrorMessage != before.ErrorMessage || row.DeadAt == nil {
+		t.Fatalf("new release did not park exhausted old torrent with its reason and identity: %+v %v", row, err)
+	}
+	if got := terminalVariantStatus(t, variants, book.ID); got != models.VariantWanted {
+		t.Fatalf("new release decision lost before polling: %q", got)
+	}
+	var invalid models.ErrInvalidTransition
+	if err := repo.SetErrorWithStatus(ctx, old.ID, models.StateImportBlocked, "stale poll tried to block again"); !errors.As(err, &invalid) {
+		t.Fatalf("stale poll rewrote already blocked torrent: %v", err)
+	}
+	if got := terminalVariantStatus(t, variants, book.ID); got != models.VariantWanted {
+		t.Fatalf("stale poll undid new release decision: %q", got)
+	}
+	if row, err = repo.GetByID(ctx, old.ID); err != nil || row == nil || row.ErrorMessage != before.ErrorMessage {
+		t.Fatalf("stale poll rewrote the original failure: %+v %v", row, err)
+	}
+	if accepted, found, err := repo.ResetImportRetry(ctx, old.ID); err != nil || accepted || !found {
+		t.Fatalf("generic retry bypassed the named action: %t %t %v", accepted, found, err)
+	}
+	// If this copy is later reviewed again, the old torrent remains eligible
+	// for the named existing-torrent action (provided no source was rejected).
+	if err := variants.SetStatus(ctx, variant.ID, models.VariantReview); err != nil {
+		t.Fatal(err)
+	}
+	if approved, err := repo.RetryReviewedImport(ctx, book.ID, variant.ID, old.ID, 42, "retry the retained torrent"); err != nil || !approved {
+		t.Fatalf("named existing-torrent retry after re-review: %t %v", approved, err)
+	}
+	if row, err = repo.GetByID(ctx, old.ID); err != nil || row == nil || row.Status != models.StateImportFailed ||
+		row.ImportRetryCount != 0 || row.TorrentID == nil || *row.TorrentID != hash {
+		t.Fatalf("named retry lost the old torrent: %+v %v", row, err)
+	}
+}
+
+func TestVariantNewReleaseDecisionAuditFailureLeavesExhaustedTorrentUnchanged(t *testing.T) {
+	variants, repo, book, variant, old := downloadingImportFixture(t)
+	ctx := context.Background()
+	if _, err := repo.db.ExecContext(ctx, `UPDATE downloads SET import_retry_count=? WHERE id=?`, ImportRetryLimit, old.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.RecoverInterruptedImports(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.db.ExecContext(ctx, `CREATE TRIGGER reject_review_retry_audit BEFORE INSERT ON history
+		WHEN NEW.event_type='variantReviewRetried' BEGIN SELECT RAISE(ABORT, 'no audit'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := variants.RetryReviewed(ctx, book.ID, variant.ID, 42, "seek a new release"); err == nil || ok {
+		t.Fatalf("audit failed but new-release decision committed: %t %v", ok, err)
+	}
+	if got := terminalVariantStatus(t, variants, book.ID); got != models.VariantReview {
+		t.Fatalf("failed audit changed reviewed copy: %q", got)
+	}
+	row, err := repo.GetByID(ctx, old.ID)
+	if err != nil || row == nil || row.Status != models.StateImportFailed || row.ImportRetryCount != ImportRetryLimit {
+		t.Fatalf("failed audit changed exhausted download: %+v %v", row, err)
 	}
 }
 

@@ -120,8 +120,10 @@ func reconcileVariantAfterDetach(ctx context.Context, tx *sql.Tx, variantID sql.
 
 // RetryReviewed moves only a reviewed, fileless, idle copy back to wanted.
 // The status change and named audit are one transaction; failed or duplicate
-// retries leave both untouched. It never writes to downloads or files and
-// never contacts a download client or starts a search.
+// retries leave both untouched. Exhausted importFailed rows for this copy
+// become importBlocked in that transaction so a later client poll cannot undo
+// the new-release decision. Torrent identities, errors, rejections and files
+// stay intact; this never contacts a client or starts a search.
 func (r *BookVariantRepo) RetryReviewed(ctx context.Context, bookID, variantID, actorID int64, reason string) (bool, error) {
 	reason = strings.TrimSpace(reason)
 	if bookID <= 0 || variantID <= 0 || actorID <= 0 || reason == "" || len(reason) > 500 {
@@ -146,6 +148,17 @@ func (r *BookVariantRepo) RetryReviewed(ctx context.Context, bookID, variantID, 
 	}
 	if n != 1 {
 		return false, nil
+	}
+	// Recovery or the fifth failed attempt already put this copy in review,
+	// but the scanner would still terminally block an exhausted importFailed
+	// row on its next ordinary poll and reconcile wanted back to review.
+	// Park only those spent rows; retryable failures are active and were
+	// excluded by the claim above. The named old-torrent action can rearm an
+	// importBlocked row if the copy is later reviewed again.
+	if _, err := tx.ExecContext(ctx, `UPDATE downloads SET status=?, dead_at=?
+		WHERE variant_id=? AND book_id=? AND status=? AND import_retry_count >= ?`,
+		models.StateImportBlocked, time.Now().UTC(), variantID, bookID, models.StateImportFailed, ImportRetryLimit); err != nil {
+		return false, fmt.Errorf("park exhausted reviewed downloads: %w", err)
 	}
 	data, err := json.Marshal(struct {
 		ActorUserID int64  `json:"actorUserId"`

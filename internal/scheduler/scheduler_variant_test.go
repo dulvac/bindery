@@ -5,12 +5,16 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/httpsec"
+	"github.com/vavallee/bindery/internal/importer"
 	"github.com/vavallee/bindery/internal/indexer"
 	"github.com/vavallee/bindery/internal/indexer/newznab"
 	"github.com/vavallee/bindery/internal/models"
@@ -70,7 +74,7 @@ func variantGrabFixture(t *testing.T) (*Scheduler, *variantResultsSearcher, *db.
 	}
 	s := &Scheduler{books: f.books, authors: db.NewAuthorRepo(f.database), indexers: indexers,
 		searcher: search, settings: db.NewSettingsRepo(f.database), blocklist: db.NewBlocklistRepo(f.database),
-		clients: clients, downloads: f.downloads, pending: db.NewPendingReleaseRepo(f.database)}
+		clients: clients, downloads: f.downloads, history: db.NewHistoryRepo(f.database), pending: db.NewPendingReleaseRepo(f.database)}
 	return s, search, f.downloads, book, &sends
 }
 
@@ -249,17 +253,47 @@ func TestVariantExistingTorrentRetryInterleavedWantedSweepsNeverGrab(t *testing.
 	}
 }
 
-// An exhausted old import is a review hold until an admin explicitly chooses
-// a new release. Once they do, it must not be hidden by the dead old row.
-func TestVariantExhaustedReviewedNewReleaseReentersWantedSweep(t *testing.T) {
+// A normal client poll between the admin's new-release decision and the
+// wanted sweep must not let the exhausted old torrent undo that decision.
+func TestVariantExhaustedReviewedNewReleaseSurvivesQbitPollBeforeWantedSweep(t *testing.T) {
 	s, search, downloads, book, sends := variantGrabFixture(t)
 	ctx := context.Background()
 	copies, err := s.books.VariantRepo().EnsureWanted(ctx, book.ID, models.MediaTypeEbook, []string{"eng"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	hash := "abcdef1234567890abcdef1234567890abcdef12"
+	source := filepath.Join(t.TempDir(), "old.epub")
+	if err := os.WriteFile(source, []byte("old seed remains here"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var mutators atomic.Int32
+	var qbitError atomic.Bool
+	qbit := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/auth/login":
+			_, _ = w.Write([]byte("Ok."))
+		case "/api/v2/torrents/info":
+			state := "stalledUP"
+			if qbitError.Load() {
+				state = "error"
+			}
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"hash": hash, "name": "old.epub", "category": "mam",
+				"state": state, "progress": 1.0, "size": 8192, "amount_left": 0,
+				"save_path": filepath.Dir(source), "content_path": source}})
+		default:
+			mutators.Add(1) // Only the torrent listing and auth are expected from this poll.
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(qbit.Close)
+	host, port := stallServerHostPort(t, qbit.URL)
+	client := &models.DownloadClient{Name: "old-qbit", Type: "qbittorrent", Host: host, Port: port, Category: "mam", Enabled: true}
+	if err := s.clients.Create(ctx, client); err != nil {
+		t.Fatal(err)
+	}
 	dl := &models.Download{GUID: "old-exhausted-torrent", Title: "Dune [ENG / EPUB]", BookID: &book.ID,
-		VariantID: &copies[0].ID, Protocol: "torrent", Status: models.StateGrabbed}
+		VariantID: &copies[0].ID, DownloadClientID: &client.ID, TorrentID: &hash, Protocol: "torrent", Status: models.StateGrabbed}
 	if err := downloads.Create(ctx, dl); err != nil {
 		t.Fatal(err)
 	}
@@ -285,16 +319,39 @@ func TestVariantExhaustedReviewedNewReleaseReentersWantedSweep(t *testing.T) {
 	if queue := s.wantedSearchQueue(ctx); len(queue) != 0 {
 		t.Fatalf("review queued an unattended grab: %+v", queue)
 	}
+	if err := s.books.RejectionRepo().Record(ctx, book.ID, copies[0].ID, dl.ID, source, "old source rejected"); err != nil {
+		t.Fatal(err)
+	}
 	approved, err := s.books.VariantRepo().RetryReviewed(ctx, book.ID, copies[0].ID, 42, "seek another release")
 	if err != nil || !approved {
 		t.Fatalf("new-release decision: %t %v", approved, err)
 	}
+	poller := importer.NewScanner(downloads, s.clients, s.books, s.authors, s.history, "", "", "", "", "")
+	poller.CheckDownloads(ctx) // an ordinary qBittorrent poll, before the next wanted sweep
 	queue := s.wantedSearchQueue(ctx)
 	if len(queue) != 1 || queue[0].book.ID != book.ID || len(queue[0].formats) != 1 || queue[0].formats[0] != models.MediaTypeEbook {
-		t.Fatalf("exhausted old import hid named new-release search: %+v", queue)
+		t.Fatalf("qBittorrent poll undid the new-release decision: %+v", queue)
 	}
-	if len(search.calls) != 0 || *sends != 0 {
-		t.Fatalf("queue inspection sent a release: searches=%d sends=%d", len(search.calls), *sends)
+	// The retained torrent may later report a client error. That must not
+	// overwrite its terminal import state or disable the named retry action.
+	qbitError.Store(true)
+	poller.CheckDownloads(ctx)
+	if queue := s.wantedSearchQueue(ctx); len(queue) != 1 || queue[0].book.ID != book.ID {
+		t.Fatalf("old torrent error hid new-release search: %+v", queue)
+	}
+	old, err := downloads.GetByID(ctx, dl.ID)
+	if err != nil || old == nil || old.Status != models.StateImportBlocked || old.ImportRetryCount != db.ImportRetryLimit ||
+		old.TorrentID == nil || *old.TorrentID != hash || old.DownloadClientID == nil || *old.DownloadClientID != client.ID {
+		t.Fatalf("old torrent changed instead of becoming inert: %+v %v", old, err)
+	}
+	if rejected, err := s.books.RejectionRepo().IsRejected(ctx, book.ID, copies[0].ID, source); err != nil || !rejected {
+		t.Fatalf("old rejection was lost: rejected=%t err=%v", rejected, err)
+	}
+	if data, err := os.ReadFile(source); err != nil || string(data) != "old seed remains here" {
+		t.Fatalf("source changed: %q %v", data, err)
+	}
+	if len(search.calls) != 0 || *sends != 0 || mutators.Load() != 0 {
+		t.Fatalf("poll/sweep sent or changed a torrent: searches=%d sends=%d qbit unexpected=%d", len(search.calls), *sends, mutators.Load())
 	}
 }
 

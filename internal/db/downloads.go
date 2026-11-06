@@ -899,6 +899,12 @@ func (r *DownloadRepo) SetErrorWithStatus(ctx context.Context, id int64, status 
 	if err := tx.QueryRowContext(ctx, "SELECT status, import_retry_count FROM downloads WHERE id=?", id).Scan(&current, &retries); err != nil {
 		return fmt.Errorf("lookup current state: %w", err)
 	}
+	if current == models.StateImportBlocked && status == current {
+		// A poll may have read importFailed before RetryReviewed parked it in
+		// importBlocked. Its stale terminal write must not reconcile the newly
+		// wanted copy back to review or publish another failure event.
+		return models.ErrInvalidTransition{From: current, To: status}
+	}
 	if current != status && !current.CanTransitionTo(status) {
 		return models.ErrInvalidTransition{From: current, To: status}
 	}

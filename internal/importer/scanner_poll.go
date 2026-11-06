@@ -542,6 +542,12 @@ func (s *Scanner) checkQbittorrentDownloads(ctx context.Context, client *models.
 		if dl.DownloadClientID == nil || *dl.DownloadClientID != client.ID {
 			continue
 		}
+		// A terminal import is waiting for a named decision, even if its old
+		// torrent stays seeding or later reports an error. Reclassifying the
+		// client state here would erase the existing-torrent retry option.
+		if dl.Status == models.StateImportBlocked {
+			continue
+		}
 
 		var torrent qbittorrent.Torrent
 		var ok bool
