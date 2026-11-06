@@ -41,8 +41,9 @@ func refreshRaceFixture(t *testing.T) (context.Context, *BookRepo, *models.Book,
 	return ctx, books, book, path
 }
 
-// withRefreshWindow runs edit once, inside refreshBookStatus's read then write
-// window, the way a user PUT racing an import lands (#2375).
+// withRefreshWindow runs edit once inside the standalone refresh's read/write
+// window. File registration now refreshes inside its transaction, where the
+// one-connection test DB cannot admit a concurrent edit.
 func withRefreshWindow(t *testing.T, edit func()) {
 	t.Helper()
 	fired := false
@@ -56,12 +57,14 @@ func withRefreshWindow(t *testing.T, edit func()) {
 	t.Cleanup(func() { refreshBookStatusLoaded = nil })
 }
 
-// TestRefreshBookStatus_KeepsConcurrentEdit is the reproduction #2375 asked
-// for: the user unmonitors and renames a book while an import is recording its
-// file. refreshBookStatus used to write the whole row back from the snapshot it
-// read before the edit, so the book came back monitored under its old title.
+// TestRefreshBookStatus_KeepsConcurrentEdit reproduces #2375 on the
+// standalone status refresh: a user unmonitors and renames a book between
+// its read and write. The refresh must not overwrite those edits.
 func TestRefreshBookStatus_KeepsConcurrentEdit(t *testing.T) {
 	ctx, books, book, path := refreshRaceFixture(t)
+	if err := books.AddBookFile(ctx, book.ID, models.MediaTypeEbook, path); err != nil {
+		t.Fatal(err)
+	}
 
 	withRefreshWindow(t, func() {
 		current, err := books.GetByID(ctx, book.ID)
@@ -75,7 +78,7 @@ func TestRefreshBookStatus_KeepsConcurrentEdit(t *testing.T) {
 		}
 	})
 
-	if err := books.AddBookFile(ctx, book.ID, models.MediaTypeEbook, path); err != nil {
+	if err := books.RefreshBookStatus(ctx, book.ID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -100,6 +103,9 @@ func TestRefreshBookStatus_KeepsConcurrentEdit(t *testing.T) {
 // book that also wants an audiobook.
 func TestRefreshBookStatus_RederivesWhenInputsChange(t *testing.T) {
 	ctx, books, book, path := refreshRaceFixture(t)
+	if err := books.AddBookFile(ctx, book.ID, models.MediaTypeEbook, path); err != nil {
+		t.Fatal(err)
+	}
 
 	withRefreshWindow(t, func() {
 		current, err := books.GetByID(ctx, book.ID)
@@ -112,7 +118,7 @@ func TestRefreshBookStatus_RederivesWhenInputsChange(t *testing.T) {
 		}
 	})
 
-	if err := books.AddBookFile(ctx, book.ID, models.MediaTypeEbook, path); err != nil {
+	if err := books.RefreshBookStatus(ctx, book.ID); err != nil {
 		t.Fatal(err)
 	}
 

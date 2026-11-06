@@ -187,6 +187,58 @@ func TestTrackVariantRetryRejectsExistingFileInAnotherFormat(t *testing.T) {
 	}
 }
 
+func TestSetVariantRejectsCrossVariantClaimWithoutChangingStatus(t *testing.T) {
+	database, _, book := openTestDB(t)
+	ctx := context.Background()
+	variants := NewBookVariantRepo(database)
+	rows, err := variants.EnsureWanted(ctx, book.ID, "ebook", []string{"eng", "rum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := NewBookFileRepo(database)
+	const path = "/lib/checked-english.epub"
+	if err := files.TrackVariant(ctx, book.ID, rows[0].ID, "ebook", path, "eng", "verified"); err != nil {
+		t.Fatal(err)
+	}
+	if err := files.SetVariant(ctx, path, &rows[1].ID, "rum", "verified"); err == nil {
+		t.Fatal("SetVariant replaced a placed English claim with a Romanian one")
+	}
+	file, err := files.GetByPath(ctx, path)
+	if err != nil || file == nil || file.VariantID == nil || *file.VariantID != rows[0].ID || file.Language != "eng" || file.Verification != "verified" {
+		t.Fatalf("rejected replacement changed the file: %#v, %v", file, err)
+	}
+	if got := variantStatus(t, database, book.ID, rows[0].ID); got != models.VariantImported {
+		t.Fatalf("former variant status = %q; want imported", got)
+	}
+	if got := variantStatus(t, database, book.ID, rows[1].ID); got != models.VariantWanted {
+		t.Fatalf("target variant status = %q; want wanted", got)
+	}
+}
+
+func TestSetVariantCannotAttachLegacyFile(t *testing.T) {
+	database, _, book := openTestDB(t)
+	ctx := context.Background()
+	rows, err := NewBookVariantRepo(database).EnsureWanted(ctx, book.ID, "ebook", []string{"rum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := NewBookFileRepo(database)
+	const path = "/lib/legacy-file.epub"
+	if err := files.Add(ctx, book.ID, "ebook", path); err != nil {
+		t.Fatal(err)
+	}
+	if err := files.SetVariant(ctx, path, &rows[0].ID, "rum", "verified"); err == nil {
+		t.Fatal("SetVariant attached a legacy file without safe import")
+	}
+	file, err := files.GetByPath(ctx, path)
+	if err != nil || file == nil || file.VariantID != nil || file.Language != "" || file.Verification != "unverified" {
+		t.Fatalf("rejected attachment changed the legacy file: %#v, %v", file, err)
+	}
+	if got := variantStatus(t, database, book.ID, rows[0].ID); got != models.VariantWanted {
+		t.Fatalf("rejected attachment changed variant status to %q", got)
+	}
+}
+
 func TestSetVariantCannotAttachUnverifiedWrongLanguage(t *testing.T) {
 	database, _, book := openTestDB(t)
 	ctx := context.Background()
@@ -207,8 +259,12 @@ func TestSetVariantCannotAttachUnverifiedWrongLanguage(t *testing.T) {
 			t.Fatalf("invalid association changed file: %#v, %v", got, err)
 		}
 	}
-	if err := files.SetVariant(ctx, path, &rows[0].ID, "", "unverified"); err != nil {
+	const placed = "/lib/unknown-language-placed.epub"
+	if err := files.TrackVariant(ctx, book.ID, rows[0].ID, "ebook", placed, "", "unverified"); err != nil {
 		t.Fatalf("unknown language must remain unlabeled: %v", err)
+	}
+	if err := files.SetVariant(ctx, placed, &rows[0].ID, "", "unverified"); err != nil {
+		t.Fatalf("checking the existing unverified claim: %v", err)
 	}
 }
 

@@ -119,10 +119,10 @@ func (r TrackResult) Created() bool {
 // book is taken over, and a path another existing book tracks fails with
 // *PathOwnedError and leaves that book's row alone (#2937).
 //
-// The insert and the ownership lookup run in one transaction so the answer
-// describes the row this call saw, not one a concurrent writer changed in
-// between. Nothing else happens inside it: no file I/O, no other query on
-// r.db (the pool has one connection).
+// The insert, orphan takeover, former-variant reconciliation, and new
+// owner's compatibility/status refresh share one transaction. Refresh may
+// stat tracked paths but never changes files; all SQL stays on tx because the
+// pool has one connection.
 func (r *BookFileRepo) Track(ctx context.Context, bookID int64, format, path string) (TrackResult, error) {
 	format = models.BookFileFormatFor(path, format)
 	tx, err := r.db.BeginTx(ctx, nil)
@@ -142,43 +142,43 @@ func (r *BookFileRepo) Track(ctx context.Context, bookID int64, format, path str
 	if err != nil {
 		return TrackResult{}, fmt.Errorf("book_files add rows: %w", err)
 	}
-	if n > 0 {
-		if err := tx.Commit(); err != nil {
-			return TrackResult{}, fmt.Errorf("book_files add commit: %w", err)
+	result := TrackResult{Outcome: TrackInserted}
+	if n == 0 {
+		var owner int64
+		var ownerTitle sql.NullString
+		var oldVariant sql.NullInt64
+		err = tx.QueryRowContext(ctx,
+			`SELECT bf.book_id, b.title, bf.variant_id FROM book_files bf LEFT JOIN books b ON b.id = bf.book_id
+			 WHERE bf.path = ?`, path).Scan(&owner, &ownerTitle, &oldVariant)
+		if errors.Is(err, sql.ErrNoRows) {
+			return TrackResult{}, fmt.Errorf("book_files add: insert of %s was ignored but no row holds the path", path)
 		}
-		return TrackResult{Outcome: TrackInserted}, nil
-	}
-
-	var owner int64
-	var ownerTitle sql.NullString
-	var oldVariant sql.NullInt64
-	err = tx.QueryRowContext(ctx,
-		`SELECT bf.book_id, b.title, bf.variant_id FROM book_files bf LEFT JOIN books b ON b.id = bf.book_id
-		 WHERE bf.path = ?`, path).Scan(&owner, &ownerTitle, &oldVariant)
-	if errors.Is(err, sql.ErrNoRows) {
-		return TrackResult{}, fmt.Errorf("book_files add: insert of %s was ignored but no row holds the path", path)
-	}
-	if err != nil {
-		return TrackResult{}, fmt.Errorf("book_files owner lookup: %w", err)
-	}
-	switch {
-	case owner == bookID:
-		return TrackResult{Outcome: TrackAlreadyTracked}, nil
-	case !ownerTitle.Valid:
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE book_files SET book_id = ?, format = ?, variant_id = NULL, language = '', verification = 'unverified' WHERE path = ?`, bookID, format, path); err != nil {
-			return TrackResult{}, fmt.Errorf("book_files reclaim orphaned row: %w", err)
+		if err != nil {
+			return TrackResult{}, fmt.Errorf("book_files owner lookup: %w", err)
 		}
-		if err := reconcileVariantAfterDetach(ctx, tx, oldVariant); err != nil {
-			return TrackResult{}, err
+		switch {
+		case owner == bookID:
+			result = TrackResult{Outcome: TrackAlreadyTracked}
+		case !ownerTitle.Valid:
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE book_files SET book_id = ?, format = ?, variant_id = NULL, language = '', verification = 'unverified' WHERE path = ?`, bookID, format, path); err != nil {
+				return TrackResult{}, fmt.Errorf("book_files reclaim orphaned row: %w", err)
+			}
+			if err := reconcileVariantAfterDetach(ctx, tx, oldVariant); err != nil {
+				return TrackResult{}, err
+			}
+			result = TrackResult{Outcome: TrackReclaimedOrphan, PreviousBookID: owner}
+		default:
+			return TrackResult{}, &PathOwnedError{Path: path, OwnerBookID: owner, OwnerTitle: ownerTitle.String}
 		}
-		if err := tx.Commit(); err != nil {
-			return TrackResult{}, fmt.Errorf("book_files reclaim commit: %w", err)
-		}
-		return TrackResult{Outcome: TrackReclaimedOrphan, PreviousBookID: owner}, nil
-	default:
-		return TrackResult{}, &PathOwnedError{Path: path, OwnerBookID: owner, OwnerTitle: ownerTitle.String}
 	}
+	if err := NewBookRepo(r.db).WithTx(tx).refreshBookStatus(ctx, bookID); err != nil {
+		return TrackResult{}, fmt.Errorf("book_files refresh owner: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return TrackResult{}, fmt.Errorf("book_files track commit: %w", err)
+	}
+	return result, nil
 }
 
 // Add records path against bookID. It is Track without the outcome: a
@@ -259,10 +259,10 @@ func (r *BookFileRepo) TrackVariant(ctx context.Context, bookID, variantID int64
 	return nil
 }
 
-// SetVariant records a file's checked language claim. A non-nil variant must
-// belong to the file's current book and format; any stated language must
-// match the variant. Replacing or un-verifying a claim reconciles the former
-// variant in the same transaction.
+// SetVariant changes verification on a file already associated with the same
+// variant, or clears its association. Only TrackVariant may attach a new
+// variant after safe placement. The language evidence must match the existing
+// variant, and clearing or changing verification reconciles its status.
 func (r *BookFileRepo) SetVariant(ctx context.Context, path string, variantID *int64, language, verification string) error {
 	if verification != "verified" && verification != "unverified" ||
 		(language != "" && language != "eng" && language != "rum" && language != "fre") ||
@@ -282,11 +282,11 @@ func (r *BookFileRepo) SetVariant(ctx context.Context, path string, variantID *i
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE book_files
 		SET variant_id = ?, language = ?, verification = ?
-		WHERE path = ? AND (? IS NULL OR EXISTS (
+		WHERE path = ? AND (? IS NULL OR (book_files.variant_id = ? AND EXISTS (
 			SELECT 1 FROM book_variants v
 			WHERE v.id = ? AND v.book_id = book_files.book_id AND v.media_type = book_files.format
 			AND ((? = '' AND ? = 'unverified') OR v.language = ?)
-		))`, variantID, language, verification, path, variantID, variantID, language, verification, language)
+		)))`, variantID, language, verification, path, variantID, variantID, variantID, language, verification, language)
 	if err != nil {
 		return fmt.Errorf("book_files set variant: %w", err)
 	}

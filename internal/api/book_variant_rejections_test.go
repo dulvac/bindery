@@ -392,9 +392,18 @@ func TestRejectSourceRefusesWrongVariantClaim(t *testing.T) {
 			}
 		}},
 		{"file", func(t *testing.T, f *rejectSourceFixture, english int64) {
-			if err := db.NewBookFileRepo(f.conn).SetVariant(f.ctx, f.library, &english, "", "unverified"); err != nil {
+			if _, err := f.database.UntrackFilePath(f.ctx, f.library); err != nil {
 				t.Fatal(err)
 			}
+			files := db.NewBookFileRepo(f.conn)
+			if err := files.TrackVariant(f.ctx, f.book.ID, english, models.MediaTypeEbook, f.library, "", "unverified"); err != nil {
+				t.Fatal(err)
+			}
+			file, err := files.GetByPath(f.ctx, f.library)
+			if err != nil || file == nil {
+				t.Fatalf("English file claim: %#v, %v", file, err)
+			}
+			f.file = *file
 		}},
 	} {
 		t.Run(update.name, func(t *testing.T) {

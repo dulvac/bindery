@@ -306,11 +306,13 @@ func TestVariantAssociationsRoundTripThroughFileAndDownloadRepos(t *testing.T) {
 		t.Fatal(err)
 	}
 	variantID := variants[0].ID
-	files := NewBookFileRepo(database)
-	if err := files.Add(ctx, book.ID, "ebook", "/lib/romanian.epub"); err != nil {
+	downloads := NewDownloadRepo(database)
+	d := &models.Download{GUID: "variant-guid", BookID: &book.ID, VariantID: &variantID, Title: "Romanian", Status: models.StateGrabbed, Protocol: "usenet"}
+	if err := downloads.Create(ctx, d); err != nil {
 		t.Fatal(err)
 	}
-	if err := files.SetVariant(ctx, "/lib/romanian.epub", &variantID, "rum", "verified"); err != nil {
+	files := NewBookFileRepo(database)
+	if err := files.TrackVariant(ctx, book.ID, variantID, "ebook", "/lib/romanian.epub", "rum", "verified"); err != nil {
 		t.Fatal(err)
 	}
 	checkFile := func(t *testing.T, f models.BookFile) {
@@ -335,11 +337,6 @@ func TestVariantAssociationsRoundTripThroughFileAndDownloadRepos(t *testing.T) {
 	}
 	checkFile(t, byBooks[book.ID][0])
 
-	downloads := NewDownloadRepo(database)
-	d := &models.Download{GUID: "variant-guid", BookID: &book.ID, VariantID: &variantID, Title: "Romanian", Status: models.StateGrabbed, Protocol: "usenet"}
-	if err := downloads.Create(ctx, d); err != nil {
-		t.Fatal(err)
-	}
 	got, err := downloads.GetByID(ctx, d.ID)
 	if err != nil || got == nil || got.VariantID == nil || *got.VariantID != variantID {
 		t.Fatalf("GetByID = %#v, %v", got, err)
@@ -392,10 +389,7 @@ func TestBookFileOwnershipChangeClearsVariant(t *testing.T) {
 			}
 			files := NewBookFileRepo(database)
 			path := "/lib/ownership-" + mode + ".epub"
-			if err := files.Add(ctx, book.ID, "ebook", path); err != nil {
-				t.Fatal(err)
-			}
-			if err := files.SetVariant(ctx, path, &variants[0].ID, "rum", "verified"); err != nil {
+			if err := files.TrackVariant(ctx, book.ID, variants[0].ID, "ebook", path, "rum", "verified"); err != nil {
 				t.Fatal(err)
 			}
 			switch mode {
@@ -540,18 +534,14 @@ func TestBookFileRepoSetVariantRejectsVerifiedLanguageMismatch(t *testing.T) {
 			id := rows[0].ID
 			files := NewBookFileRepo(database)
 			const path = "/lib/language-mismatch.epub"
-			if err := files.Add(ctx, book.ID, "ebook", path); err != nil {
-				t.Fatal(err)
-			}
 			wantLanguage, wantVerification, wantStatus := "", "unverified", models.VariantWanted
 			if claimed {
-				if err := files.SetVariant(ctx, path, &id, "rum", "verified"); err != nil {
-					t.Fatal(err)
-				}
-				if err := variants.SetStatus(ctx, id, models.VariantImported); err != nil {
+				if err := files.TrackVariant(ctx, book.ID, id, "ebook", path, "rum", "verified"); err != nil {
 					t.Fatal(err)
 				}
 				wantLanguage, wantVerification, wantStatus = "rum", "verified", models.VariantImported
+			} else if err := files.Add(ctx, book.ID, "ebook", path); err != nil {
+				t.Fatal(err)
 			}
 			if err := files.SetVariant(ctx, path, &id, "eng", "verified"); err == nil {
 				t.Fatal("SetVariant accepted English verification for a Romanian variant")
@@ -594,12 +584,10 @@ func TestVariantReconciliationIgnoresMismatchedVerifiedFile(t *testing.T) {
 	files := NewBookFileRepo(database)
 	const matching = "/lib/matching-rum.epub"
 	const mismatched = "/lib/mismatched-eng.epub"
-	for _, path := range []string{matching, mismatched} {
-		if err := files.Add(ctx, book.ID, "ebook", path); err != nil {
-			t.Fatal(err)
-		}
+	if err := files.TrackVariant(ctx, book.ID, id, "ebook", matching, "rum", "verified"); err != nil {
+		t.Fatal(err)
 	}
-	if err := files.SetVariant(ctx, matching, &id, "rum", "verified"); err != nil {
+	if err := files.Add(ctx, book.ID, "ebook", mismatched); err != nil {
 		t.Fatal(err)
 	}
 	// Simulate a bad claim written before SetVariant checked language.
@@ -666,10 +654,11 @@ func TestBookFileRepoSetVariantRejectsWrongBookAndFormat(t *testing.T) {
 			}
 		})
 	}
-	if err := files.SetVariant(ctx, path, &own[0].ID, "rum", "verified"); err != nil {
-		t.Fatalf("valid same-book ebook variant: %v", err)
+	const placed = "/lib/placed-variant-ownership.epub"
+	if err := files.TrackVariant(ctx, book.ID, own[0].ID, "ebook", placed, "rum", "verified"); err != nil {
+		t.Fatalf("valid newly placed ebook variant: %v", err)
 	}
-	file, err := files.GetByPath(ctx, path)
+	file, err := files.GetByPath(ctx, placed)
 	if err != nil || file == nil || file.VariantID == nil || *file.VariantID != own[0].ID || file.Language != "rum" || file.Verification != "verified" {
 		t.Fatalf("valid file association = %#v, %v", file, err)
 	}
@@ -694,10 +683,7 @@ func TestBookFileOwnershipChangeReopensUnclaimedVariant(t *testing.T) {
 			id := rows[0].ID
 			files := NewBookFileRepo(database)
 			path := "/lib/reopen-" + mode + ".epub"
-			if err := files.Add(ctx, book.ID, "ebook", path); err != nil {
-				t.Fatal(err)
-			}
-			if err := files.SetVariant(ctx, path, &id, "rum", "verified"); err != nil {
+			if err := files.TrackVariant(ctx, book.ID, id, "ebook", path, "rum", "verified"); err != nil {
 				t.Fatal(err)
 			}
 			if err := variants.SetStatus(ctx, id, models.VariantImported); err != nil {
@@ -754,27 +740,21 @@ func TestBookFileOwnershipChangeKeepsOtherVariantClaims(t *testing.T) {
 			id := rows[0].ID
 			files := NewBookFileRepo(database)
 			const path = "/lib/keep-first.epub"
-			if err := files.Add(ctx, book.ID, "ebook", path); err != nil {
-				t.Fatal(err)
-			}
-			if err := files.SetVariant(ctx, path, &id, "rum", "verified"); err != nil {
-				t.Fatal(err)
-			}
 			wantStatus := models.VariantImported
-			switch remaining {
-			case "verified file":
-				if err := files.Add(ctx, book.ID, "ebook", "/lib/keep-second.epub"); err != nil {
-					t.Fatal(err)
-				}
-				if err := files.SetVariant(ctx, "/lib/keep-second.epub", &id, "rum", "verified"); err != nil {
-					t.Fatal(err)
-				}
-			case "active download":
+			if remaining == "active download" {
 				d := &models.Download{GUID: "still-loading", BookID: &book.ID, VariantID: &id, Title: "Loading", Status: models.StateGrabbed, Protocol: "usenet"}
 				if err := NewDownloadRepo(database).Create(ctx, d); err != nil {
 					t.Fatal(err)
 				}
 				wantStatus = models.VariantDownloading
+			}
+			if err := files.TrackVariant(ctx, book.ID, id, "ebook", path, "rum", "verified"); err != nil {
+				t.Fatal(err)
+			}
+			if remaining == "verified file" {
+				if err := files.TrackVariant(ctx, book.ID, id, "ebook", "/lib/keep-second.epub", "rum", "verified"); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if err := variants.SetStatus(ctx, id, models.VariantImported); err != nil {
 				t.Fatal(err)
@@ -867,10 +847,7 @@ func TestDownloadBookReassignmentKeepsOtherVariantClaims(t *testing.T) {
 			switch tc.name {
 			case "verified file":
 				files := NewBookFileRepo(database)
-				if err := files.Add(ctx, book.ID, "ebook", "/lib/keep-download.epub"); err != nil {
-					t.Fatal(err)
-				}
-				if err := files.SetVariant(ctx, "/lib/keep-download.epub", &id, "rum", "verified"); err != nil {
+				if err := files.TrackVariant(ctx, book.ID, id, "ebook", "/lib/keep-download.epub", "rum", "verified"); err != nil {
 					t.Fatal(err)
 				}
 			case "active download", "failed download":
@@ -917,20 +894,14 @@ func TestBookFileRepoSetVariantKeepsUnverifiedClaimImported(t *testing.T) {
 	id := rows[0].ID
 	files := NewBookFileRepo(database)
 	const path = "/lib/lost-verification.epub"
-	if err := files.Add(ctx, book.ID, "ebook", path); err != nil {
+	if err := files.TrackVariant(ctx, book.ID, id, "ebook", path, "rum", "verified"); err != nil {
 		t.Fatal(err)
 	}
-	if err := files.SetVariant(ctx, path, &id, "rum", "verified"); err != nil {
-		t.Fatal(err)
-	}
-	if err := variants.SetStatus(ctx, id, models.VariantImported); err != nil {
-		t.Fatal(err)
-	}
-	if err := files.SetVariant(ctx, path, &id, "rum", "unverified"); err != nil {
+	if err := files.SetVariant(ctx, path, &id, "", "unverified"); err != nil {
 		t.Fatal(err)
 	}
 	file, err := files.GetByPath(ctx, path)
-	if err != nil || file == nil || file.VariantID == nil || *file.VariantID != id || file.Language != "rum" || file.Verification != "unverified" {
+	if err != nil || file == nil || file.VariantID == nil || *file.VariantID != id || file.Language != "" || file.Verification != "unverified" {
 		t.Fatalf("file after losing verification = %#v, %v", file, err)
 	}
 	got, err := variants.ListByBook(ctx, book.ID)
@@ -943,7 +914,7 @@ func TestBookFileRepoSetVariantKeepsUnverifiedClaimImported(t *testing.T) {
 	}
 }
 
-func TestBookFileRepoSetVariantReopensReplacedClaim(t *testing.T) {
+func TestBookFileRepoSetVariantClearReopensClaim(t *testing.T) {
 	database, _, book := openTestDB(t)
 	ctx := context.Background()
 	variants := NewBookVariantRepo(database)
@@ -952,22 +923,26 @@ func TestBookFileRepoSetVariantReopensReplacedClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	files := NewBookFileRepo(database)
-	const path = "/lib/changed-language.epub"
-	if err := files.Add(ctx, book.ID, "ebook", path); err != nil {
+	const oldPath = "/lib/changed-language.epub"
+	if err := files.TrackVariant(ctx, book.ID, rows[0].ID, "ebook", oldPath, "eng", "verified"); err != nil {
 		t.Fatal(err)
 	}
-	if err := files.SetVariant(ctx, path, &rows[0].ID, "eng", "verified"); err != nil {
+	if err := files.SetVariant(ctx, oldPath, nil, "", "unverified"); err != nil {
 		t.Fatal(err)
 	}
-	if err := variants.SetStatus(ctx, rows[0].ID, models.VariantImported); err != nil {
+	file, err := files.GetByPath(ctx, oldPath)
+	if err != nil || file == nil || file.VariantID != nil || file.Language != "" || file.Verification != "unverified" {
+		t.Fatalf("cleared claim left file association = %#v, %v", file, err)
+	}
+	if got := variantStatus(t, database, book.ID, rows[0].ID); got != models.VariantWanted {
+		t.Fatalf("cleared English claim remains %q; want wanted", got)
+	}
+	const placed = "/lib/placed-romanian.epub"
+	if err := files.TrackVariant(ctx, book.ID, rows[1].ID, "ebook", placed, "rum", "verified"); err != nil {
 		t.Fatal(err)
 	}
-	if err := files.SetVariant(ctx, path, &rows[1].ID, "rum", "verified"); err != nil {
-		t.Fatal(err)
-	}
-	got, err := variants.ListByBook(ctx, book.ID)
-	if err != nil || len(got) != 2 || got[0].Status != models.VariantWanted {
-		t.Fatalf("former file variant = %#v, %v; want English wanted", got, err)
+	if got := variantStatus(t, database, book.ID, rows[1].ID); got != models.VariantImported {
+		t.Fatalf("new Romanian import = %q; want imported", got)
 	}
 }
 

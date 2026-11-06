@@ -993,10 +993,8 @@ func (r *BookRepo) MarkWantedMonitored(ctx context.Context, id int64) error {
 // records nothing, so a caller can never report an import that tracked
 // nothing as a success (#2937). A row left by a deleted book is taken over.
 func (r *BookRepo) AddBookFile(ctx context.Context, bookID int64, format, path string) error {
-	if _, err := r.trackBookFile(ctx, bookID, format, path); err != nil {
-		return err
-	}
-	return r.refreshBookStatus(ctx, bookID)
+	_, err := r.trackBookFile(ctx, bookID, format, path)
+	return err
 }
 
 // AddBookFileIfMissing records a new on-disk file and reports whether this call
@@ -1008,7 +1006,7 @@ func (r *BookRepo) AddBookFileIfMissing(ctx context.Context, bookID int64, forma
 	if err != nil {
 		return false, err
 	}
-	return res.Created(), r.refreshBookStatus(ctx, bookID)
+	return res.Created(), nil
 }
 
 // trackBookFile is BookFileRepo.Track with the orphan takeover logged, since

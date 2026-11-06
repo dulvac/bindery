@@ -121,6 +121,78 @@ func TestBookRepo_AddBookFile_OrphanedOwnerRepointed(t *testing.T) {
 	}
 }
 
+// A failed refresh must roll back the orphan takeover and the former
+// variant's reconciliation, no matter which tracking entry point is used.
+func TestOrphanReclaimRefreshFailureRollsBackOwnershipAndVariant(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		claim func(context.Context, *sql.DB, int64, string) error
+	}{
+		{"BookFileRepo.Track", func(ctx context.Context, database *sql.DB, bookID int64, path string) error {
+			_, err := NewBookFileRepo(database).Track(ctx, bookID, models.MediaTypeEbook, path)
+			return err
+		}},
+		{"BookRepo.AddBookFile", func(ctx context.Context, database *sql.DB, bookID int64, path string) error {
+			return NewBookRepo(database).AddBookFile(ctx, bookID, models.MediaTypeEbook, path)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database, author, gone := openTestDB(t)
+			ctx := context.Background()
+			live := secondBook(t, database, author.ID, "Reclaim Target")
+			variant, err := NewBookVariantRepo(database).EnsureWanted(ctx, gone.ID, models.MediaTypeEbook, []string{"rum"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			const path = "/lib/orphan [rum].epub"
+			files := NewBookFileRepo(database)
+			if err := files.TrackVariant(ctx, gone.ID, variant[0].ID, models.MediaTypeEbook, path, "rum", "verified"); err != nil {
+				t.Fatal(err)
+			}
+			orphanBookRows(t, database, gone.ID)
+			if got := variantStatus(t, database, gone.ID, variant[0].ID); got != models.VariantImported {
+				t.Fatalf("orphan variant before reclaim = %q; want imported", got)
+			}
+			trigger := fmt.Sprintf(`CREATE TRIGGER reject_reclaim_refresh BEFORE UPDATE OF ebook_file_path ON books
+				WHEN NEW.id = %d BEGIN SELECT RAISE(ABORT, 'refresh blocked'); END`, live.ID)
+			if _, err := database.ExecContext(ctx, trigger); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.claim(ctx, database, live.ID, path); err == nil {
+				t.Fatal("reclaim committed despite a failed target book refresh")
+			}
+			file, err := files.GetByPath(ctx, path)
+			if err != nil || file == nil || file.BookID != gone.ID || file.VariantID == nil || *file.VariantID != variant[0].ID || file.Language != "rum" || file.Verification != "verified" {
+				t.Fatalf("failed reclaim changed orphan file: %#v, %v", file, err)
+			}
+			if got := variantStatus(t, database, gone.ID, variant[0].ID); got != models.VariantImported {
+				t.Fatalf("failed reclaim reopened former variant: %q", got)
+			}
+			var status string
+			var storedPath sql.NullString
+			if err := database.QueryRowContext(ctx, `SELECT status, ebook_file_path FROM books WHERE id = ?`, live.ID).Scan(&status, &storedPath); err != nil || status != models.BookStatusWanted || storedPath.String != "" {
+				t.Fatalf("failed reclaim changed target: status %q, path %q, err %v", status, storedPath.String, err)
+			}
+			if _, err := database.ExecContext(ctx, `DROP TRIGGER reject_reclaim_refresh`); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.claim(ctx, database, live.ID, path); err != nil {
+				t.Fatalf("reclaim after dropping trigger: %v", err)
+			}
+			file, err = files.GetByPath(ctx, path)
+			if err != nil || file == nil || file.BookID != live.ID || file.VariantID != nil || file.Language != "" || file.Verification != "unverified" {
+				t.Fatalf("successful reclaim did not clear orphan claim: %#v, %v", file, err)
+			}
+			if got := variantStatus(t, database, gone.ID, variant[0].ID); got != models.VariantWanted {
+				t.Fatalf("successful reclaim left former variant %q; want wanted", got)
+			}
+			if err := database.QueryRowContext(ctx, `SELECT status, ebook_file_path FROM books WHERE id = ?`, live.ID).Scan(&status, &storedPath); err != nil || status != models.BookStatusImported || storedPath.String != path {
+				t.Fatalf("successful reclaim did not refresh target: status %q, path %q, err %v", status, storedPath.String, err)
+			}
+		})
+	}
+}
+
 // TestBookFileRepo_TrackOutcomes pins what Track reports for each case, so a
 // caller can tell an insert from a same-book no-op from an orphan takeover.
 func TestBookFileRepo_TrackOutcomes(t *testing.T) {
