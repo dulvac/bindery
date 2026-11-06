@@ -15,8 +15,9 @@ import (
 // checkedVariantSource stays local to the importer: Task 8 owns persisted
 // book-file associations and language-bearing destinations.
 type checkedVariantSource struct {
-	path     string
-	assessed os.FileInfo
+	path         string
+	assessed     os.FileInfo
+	verification string
 }
 
 // A successful hardlink must still identify the regular file whose evidence
@@ -34,12 +35,10 @@ func variantSourceChanged(phase, source string, cause error) error {
 	return fmt.Errorf("variant source %s %s (inode, size or mtime mismatch)", source, phase)
 }
 
-// reviewVariantImport gates the existing placement paths. It reads source
-// evidence and persists review decisions before any link. It never trusts a
-// caller-supplied variant: the download and selected
-// variant are reloaded from the database, and every source is checked before
-// any destination is created. The returned list is the only list placement may
-// use, so a mixed release cannot import a second, wrong-language file.
+// reviewVariantImport reads source evidence and persists review decisions
+// before placement. It never trusts a caller-supplied variant: the download
+// and selected variant are reloaded from the database. Task 8 will consume the
+// selected files for private staging; this task must not place them publicly.
 func (s *Scanner) reviewVariantImport(ctx context.Context, dl *models.Download, book *models.Book, author *models.Author,
 	format, downloadPath string, files []string) ([]checkedVariantSource, bool, string, error) {
 	if s.books == nil || s.downloads == nil || s.history == nil || dl == nil || book == nil {
@@ -72,17 +71,19 @@ func (s *Scanner) reviewVariantImport(ctx context.Context, dl *models.Download, 
 	if err != nil {
 		return nil, false, "", err
 	}
+	eligible := make([]string, 0, len(files))
+	rejectedCount := 0
 	for _, source := range files {
 		if err := s.safeVariantSource(downloadPath, source); err != nil {
 			return nil, false, "", err
 		}
-		// Check the exact file even when no folder rejection was found. A
-		// failed lookup is not permission to import.
+		// EPUB rejections name exact files; only an audiobook's rejected
+		// content folder also covers its contained tracks.
 		rejected, err := rejections.IsRejected(ctx, book.ID, variant.ID, source)
 		if err != nil {
 			return nil, false, "", err
 		}
-		if !rejected {
+		if !rejected && variant.MediaType == models.MediaTypeAudiobook {
 			for _, prior := range paths {
 				if prior == source {
 					rejected = true
@@ -105,11 +106,16 @@ func (s *Scanner) reviewVariantImport(ctx context.Context, dl *models.Download, 
 			}
 		}
 		if rejected {
-			if err := s.books.VariantRepo().SetStatus(ctx, variant.ID, models.VariantReview); err != nil {
-				return nil, false, "", fmt.Errorf("keep rejected variant in review: %w", err)
-			}
-			return nil, true, "source previously rejected for this book", nil
+			rejectedCount++
+			continue
 		}
+		eligible = append(eligible, source)
+	}
+	if len(eligible) == 0 && rejectedCount > 0 {
+		if err := s.books.VariantRepo().SetStatus(ctx, variant.ID, models.VariantReview); err != nil {
+			return nil, false, "", fmt.Errorf("keep rejected variant in review: %w", err)
+		}
+		return nil, true, "source previously rejected for this book", nil
 	}
 	// Use the existing history API, not an unaudited boolean on the release.
 	// Even a malformed or unrelated event must not waive a language mismatch.
@@ -137,7 +143,7 @@ func (s *Scanner) reviewVariantImport(ctx context.Context, dl *models.Download, 
 	var matching, uncertain, mismatched []checkedVariantSource
 	var wrongWork bool
 	var reason string
-	for _, source := range files {
+	for _, source := range eligible {
 		// A manual formatHint cannot turn an M4B into an ebook. Likewise a
 		// PDF sidecar alongside an audiobook is not an audio file to link.
 		if detectDownloadFormat([]string{source}) != variant.MediaType {
@@ -165,7 +171,7 @@ func (s *Scanner) reviewVariantImport(ctx context.Context, dl *models.Download, 
 			wrongWork = true
 			reason = e.Reason
 		}
-		candidate := checkedVariantSource{path: source, assessed: assessed}
+		candidate := checkedVariantSource{path: source, assessed: assessed, verification: "unverified"}
 		switch {
 		case e.WrongLanguage:
 			mismatched = append(mismatched, candidate)
@@ -173,12 +179,19 @@ func (s *Scanner) reviewVariantImport(ctx context.Context, dl *models.Download, 
 				reason = e.Reason
 			}
 		case e.Verification == "verified" && e.DetectedLanguage == variant.Language:
+			candidate.verification = "verified"
 			matching = append(matching, candidate)
 		default:
 			uncertain = append(uncertain, candidate)
 		}
 	}
 	if len(matching)+len(uncertain)+len(mismatched) == 0 {
+		if rejectedCount > 0 {
+			if err := s.books.VariantRepo().SetStatus(ctx, variant.ID, models.VariantReview); err != nil {
+				return nil, false, "", fmt.Errorf("keep rejected variant in review: %w", err)
+			}
+			return nil, true, "source previously rejected for this book", nil
+		}
 		return nil, false, "", fmt.Errorf("download has no files of the requested variant format")
 	}
 	if wrongWork || len(matching)+len(uncertain) == 0 {
@@ -204,9 +217,18 @@ func (s *Scanner) reviewVariantImport(ctx context.Context, dl *models.Download, 
 		}
 		return nil, true, reason, nil
 	}
+	// Reject confident language mismatches by exact file even when an eligible
+	// sibling remains. A retry can then skip the wrong file without holding
+	// the whole download or a different language variant in review.
+	for _, item := range mismatched {
+		identity := variantRejectionIdentity(ctx, stored, downloadPath, item.path, variant.MediaType)
+		if err := rejections.Record(ctx, book.ID, variant.ID, stored.ID, identity, reason); err != nil {
+			return nil, false, "", fmt.Errorf("record rejected source: %w", err)
+		}
+	}
 	// If one file is confidently the requested copy, an uncertain sibling
 	// cannot take its place or claim a second file slot. Without a verified
-	// match, uncertain remains eligible but will not be labelled English.
+	// match, the selected source remains unverified for Task 8.
 	selected := uncertain
 	if len(matching) > 0 {
 		selected = matching

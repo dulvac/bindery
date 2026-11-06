@@ -99,6 +99,54 @@ func TestVariantImport_RejectedSourcesStayRejectedAcrossQbitRetries(t *testing.T
 	}
 }
 
+// A verified qBittorrent source remains in the client and can be retried
+// manually after Task 8 supplies private staging and safe final promotion.
+func TestVariantImport_ValidQbitSourceWaitsForTask8AcrossRetries(t *testing.T) {
+	f := newVariantReviewFixture(t, "English catalogue label", "Sample Author", models.MediaTypeEbook, "eng")
+	file := variantEPUBSource(t, f.sources, "English catalogue label.epub", "english.epub")
+	const hash = "abcdef1234567890abcdef1234567890abcdef12"
+	var mutators int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/auth/login":
+			_, _ = w.Write([]byte("Ok."))
+		case "/api/v2/torrents/info":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"hash": hash, "name": "English catalogue label", "state": "stalledUP", "progress": 1.0, "size": 8192, "amount_left": 0, "save_path": f.sources, "content_path": file}})
+		case "/api/v2/torrents/files":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"name": filepath.Base(file), "size": 8192, "progress": 1.0}})
+		default:
+			mutators++
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer srv.Close()
+	host, port := scannerTestHostPort(t, srv.URL)
+	client := &models.DownloadClient{Name: "test-qbit", Type: "qbittorrent", Host: host, Port: port, Enabled: true, Category: "mam"}
+	if err := db.NewDownloadClientRepo(f.database).Create(f.ctx, client); err != nil {
+		t.Fatal(err)
+	}
+	dl := f.addDownload(t, "English catalogue label [ENG / EPUB]")
+	if _, err := f.database.ExecContext(f.ctx, `UPDATE downloads SET download_client_id=?, torrent_id=? WHERE id=?`, client.ID, hash, dl.ID); err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			ok, found, err := f.downloads.ResetImportRetry(f.ctx, dl.ID)
+			if err != nil || !ok || !found {
+				t.Fatalf("manual retry not available: %t %t %v", ok, found, err)
+			}
+		}
+		f.scanner.checkQbittorrentDownloads(f.ctx, client)
+		f.assertPendingPlacement(t, dl)
+		if _, err := os.Stat(file); err != nil {
+			t.Fatalf("qBittorrent source removed: %v", err)
+		}
+	}
+	if mutators != 0 {
+		t.Fatalf("qBittorrent mutator/unexpected calls: %d", mutators)
+	}
+}
+
 func TestVariantScan_RejectsInodeMatchButReconcilesUnrelatedBook(t *testing.T) {
 	for _, audio := range []bool{false, true} {
 		name := "ebook"
@@ -284,7 +332,7 @@ func TestVariantImport_RejectionWriteFailureLeavesNoLibraryLink(t *testing.T) {
 	}
 }
 
-func TestVariantImport_DoesNotLinkAnotherFormatFromMixedFileList(t *testing.T) {
+func TestVariantImport_MixedFormatsSelectsEbookWithoutPublicLink(t *testing.T) {
 	f := newVariantReviewFixture(t, "English catalogue label", "Sample Author", models.MediaTypeEbook, "eng")
 	epub := variantEPUBSource(t, f.sources, "English catalogue label.epub", "english.epub")
 	other := filepath.Join(f.sources, "bonus.m4b")
@@ -292,21 +340,20 @@ func TestVariantImport_DoesNotLinkAnotherFormatFromMixedFileList(t *testing.T) {
 		t.Fatal(err)
 	}
 	dl := f.addDownload(t, "English catalogue label [ENG / EPUB]")
+	author, err := db.NewAuthorRepo(f.database).GetByID(f.ctx, f.book.AuthorID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected, reviewed, reason, err := f.scanner.reviewVariantImport(f.ctx, dl, f.book, author, models.MediaTypeEbook, f.sources, []string{epub, other})
+	if err != nil || reviewed || len(selected) != 1 || selected[0].path != epub {
+		t.Fatalf("ebook selection included audiobook: %+v reviewed=%t reason=%q err=%v", selected, reviewed, reason, err)
+	}
 	f.scanner.tryImportInternal(f.ctx, dl, f.sources, "qbittorrent", "test-hash", models.MediaTypeEbook, nil, []string{epub, other})
-	files, err := f.books.ListFiles(f.ctx, f.book.ID)
-	if err != nil || len(files) != 1 {
-		t.Fatalf("ebook variant should link only the EPUB, got %+v %v", files, err)
-	}
-	linked, err := os.Lstat(files[0].Path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want, err := os.Lstat(epub)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !os.SameFile(linked, want) {
-		t.Fatalf("ebook variant linked audiobook instead: %+v", files[0])
+	f.assertPendingPlacement(t, dl)
+	for _, source := range []string{epub, other} {
+		if _, err := os.Stat(source); err != nil {
+			t.Fatalf("torrent source changed: %s: %v", source, err)
+		}
 	}
 }
 

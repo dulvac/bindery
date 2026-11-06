@@ -1835,7 +1835,6 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 		detectedFormat = formatHint
 	}
 
-	var assessedVariantSources map[string]os.FileInfo
 	if variantDownload {
 		selected, reviewed, reason, err := s.reviewVariantImport(importCtx, dl, book, author, detectedFormat, downloadPath, bookFiles)
 		if err != nil {
@@ -1843,24 +1842,28 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 			return
 		}
 		if reviewed {
-			// Existing rejections stay in review; a new rejection's record
-			// and review status were both persisted before this point.
+			// Rejection and review status were persisted before this point.
 			s.failImport(ctx, dl, models.StateImportBlocked, reason)
 			return
 		}
-		bookFiles = make([]string, 0, len(selected))
-		assessedVariantSources = make(map[string]os.FileInfo, len(selected))
-		for _, source := range selected {
-			bookFiles = append(bookFiles, source.path)
-			assessedVariantSources[source.path] = source.assessed
-		}
-		if configuredMode == "external" {
-			// A drop-folder handoff can itself create a library hardlink.
-			// Wait for Task 8's variant-aware external handoff rather than
-			// losing this selected, checked source list in dropToFolder.
-			s.failImport(ctx, dl, models.StateImportBlocked, "external variant handoff needs variant-aware destinations")
+		if len(selected) == 0 {
+			s.failImport(ctx, dl, models.StateImportBlocked, "no eligible variant source; Task 8 cannot place this download")
 			return
 		}
+		// The current placement paths publish links before they can prove
+		// ownership of the destination. A post-link mismatch rollback could
+		// unlink another writer's replacement. Task 8 owns private staging,
+		// atomic no-replace promotion and the verified book_file association.
+		// StateImportBlocked is visible and manually retryable; never claim an
+		// import or run client cleanup while those pieces are absent.
+		for _, source := range selected {
+			if source.verification != "verified" {
+				s.failImport(ctx, dl, models.StateImportBlocked, "variant language remains unverified; Task 8 must stage and promote this source before import")
+				return
+			}
+		}
+		s.failImport(ctx, dl, models.StateImportBlocked, "variant evidence verified; Task 8 must stage and promote this source before import")
+		return
 	}
 
 	// Post-download format enforcement (#1782).
@@ -2098,10 +2101,6 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 		// files actually land under, not s.libraryDir — they can be on
 		// different mounts and a cross-device hardlink would hard-fail (#1254).
 		mode := s.resolveImportMode(configuredMode, downloadPath, audiobookRoot)
-		if variantDownload && mode != "hardlink" {
-			s.failImport(ctx, dl, models.StateImportBlocked, "variant audiobook placement requires a verifiable hardlink; copy/move is not safe after evidence review")
-			return
-		}
 		// audiobookSource is the path the move/copy/hardlink will operate on.
 		// When the caller supplied an explicit per-torrent file list (issue
 		// #903), prefer that to downloadPath: downloadPath can be a shared
@@ -2113,11 +2112,7 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 		// per-file placement.
 		audiobookSource := downloadPath
 		usePerFile := false
-		if variantDownload {
-			// The folder placer links sidecars and other files that were not
-			// assessed. Place only the checked source list for a variant.
-			usePerFile = true
-		} else if len(explicitFiles) > 0 {
+		if len(explicitFiles) > 0 {
 			src, perFile := s.resolveAudiobookSource(downloadPath, bookFiles, isTorrentOwnFolder(ctx))
 			usePerFile = perFile
 			if !perFile {
@@ -2182,11 +2177,7 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 					var fileErr error
 					switch mode {
 					case "hardlink":
-						if variantDownload {
-							fileErr = osLink(srcFile, dstFile) // no cross-device copy fallback for torrents
-						} else {
-							fileErr = HardlinkFile(srcFile, dstFile)
-						}
+						fileErr = HardlinkFile(srcFile, dstFile)
 					case "copy":
 						fileErr = CopyFileCtx(importCtx, srcFile, dstFile)
 					default:
@@ -2196,28 +2187,7 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 						dirErr = fileErr
 						break
 					}
-					// osLink succeeded, so only this new library entry may be
-					// rolled back if its inode or contents changed since review.
 					placed = append(placed, names[i])
-					if variantDownload {
-						linked, statErr := os.Lstat(dstFile)
-						if statErr != nil || !sameAssessedSource(assessedVariantSources[srcFile], linked) {
-							dirErr = variantSourceChanged("changed after evidence review", srcFile, statErr)
-							break
-						}
-					}
-				}
-				if variantDownload && dirErr == nil {
-					// A later track may have changed an earlier hardlink while
-					// placement was still running. Check the complete folder once
-					// more before recording it in book_files.
-					for i, srcFile := range bookFiles {
-						linked, statErr := os.Lstat(filepath.Join(destDir, names[i]))
-						if statErr != nil || !sameAssessedSource(assessedVariantSources[srcFile], linked) {
-							dirErr = variantSourceChanged("changed before recording folder", srcFile, statErr)
-							break
-						}
-					}
 				}
 				// An unexpected placement failure (a full disk, a revoked
 				// permission) used to leave the already-placed files behind
@@ -2588,10 +2558,6 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 	// failure when the author's RootFolderID is on a separate mount (#1254).
 	ebookRoot := s.effectiveLibraryDir(ctx, author)
 	ebookMode := s.resolveImportMode(configuredMode, downloadPath, ebookRoot)
-	if variantDownload && ebookMode != "hardlink" {
-		s.failImport(ctx, dl, models.StateImportBlocked, "variant ebook placement requires a verifiable hardlink; copy/move is not safe after evidence review")
-		return
-	}
 	calibreQueued := false
 	for _, srcFile := range orderByBookTitle(book, bookFiles) {
 		if book == nil {
@@ -2643,21 +2609,6 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 			continue
 		}
 
-		if variantDownload {
-			// Before staging, refuse a colliding destination even when no
-			// book_files row tracks it. A same-path retry is idempotent only
-			// when this very source inode is already tracked by this book.
-			if to, statErr := os.Lstat(destPath); statErr == nil {
-				if !sameAssessedSource(assessedVariantSources[srcFile], to) || !s.alreadyImportedPath(ctx, book, destPath) {
-					s.failImport(ctx, dl, models.StateImportBlocked, "variant destination already holds another or untracked source; needs language-bearing destination")
-					return
-				}
-			} else if !os.IsNotExist(statErr) {
-				s.failImport(ctx, dl, models.StateImportBlocked, fmt.Sprintf("cannot inspect variant destination: %v", statErr))
-				return
-			}
-		}
-
 		// Idempotency guard (issue #706 finding 2): if a prior attempt already
 		// landed this exact destination file and recorded it in book_files but
 		// crashed before writing the terminal status, re-importing would
@@ -2686,15 +2637,6 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 		// atomic-rename for the durability invariant: either the user
 		// sees the final file with its DB row, or neither.
 		stagedPath, commit, rollback, stageErr := StagedImport(importCtx, mode, srcFile, destPath)
-		var stagedInfo os.FileInfo
-		if stageErr == nil && variantDownload && mode == "hardlink" {
-			var stagedErr error
-			stagedInfo, stagedErr = os.Lstat(stagedPath)
-			if stagedErr != nil || !sameAssessedSource(assessedVariantSources[srcFile], stagedInfo) {
-				rollback()
-				stageErr = variantSourceChanged("staging did not hardlink assessed source", srcFile, stagedErr)
-			}
-		}
 		if stageErr != nil {
 			slog.Error("failed to stage import", "src", srcFile, "mode", mode, "error", stageErr)
 			failed++
@@ -2721,31 +2663,7 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 			}
 			continue
 		}
-		// A variant torrent is staged as a real hardlink. Promote it with
-		// another link (O_EXCL-like) rather than Rename, which silently
-		// replaces a path created after the preflight above.
-		var commitErr error
-		if variantDownload && mode == "hardlink" {
-			commitErr = osLink(stagedPath, destPath)
-			if commitErr == nil {
-				linked, statErr := os.Lstat(destPath)
-				if statErr != nil || !sameAssessedSource(assessedVariantSources[srcFile], linked) || !os.SameFile(stagedInfo, linked) {
-					// Never remove a destination another writer installed. Only
-					// the link this call created (same staged inode) is ours.
-					currentStage, stageErr := os.Lstat(stagedPath)
-					if linked != nil && (os.SameFile(stagedInfo, linked) || stageErr == nil && os.SameFile(currentStage, linked)) {
-						if removeErr := os.Remove(destPath); removeErr != nil {
-							slog.Warn("variant import: failed to remove unchecked library link", "path", destPath, "error", removeErr)
-						}
-					}
-					commitErr = variantSourceChanged("library link differs from assessed source", srcFile, statErr)
-				} else if err := os.Remove(stagedPath); err != nil {
-					slog.Warn("variant import: staged hardlink could not be removed", "path", stagedPath, "error", err)
-				}
-			}
-		} else {
-			commitErr = commit()
-		}
+		commitErr := commit()
 		if err := commitErr; err != nil {
 			// The DB row exists but the rename failed (e.g. a concurrent
 			// reader holds destPath, or the FS went read-only between
