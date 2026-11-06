@@ -9,6 +9,7 @@ import (
 
 	"github.com/vavallee/bindery/internal/auth"
 	"github.com/vavallee/bindery/internal/db"
+	"github.com/vavallee/bindery/internal/indexer"
 	"github.com/vavallee/bindery/internal/indexer/newznab"
 	"github.com/vavallee/bindery/internal/models"
 )
@@ -20,6 +21,9 @@ import (
 type pendingItem struct {
 	models.PendingRelease
 	Book *bookRef `json:"book,omitempty"`
+	// ReleaseLanguages is read-only evidence from the displayed title, not
+	// from the indexer's language field in the stored release JSON.
+	ReleaseLanguages []string `json:"releaseLanguages"`
 }
 
 // PendingHandler serves the pending releases API.
@@ -56,7 +60,10 @@ func (h *PendingHandler) List(w http.ResponseWriter, r *http.Request) {
 		// copy keeps the key so force-grab can still re-send the signed URL.
 		it.ReleaseJSON = redactReleaseJSON(it.ReleaseJSON)
 		it.GUID = newznab.RedactDownloadURL(it.GUID)
-		out[i] = pendingItem{PendingRelease: it}
+		out[i] = pendingItem{
+			PendingRelease:   it,
+			ReleaseLanguages: append([]string{}, indexer.ReleaseLanguages(it.Title)...),
+		}
 		if it.BookID != 0 {
 			bookIDs = append(bookIDs, it.BookID)
 		}

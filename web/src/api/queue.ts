@@ -104,6 +104,8 @@ export interface PendingRelease {
   id: number
   bookId: number
   title: string
+  // Server-derived title evidence. [] means unknown; absent on older servers.
+  releaseLanguages?: string[]
   mediaType?: 'ebook' | 'audiobook'
   indexerId?: number
   guid: string

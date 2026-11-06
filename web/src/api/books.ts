@@ -123,7 +123,9 @@ export interface SearchResult {
   grabs: number
   pubDate: string
   protocol: string   // "usenet" or "torrent"
-  language?: string  // ISO 639-1 from newznab:attr language (when present)
+  language?: string  // ISO 639-1 from newznab:attr language (when present); not title evidence
+  // Server-derived title evidence. [] means unknown; absent on older servers.
+  releaseLanguages?: string[]
   mediaType?: string // "ebook" or "audiobook"; set for dual-format book searches
   approved?: boolean
   rejection?: string

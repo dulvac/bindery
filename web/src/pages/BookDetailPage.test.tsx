@@ -735,8 +735,8 @@ describe('BookDetailPage — real variant manual actions', () => {
   it('searches and grabs only the selected Romanian ebook, never an English audio result', async () => {
     vi.mocked(api.getBook).mockResolvedValue(makeBook({ title: 'Dune', mediaType: 'both', variants }))
     vi.mocked(api.searchBook).mockResolvedValue({ results: [
-      makeResult({ guid: 'ebook-ro', title: 'Dune [ROM / EPUB]', mediaType: 'ebook' }),
-      makeResult({ guid: 'audio-en', title: 'Dune [ENG / M4B]', mediaType: 'audiobook' }),
+      makeResult({ guid: 'ebook-ro', title: 'Dune [ROM / EPUB]', mediaType: 'ebook', releaseLanguages: ['rum'] }),
+      makeResult({ guid: 'audio-en', title: 'Dune [ENG / M4B]', mediaType: 'audiobook', releaseLanguages: ['eng'] }),
       makeResult({ guid: 'unknown', title: 'Dune.epub', mediaType: 'ebook' }),
     ], debug: null })
     renderBookDetailPage()
@@ -753,7 +753,7 @@ describe('BookDetailPage — real variant manual actions', () => {
 
   it('keeps an unknown format-qualified code eligible and labels it unverified', async () => {
     vi.mocked(api.getBook).mockResolvedValue(makeBook({ variants: [variants[0]] }))
-    vi.mocked(api.searchBook).mockResolvedValue({ results: [makeResult({ guid: 'web', title: 'Dune [WEB / EPUB]', mediaType: 'ebook' })], debug: null })
+    vi.mocked(api.searchBook).mockResolvedValue({ results: [makeResult({ guid: 'web', title: 'Dune [WEB / EPUB]', mediaType: 'ebook', language: 'he', releaseLanguages: [] })], debug: null })
     renderBookDetailPage()
     fireEvent.click(await screen.findByRole('button', { name: /Search ebook indexers/ }))
     const row = (await screen.findByText('Dune [WEB / EPUB]')).closest('div.flex.items-center.justify-between') as HTMLElement
@@ -763,9 +763,47 @@ describe('BookDetailPage — real variant manual actions', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   })
 
+  it('keeps server-known Hebrew out of Romanian results and blocks a non-admin filtered grab', async () => {
+    asAnotherUser()
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({ variants: [variants[0]] }))
+    const he = makeResult({ guid: 'he', title: 'Dune [HE / EPUB]', mediaType: 'ebook', releaseLanguages: ['heb'] })
+    const heb = makeResult({ guid: 'heb', title: 'Dune [HEB / EPUB]', mediaType: 'ebook', releaseLanguages: ['heb'] })
+    vi.mocked(api.searchBook).mockResolvedValue({ results: [he], filtered: [he, heb], debug: null })
+    renderBookDetailPage()
+    fireEvent.click(await screen.findByRole('button', { name: /Search ebook indexers/ }))
+    expect(await screen.findByTestId('filtered-results')).toBeInTheDocument()
+    expect(screen.queryByText('Dune [HE / EPUB]')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /Filtered/ }))
+    for (const title of ['Dune [HE / EPUB]', 'Dune [HEB / EPUB]']) {
+      const row = screen.getByText(title).closest('div.flex.items-center.justify-between') as HTMLElement
+      expect(within(row).queryByText(/Unverified language/)).not.toBeInTheDocument()
+      expect(within(row).getByRole('button', { name: 'Grab' })).toBeDisabled()
+      fireEvent.click(within(row).getByRole('button', { name: 'Grab' }))
+    }
+    expect(api.grab).not.toHaveBeenCalled()
+  })
+
+  it('shows unknown evidence on older search responses and lets the backend reject a mismatch', async () => {
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({ variants: [variants[0]] }))
+    vi.mocked(api.searchBook).mockResolvedValue({ results: [], filtered: [makeResult({
+      guid: 'en-old', title: 'Dune [ENG / EPUB]', mediaType: 'ebook',
+      rejection: 'release language eng does not match requested variant rum',
+    })], debug: null })
+    vi.mocked(api.grab).mockRejectedValue(new Error('release language eng does not match requested variant rum'))
+    renderBookDetailPage()
+    fireEvent.click(await screen.findByRole('button', { name: /Search ebook indexers/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /Filtered/ }))
+    const row = screen.getByText('Dune [ENG / EPUB]').closest('div.flex.items-center.justify-between') as HTMLElement
+    expect(within(row).getByText(/Unverified language/)).toBeInTheDocument()
+    fireEvent.click(within(row).getByRole('button', { name: 'Grab' }))
+    await waitFor(() => expect(api.grab).toHaveBeenCalledWith(expect.objectContaining({ guid: 'en-old', variantId: 17 })))
+    expect(await screen.findByText('release language eng does not match requested variant rum')).toBeInTheDocument()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
   it('accepts a French FRA marker for the requested fre variant without an override', async () => {
     vi.mocked(api.getBook).mockResolvedValue(makeBook({ variants: [{ ...variants[0], id: 33, language: 'fre' }] }))
-    vi.mocked(api.searchBook).mockResolvedValue({ results: [makeResult({ guid: 'fr', title: 'Dune [FRA / EPUB]', mediaType: 'ebook' })], debug: null })
+    vi.mocked(api.searchBook).mockResolvedValue({ results: [makeResult({ guid: 'fr', title: 'Dune [FRA / EPUB]', mediaType: 'ebook', releaseLanguages: ['fre'] })], debug: null })
     renderBookDetailPage()
     fireEvent.click(await screen.findByRole('button', { name: /Search ebook indexers/ }))
     const row = (await screen.findByText('Dune [FRA / EPUB]')).closest('div.flex.items-center.justify-between') as HTMLElement
@@ -812,7 +850,7 @@ describe('BookDetailPage — real variant manual actions', () => {
 
   it('requires an admin reason and confirmation for a known wrong-language filtered release', async () => {
     vi.mocked(api.getBook).mockResolvedValue(makeBook({ variants: [variants[0]] }))
-    vi.mocked(api.searchBook).mockResolvedValue({ results: [], filtered: [makeResult({ guid: 'en', title: 'Dune [ENG / EPUB]', mediaType: 'ebook', rejection: 'release language eng does not match requested variant rum' })], debug: null })
+    vi.mocked(api.searchBook).mockResolvedValue({ results: [], filtered: [makeResult({ guid: 'en', title: 'Dune [ENG / EPUB]', mediaType: 'ebook', rejection: 'release language eng does not match requested variant rum', releaseLanguages: ['eng'] })], debug: null })
     renderBookDetailPage()
     fireEvent.click(await screen.findByRole('button', { name: /Search ebook indexers/ }))
     fireEvent.click(await screen.findByRole('button', { name: /Filtered/ }))

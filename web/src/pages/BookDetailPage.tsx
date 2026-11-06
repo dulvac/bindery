@@ -34,7 +34,7 @@ import CoverImage from '../components/CoverImage'
 import BookLanguages from '../components/BookLanguages'
 import BookVariantStatus from '../components/BookVariantStatus'
 import ChooseBookVariant from '../components/ChooseBookVariant'
-import { matchesVariantFormat, releaseMarkerLanguages, variantLabel, wantedCopies, wrongLanguage } from '../util/bookVariant'
+import { matchesVariantFormat, variantLabel, wantedCopies, wrongLanguage } from '../util/bookVariant'
 import type { BookVariantStatus as BookVariant } from '../api/client'
 import { decodeEntities } from '../util/decodeEntities'
 
@@ -202,7 +202,7 @@ function ReleaseRow({
             </>
           )}
           {r.rejection && <span className="ml-2 text-amber-600 dark:text-amber-400">· {r.rejection}</span>}
-          {variant && releaseMarkerLanguages(r.title).length === 0 && <span className="ml-2 text-amber-600 dark:text-amber-400">· {t('variants.unverified', 'Unverified language')}</span>}
+          {variant && !r.releaseLanguages?.length && <span className="ml-2 text-amber-600 dark:text-amber-400">· {t('variants.unverified', 'Unverified language')}</span>}
         </span>
       </div>
       <button

@@ -29,6 +29,12 @@ vi.mock('../api/client', async importOriginal => {
   }
 })
 
+const authState = { isAdmin: true }
+vi.mock('../auth/AuthContext', async importOriginal => ({
+  ...await importOriginal<typeof import('../auth/AuthContext')>(),
+  useIsAdmin: () => authState.isAdmin,
+}))
+
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, options?: Record<string, unknown>) => {
@@ -92,7 +98,9 @@ vi.mock('react-i18next', () => ({
         'variants.pendingCost': 'This release may cost ratio. No wedges or bonus points are spent automatically.',
         'variants.stale': 'This copy is no longer wanted. Refresh and search again.',
         'variants.unverified': 'Unverified language',
+        'variants.adminOnly': 'Only an admin can approve a wrong-language release.',
         'variants.optionalOverrideReason': 'Optional admin reason for language override',
+        'variants.overrideReason': 'Reason for language override',
         'variants.inconclusiveReasonHint': 'If you verified a different language, enter an admin reason. Leave blank for unknown language; the server makes the final decision.',
         'queue.importRequeued': 'Queued for another import attempt — the scanner picks it up on its next check.',
         'common.dismiss': 'Dismiss',
@@ -191,13 +199,14 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  authState.isAdmin = true
   vi.useRealTimers()
 })
 
 describe('QueuePage — pending variant safety', () => {
   const real = { id: 27, mediaType: 'ebook' as const, language: 'rum', status: 'wanted', verification: '' }
   const book = { id: 42, title: 'Dune', mediaType: 'both', variants: [real, { id: 28, mediaType: 'audiobook', language: 'eng', status: 'wanted', verification: '' }] } as Book
-  const pending = makePendingRelease({ mediaType: 'ebook', title: 'Dune [ROM / EPUB]', reason: 'Delayed for ratio' })
+  const pending = makePendingRelease({ mediaType: 'ebook', title: 'Dune [ROM / EPUB]', releaseLanguages: ['rum'], reason: 'Delayed for ratio' })
 
   it('waits for explicit ratio confirmation and sends the selected real wanted variant', async () => {
     vi.mocked(api.listPending).mockResolvedValue([pending])
@@ -216,7 +225,7 @@ describe('QueuePage — pending variant safety', () => {
   })
 
   it('treats an unknown format-qualified code as unverified, not wrong-language', async () => {
-    vi.mocked(api.listPending).mockResolvedValue([{ ...pending, title: 'Dune [WEB / EPUB]' }])
+    vi.mocked(api.listPending).mockResolvedValue([{ ...pending, title: 'Dune [WEB / EPUB]', releaseJson: '{"language":"he"}', releaseLanguages: [] }])
     vi.mocked(api.getBook).mockResolvedValue(book)
     renderQueuePage()
     fireEvent.click(await screen.findByRole('button', { name: 'Grab Now' }))
@@ -227,23 +236,51 @@ describe('QueuePage — pending variant safety', () => {
     await waitFor(() => expect(api.grabPending).toHaveBeenCalledWith(10, { variantId: 27 }))
   })
 
-  it('lets an admin provide an optional reason when a known server mismatch has no bracket marker', async () => {
-    vi.mocked(api.listPending).mockResolvedValue([{ ...pending, title: 'Dune FRENCH.epub' }])
+  it('requires an admin reason and ratio acknowledgement for server-known French without a bracket marker', async () => {
+    vi.mocked(api.listPending).mockResolvedValue([{ ...pending, title: 'Dune FRENCH.epub', releaseJson: '{"language":"ro"}', releaseLanguages: ['fre'] }])
+    vi.mocked(api.getBook).mockResolvedValue(book)
+    renderQueuePage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Grab Now' }))
+    const dialog = await screen.findByRole('dialog')
+    expect(dialog).not.toHaveTextContent('Unverified language')
+    expect(within(dialog).getByRole('textbox', { name: 'Reason for language override' })).toBeInTheDocument()
+    expect(api.grabPending).not.toHaveBeenCalled()
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: /cost ratio/ }))
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm grab' }))
+    expect(api.grabPending).not.toHaveBeenCalled()
+    fireEvent.click(await screen.findByRole('button', { name: 'Grab Now' }))
+    const retryDialog = await screen.findByRole('dialog')
+    fireEvent.change(within(retryDialog).getByRole('textbox', { name: 'Reason for language override' }), {
+      target: { value: 'I verified this release is a bilingual Romanian edition' },
+    })
+    fireEvent.click(within(retryDialog).getByRole('checkbox', { name: /cost ratio/ }))
+    fireEvent.click(within(retryDialog).getByRole('button', { name: 'Confirm grab' }))
+    await waitFor(() => expect(api.grabPending).toHaveBeenCalledWith(10, {
+      variantId: 27,
+      languageOverrideReason: 'I verified this release is a bilingual Romanian edition',
+    }))
+  })
+
+  it('does not send a server-known French pending release for Romanian to a non-admin', async () => {
+    authState.isAdmin = false
+    vi.mocked(api.listPending).mockResolvedValue([{ ...pending, title: 'Dune FRENCH.epub', releaseLanguages: ['fre'] }])
+    vi.mocked(api.getBook).mockResolvedValue(book)
+    renderQueuePage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Grab Now' }))
+    expect(await screen.findByText('Only an admin can approve a wrong-language release.')).toBeInTheDocument()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(api.grabPending).not.toHaveBeenCalled()
+  })
+
+  it('shows unknown for an older Pending response with no releaseLanguages field', async () => {
+    vi.mocked(api.listPending).mockResolvedValue([{ ...pending, title: 'Dune FRENCH.epub', releaseLanguages: undefined }])
     vi.mocked(api.getBook).mockResolvedValue(book)
     renderQueuePage()
     fireEvent.click(await screen.findByRole('button', { name: 'Grab Now' }))
     const dialog = await screen.findByRole('dialog')
     expect(dialog).toHaveTextContent('Unverified language')
-    fireEvent.change(within(dialog).getByRole('textbox', { name: 'Optional admin reason for language override' }), {
-      target: { value: 'I verified this release is a bilingual Romanian edition' },
-    })
+    expect(within(dialog).getByRole('textbox', { name: 'Optional admin reason for language override' })).toBeInTheDocument()
     expect(api.grabPending).not.toHaveBeenCalled()
-    fireEvent.click(within(dialog).getByRole('checkbox', { name: /cost ratio/ }))
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm grab' }))
-    await waitFor(() => expect(api.grabPending).toHaveBeenCalledWith(10, {
-      variantId: 27,
-      languageOverrideReason: 'I verified this release is a bilingual Romanian edition',
-    }))
   })
 
   it('requires an explicit choice when two ebook languages are wanted for one pending release', async () => {

@@ -24,6 +24,12 @@ vi.mock('../api/client', async importOriginal => {
   }
 })
 
+const authState = { isAdmin: true }
+vi.mock('../auth/AuthContext', async importOriginal => ({
+  ...await importOriginal<typeof import('../auth/AuthContext')>(),
+  useIsAdmin: () => authState.isAdmin,
+}))
+
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, options?: Record<string, unknown>) => {
@@ -200,6 +206,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  authState.isAdmin = true
   vi.useRealTimers()
 })
 
@@ -287,6 +294,40 @@ describe('WantedPage — bound manual grabs', () => {
     expect(screen.getByText('Unverified language')).toBeInTheDocument()
     expect(screen.queryByText('Dune [ENG / M4B]')).not.toBeInTheDocument()
     expect(api.searchBook).toHaveBeenCalledWith(1, { mediaType: 'ebook', language: 'rum' })
+  })
+
+  it('hides server-known Hebrew results and refuses a non-admin filtered grab', async () => {
+    authState.isAdmin = false
+    const variants = [{ id: 25, mediaType: 'ebook' as const, language: 'rum', status: 'wanted', verification: '' }]
+    const book = makeBook({ id: 1, title: 'Dune', variants })
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([book]))
+    vi.mocked(api.getBook).mockResolvedValue(book)
+    const he = makeResult({ guid: 'he', title: 'Dune [HE / EPUB]', mediaType: 'ebook', releaseLanguages: ['heb'] })
+    vi.mocked(api.searchBook).mockResolvedValue({ results: [he], filtered: [he], filteredTotal: 1, debug: null })
+    renderWantedPage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Search' }))
+    expect(await screen.findByText('None matched, 1 filtered.')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /Filtered/ }))
+    const row = screen.getByText('Dune [HE / EPUB]').closest('div.flex.items-center.justify-between') as HTMLElement
+    expect(within(row).queryByText('Unverified language')).not.toBeInTheDocument()
+    expect(within(row).getByRole('button', { name: 'Grab' })).toBeDisabled()
+    fireEvent.click(within(row).getByRole('button', { name: 'Grab' }))
+    expect(api.grab).not.toHaveBeenCalled()
+  })
+
+  it('treats a server-unknown WEB tag as unverified even when the indexer claims Hebrew', async () => {
+    authState.isAdmin = false
+    const variants = [{ id: 25, mediaType: 'ebook' as const, language: 'rum', status: 'wanted', verification: '' }]
+    const book = makeBook({ id: 1, title: 'Dune', variants })
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([book]))
+    vi.mocked(api.getBook).mockResolvedValue(book)
+    vi.mocked(api.searchBook).mockResolvedValue({ results: [makeResult({ guid: 'web', title: 'Dune [WEB / EPUB]', mediaType: 'ebook', language: 'he', releaseLanguages: [] })], debug: null })
+    renderWantedPage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Search' }))
+    const row = (await screen.findByText('Dune [WEB / EPUB]')).closest('div.flex.items-center.justify-between') as HTMLElement
+    expect(within(row).getByText('Unverified language')).toBeInTheDocument()
+    fireEvent.click(within(row).getByRole('button', { name: 'Grab' }))
+    await waitFor(() => expect(api.grab).toHaveBeenCalledWith(expect.objectContaining({ guid: 'web', variantId: 25 })))
   })
 
   it('leaves an unknown three-letter marker available as unverified, without an override', async () => {

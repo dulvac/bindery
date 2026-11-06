@@ -1,6 +1,6 @@
 import type { TFunction } from 'i18next'
 import type { Book, BookVariantStatus, SearchResult } from '../api/client'
-import { canonicalLanguage, languageName } from './language'
+import { languageName } from './language'
 
 // The Wanted list includes negative, display-only IDs for pending requests.
 // Only the single-book detail response supplies IDs suitable for actions.
@@ -18,28 +18,11 @@ export function variantLabel(v: BookVariantStatus, t: TFunction): string {
   return `${format} · ${language}`
 }
 
-// The server owns the full release-language parser and makes the final grab
-// decision. These MAM markers give the browser a conservative warning before
-// asking a named admin for the override; a blank tag is never called English.
-const mamMarker = /\[([a-z]{2,3})\s*\/\s*(?:EPUB|AZW3|MOBI|PDF|M4B|MP3|FLAC)\]/gi
-// A conservative subset of the server's known language codes. Unrecognized
-// bracket text (for example WEB, a release source) is not language evidence.
-const knownMarkerCodes = new Set([
-  'eng', 'fre', 'ger', 'dut', 'spa', 'ita', 'por', 'jpn', 'chi', 'rus',
-  'kor', 'ara', 'swe', 'nor', 'dan', 'pol', 'cze', 'tur', 'hin', 'rum',
-])
-export function releaseMarkerLanguages(title: string): string[] {
-  const codes = [...title.matchAll(mamMarker)].map(m => {
-    const code = m[1].toLowerCase()
-    return canonicalLanguage(['rom', 'ron', 'ro'].includes(code) ? 'rum' : code)
-  }).filter(code => knownMarkerCodes.has(code))
-  return [...new Set(codes)]
-}
-
+// Only the server's title parser can classify a release. Absent evidence from
+// an older server is unknown, even when its indexer supplies a language attr.
 export function wrongLanguage(r: SearchResult, variant: BookVariantStatus): boolean {
-  const codes = releaseMarkerLanguages(r.title)
-  return (codes.length > 0 && (codes.length !== 1 || codes[0] !== variant.language))
-    || /release languages? .*(?:variant|requested variant)/i.test(r.rejection ?? '')
+  const codes = r.releaseLanguages ?? []
+  return codes.length > 0 && (codes.length !== 1 || codes[0] !== variant.language)
 }
 
 export function matchesVariantFormat(r: SearchResult, variant: BookVariantStatus, dualFormat: boolean): boolean {

@@ -5,7 +5,7 @@ import { useConfirmDialog } from '../components/useConfirmDialog'
 import { api, Book, PendingRelease, QueueItem } from '../api/client'
 import { useIsAdmin } from '../auth/AuthContext'
 import ChooseBookVariant from '../components/ChooseBookVariant'
-import { releaseMarkerLanguages, variantLabel, wantedCopies } from '../util/bookVariant'
+import { variantLabel, wantedCopies } from '../util/bookVariant'
 import BookAuthorLink from '../components/BookAuthorLink'
 import ImportHints from '../components/ImportHints'
 import Pagination from '../components/Pagination'
@@ -202,7 +202,7 @@ export default function QueuePage() {
         load()
         return
       }
-      const codes = releaseMarkerLanguages(item.title)
+      const codes = item.releaseLanguages ?? []
       const mismatch = selected && codes.length > 0 && (codes.length !== 1 || codes[0] !== selected.language)
       if (mismatch && !isAdmin) {
         setPendingError(prev => ({ ...prev, [item.id]: t('variants.adminOnly', 'Only an admin can approve a wrong-language release.') }))

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"testing"
 
@@ -160,6 +161,57 @@ func TestPendingList_EnrichesBookAndAuthor(t *testing.T) {
 	}
 	if alice.Book.Title != "Alice Book" || alice.Book.AuthorID == 0 || alice.Book.AuthorName != "Aa" {
 		t.Errorf("unexpected book ref: %+v", alice.Book)
+	}
+}
+
+// Pending exposes the same parser evidence as book search, scoped to the
+// caller. The release blob's indexer language cannot turn an unknown title
+// into a known language, even when it claims one.
+func TestPendingListReturnsCanonicalReleaseLanguages(t *testing.T) {
+	auth.SetEnforceTenancyForTests(t, true)
+	h, database, alice, bob, idA, idB := seedTwoUserPending(t)
+	for _, row := range []struct {
+		id    int64
+		title string
+		attr  string
+	}{
+		{idA, "Dune FRENCH.epub", "en"},
+		{idB, "Dune [WEB / EPUB]", "he"},
+	} {
+		blob, err := json.Marshal(map[string]string{"title": row.title, "language": row.attr})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.Exec("UPDATE pending_releases SET title=?, release_json=? WHERE id=?", row.title, string(blob), row.id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	list := func(user int64) []struct {
+		ID               int64    `json:"id"`
+		Title            string   `json:"title"`
+		ReleaseLanguages []string `json:"releaseLanguages"`
+	} {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.List(rec, asRole(httptest.NewRequest(http.MethodGet, "/api/v1/pending", nil), user, auth.RoleUser))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("list = %d: %s", rec.Code, rec.Body.String())
+		}
+		var out []struct {
+			ID               int64    `json:"id"`
+			Title            string   `json:"title"`
+			ReleaseLanguages []string `json:"releaseLanguages"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	if got := list(alice); len(got) != 1 || got[0].ID != idA || got[0].Title != "Dune FRENCH.epub" || !slices.Equal(got[0].ReleaseLanguages, []string{"fre"}) {
+		t.Errorf("French pending = %+v; want title-derived fre only for owner", got)
+	}
+	if got := list(bob); len(got) != 1 || got[0].ID != idB || got[0].Title != "Dune [WEB / EPUB]" || got[0].ReleaseLanguages == nil || len(got[0].ReleaseLanguages) != 0 {
+		t.Errorf("WEB pending = %+v; want title-derived [] not indexer he", got)
 	}
 }
 

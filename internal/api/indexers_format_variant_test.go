@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"testing"
 
@@ -12,6 +13,49 @@ import (
 	"github.com/vavallee/bindery/internal/indexer/newznab"
 	"github.com/vavallee/bindery/internal/models"
 )
+
+// The wire evidence comes from the server's title parser for both normal and
+// filtered releases. An indexer-supplied language alone is not proof.
+func TestInteractiveSearchReturnsCanonicalReleaseLanguages(t *testing.T) {
+	f := newGrabSecFixture(t)
+	book := regrabOwnedBook(t, f.database, f.books, "canonical-release-languages", f.bob)
+	if _, err := f.books.VariantRepo().EnsureWanted(f.ctx, book.ID, models.MediaTypeEbook, []string{"rum"}); err != nil {
+		t.Fatal(err)
+	}
+	s := &mockIndexerSearcher{ebookResults: []newznab.SearchResult{
+		{GUID: "he", Title: "Dune [HE / EPUB]", Language: "ro"},
+		{GUID: "heb", Title: "Dune [HEB / EPUB]"},
+		{GUID: "web", Title: "Dune [WEB / EPUB]", Language: "he"},
+		{GUID: "rom", Title: "Dune [ROM / EPUB]"},
+	}}
+	h := NewIndexerHandler(db.NewIndexerRepo(f.database), f.books, db.NewAuthorRepo(f.database), nil, s, db.NewSettingsRepo(f.database), db.NewBlocklistRepo(f.database))
+	rec := httptest.NewRecorder()
+	req := withURLParam(httptest.NewRequest(http.MethodPost, "/book/1/search?mediaType=ebook&language=rum", nil), "id", strconv.FormatInt(book.ID, 10))
+	h.SearchBook(rec, asRole(req, f.bob, auth.RoleUser))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("search = %d: %s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Results, Filtered []struct {
+			GUID             string   `json:"guid"`
+			Language         string   `json:"language"`
+			ReleaseLanguages []string `json:"releaseLanguages"`
+		}
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 2 || response.Results[0].GUID != "rom" || response.Results[1].GUID != "web" ||
+		!slices.Equal(response.Results[0].ReleaseLanguages, []string{"rum"}) ||
+		response.Results[1].ReleaseLanguages == nil || len(response.Results[1].ReleaseLanguages) != 0 || response.Results[1].Language != "" {
+		t.Errorf("results = %+v; want unknown WEB [] (not indexer he) and known Romanian", response.Results)
+	}
+	if len(response.Filtered) != 2 || response.Filtered[0].GUID != "he" || response.Filtered[1].GUID != "heb" ||
+		!slices.Equal(response.Filtered[0].ReleaseLanguages, []string{"heb"}) ||
+		!slices.Equal(response.Filtered[1].ReleaseLanguages, []string{"heb"}) {
+		t.Errorf("filtered = %+v; want server-known HE/HEB both tagged heb", response.Filtered)
+	}
+}
 
 func TestInteractiveSearchFormatAndLanguageStayOnOneWantedVariant(t *testing.T) {
 	f := newGrabSecFixture(t)

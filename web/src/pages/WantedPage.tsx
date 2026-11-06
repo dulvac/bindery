@@ -5,7 +5,7 @@ import { api, Book, SearchResult } from '../api/client'
 import type { BookVariantStatus } from '../api/client'
 import { useIsAdmin } from '../auth/AuthContext'
 import ChooseBookVariant from '../components/ChooseBookVariant'
-import { matchesVariantFormat, releaseMarkerLanguages, wantedCopies, wrongLanguage } from '../util/bookVariant'
+import { matchesVariantFormat, wantedCopies, wrongLanguage } from '../util/bookVariant'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { grabWithForceConfirm } from '../util/forceGrab'
 import BulkActionBar from '../components/BulkActionBar'
@@ -617,7 +617,7 @@ export default function WantedPage() {
                             {r.language && !searchedVariant && (
                               <span className="ml-1.5 inline-block px-1 py-0 rounded bg-slate-300 dark:bg-zinc-700 text-[9px] font-medium uppercase tracking-wide">{r.language}</span>
                             )}
-                            {searchedVariant && releaseMarkerLanguages(r.title).length === 0 && <span className="ml-2 text-amber-600">{t('variants.unverified', 'Unverified language')}</span>}
+                            {searchedVariant && !r.releaseLanguages?.length && <span className="ml-2 text-amber-600">{t('variants.unverified', 'Unverified language')}</span>}
                           </span>
                         </div>
                         <button

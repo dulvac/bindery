@@ -996,9 +996,10 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 		// search result registry.
 		redactSearchResult(&res)
 		out[i] = searchDecision{
-			SearchResult: res,
-			Approved:     d.Approved,
-			Rejection:    d.Rejection,
+			SearchResult:     res,
+			ReleaseLanguages: append([]string{}, indexer.ReleaseLanguages(res.Title)...),
+			Approved:         d.Approved,
+			Rejection:        d.Rejection,
 		}
 		if !d.Approved && dbg != nil {
 			dbg.Filters = append(dbg.Filters, indexer.FilterDebug{
@@ -1020,7 +1021,12 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 		rawFiltered[i] = f.Result
 		res := f.Result
 		redactSearchResult(&res)
-		filteredOut[i] = searchDecision{SearchResult: res, Approved: false, Rejection: f.Reason}
+		filteredOut[i] = searchDecision{
+			SearchResult:     res,
+			ReleaseLanguages: append([]string{}, indexer.ReleaseLanguages(res.Title)...),
+			Approved:         false,
+			Rejection:        f.Reason,
+		}
 	}
 	h.searchResults.remember(rawFiltered)
 
@@ -1055,8 +1061,11 @@ func (h *IndexerHandler) SearchBook(w http.ResponseWriter, r *http.Request) {
 // result plus the verdict on it.
 type searchDecision struct {
 	newznab.SearchResult
-	Approved  bool   `json:"approved"`
-	Rejection string `json:"rejection,omitempty"`
+	// ReleaseLanguages is read-only title evidence, never the indexer language attribute.
+	// [] means no known marker; the client may show it as unverified.
+	ReleaseLanguages []string `json:"releaseLanguages"`
+	Approved         bool     `json:"approved"`
+	Rejection        string   `json:"rejection,omitempty"`
 }
 
 // maxFilteredReleases bounds the "filtered" array of one interactive search,
