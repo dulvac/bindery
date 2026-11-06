@@ -207,22 +207,49 @@ func (r *BookFileRepo) TrackVariant(ctx context.Context, bookID, variantID int64
 	return r.TrackVariantChecked(ctx, bookID, variantID, format, path, language, verification, nil, VariantReviewApproval{})
 }
 
-// TrackVariantChecked runs the caller's filesystem ownership check inside the
-// transaction, immediately before commit. Bindery must be the only library
-// writer during import; SQLite cannot make a same-UID filesystem replacement
-// atomic with its commit without a separate filesystem access-control gate.
+// VariantFileClaim keeps each placed file's own language and verification
+// evidence, even when several files belong to the same requested variant.
+type VariantFileClaim struct {
+	VariantID              int64
+	Format, Path           string
+	Language, Verification string
+	Approval               VariantReviewApproval
+}
+
+// TrackVariantChecked retains the single-file API for existing callers.
 func (r *BookFileRepo) TrackVariantChecked(ctx context.Context, bookID, variantID int64, format, path, language, verification string, validate func() error, approval VariantReviewApproval) error {
-	if bookID <= 0 || variantID <= 0 || !filepath.IsAbs(path) || filepath.Clean(path) != path || path == string(filepath.Separator) {
-		return fmt.Errorf("invalid variant book, variant or path %q", path)
+	return r.TrackVariantFilesChecked(ctx, bookID, []VariantFileClaim{{
+		VariantID: variantID, Format: format, Path: path, Language: language, Verification: verification, Approval: approval,
+	}}, validate)
+}
+
+// TrackVariantFilesChecked commits every file claim and variant status as one
+// batch. The caller's check revalidates all public paths and original sources
+// after the SQL writes and immediately before commit. Bindery must be the only
+// library writer during import: SQLite cannot make a filesystem replacement
+// atomic with its commit without a separate filesystem access-control gate.
+func (r *BookFileRepo) TrackVariantFilesChecked(ctx context.Context, bookID int64, claims []VariantFileClaim, validate func() error) error {
+	if bookID <= 0 || len(claims) == 0 {
+		return fmt.Errorf("variant batch needs a book and at least one file")
 	}
-	if format != models.MediaTypeEbook && format != models.MediaTypeAudiobook || models.BookFileFormatFor(path, format) != format {
-		return fmt.Errorf("invalid variant file format %q for %q", format, path)
-	}
-	if verification != "verified" && verification != "unverified" {
-		return fmt.Errorf("invalid file verification %q", verification)
-	}
-	if language != "" && language != "eng" && language != "rum" && language != "fre" || verification == "verified" && language == "" {
-		return fmt.Errorf("invalid file language %q for %q verification", language, verification)
+	seenPaths := make(map[string]bool, len(claims))
+	for _, claim := range claims {
+		if claim.VariantID <= 0 || !filepath.IsAbs(claim.Path) || filepath.Clean(claim.Path) != claim.Path ||
+			claim.Path == string(filepath.Separator) || seenPaths[claim.Path] {
+			return fmt.Errorf("invalid or duplicate variant path %q", claim.Path)
+		}
+		seenPaths[claim.Path] = true
+		if claim.Format != models.MediaTypeEbook && claim.Format != models.MediaTypeAudiobook ||
+			models.BookFileFormatFor(claim.Path, claim.Format) != claim.Format {
+			return fmt.Errorf("invalid variant file format %q for %q", claim.Format, claim.Path)
+		}
+		if claim.Verification != "verified" && claim.Verification != "unverified" {
+			return fmt.Errorf("invalid file verification %q", claim.Verification)
+		}
+		if claim.Language != "" && claim.Language != "eng" && claim.Language != "rum" && claim.Language != "fre" ||
+			claim.Verification == "verified" && claim.Language == "" {
+			return fmt.Errorf("invalid file language %q for %q verification", claim.Language, claim.Verification)
+		}
 	}
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -230,53 +257,73 @@ func (r *BookFileRepo) TrackVariantChecked(ctx context.Context, bookID, variantI
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var variantBookID int64
-	var variantFormat, variantLanguage, status string
-	if err := tx.QueryRowContext(ctx, `SELECT book_id, media_type, language, status FROM book_variants WHERE id = ?`, variantID).
-		Scan(&variantBookID, &variantFormat, &variantLanguage, &status); err != nil {
-		return fmt.Errorf("book_files variant lookup: %w", err)
+	type variantState struct {
+		status   string
+		approval VariantReviewApproval
 	}
-	if variantBookID != bookID || variantFormat != format || verification == "verified" && language != variantLanguage ||
-		approval.ExpectedStatus != "" && status != approval.ExpectedStatus {
-		return fmt.Errorf("book_files variant %d does not match book, format, verified language or expected status", variantID)
-	}
-	if status == models.VariantReview {
-		if err := validateVariantReviewApproval(ctx, tx, bookID, variantID, approval); err != nil {
-			return fmt.Errorf("book_files variant %d remains in review: %w", variantID, err)
+	states := make(map[int64]variantState, len(claims))
+	variantIDs := make([]int64, 0, len(claims))
+	for _, claim := range claims {
+		var variantBookID int64
+		var variantFormat, variantLanguage, status string
+		if err := tx.QueryRowContext(ctx, `SELECT book_id, media_type, language, status FROM book_variants WHERE id = ?`, claim.VariantID).
+			Scan(&variantBookID, &variantFormat, &variantLanguage, &status); err != nil {
+			return fmt.Errorf("book_files variant lookup: %w", err)
+		}
+		if variantBookID != bookID || variantFormat != claim.Format ||
+			claim.Verification == "verified" && claim.Language != variantLanguage ||
+			claim.Approval.ExpectedStatus != "" && status != claim.Approval.ExpectedStatus {
+			return fmt.Errorf("book_files variant %d does not match book, format, verified language or expected status", claim.VariantID)
+		}
+		if prior, ok := states[claim.VariantID]; ok {
+			if prior.status != status || prior.approval != claim.Approval {
+				return fmt.Errorf("book_files variant %d has inconsistent batch approval", claim.VariantID)
+			}
+		} else {
+			if status == models.VariantReview {
+				if err := validateVariantReviewApproval(ctx, tx, bookID, claim.VariantID, claim.Approval); err != nil {
+					return fmt.Errorf("book_files variant %d remains in review: %w", claim.VariantID, err)
+				}
+			}
+			states[claim.VariantID] = variantState{status, claim.Approval}
+			variantIDs = append(variantIDs, claim.VariantID)
+		}
+
+		var owner, existingVariant sql.NullInt64
+		var ownerTitle, existingLanguage, existingVerification sql.NullString
+		var existingFormat string
+		err = tx.QueryRowContext(ctx, `SELECT f.book_id, b.title, f.variant_id, f.language, f.verification, f.format
+			FROM book_files f LEFT JOIN books b ON b.id = f.book_id WHERE f.path = ?`, claim.Path).
+			Scan(&owner, &ownerTitle, &existingVariant, &existingLanguage, &existingVerification, &existingFormat)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			if _, err := tx.ExecContext(ctx, `INSERT INTO book_files
+				(book_id, format, path, size_bytes, created_at, variant_id, language, verification)
+				VALUES (?, ?, ?, 0, ?, ?, ?, ?)`, bookID, claim.Format, claim.Path, time.Now().UTC(), claim.VariantID, claim.Language, claim.Verification); err != nil {
+				return fmt.Errorf("book_files track variant insert: %w", err)
+			}
+		case err != nil:
+			return fmt.Errorf("book_files track variant path lookup: %w", err)
+		case owner.Int64 != bookID:
+			return &PathOwnedError{Path: claim.Path, OwnerBookID: owner.Int64, OwnerTitle: ownerTitle.String}
+		case existingVariant.Valid && existingVariant.Int64 == claim.VariantID && existingFormat == claim.Format &&
+			existingLanguage.String == claim.Language && existingVerification.String == claim.Verification:
+			// The already-tracked file keeps its evidence on an exact retry.
+		default:
+			return fmt.Errorf("book_files path %q already has a different or legacy claim", claim.Path)
 		}
 	}
 
-	var owner, existingVariant sql.NullInt64
-	var ownerTitle, existingLanguage, existingVerification sql.NullString
-	var existingFormat string
-	err = tx.QueryRowContext(ctx, `SELECT f.book_id, b.title, f.variant_id, f.language, f.verification, f.format
-		FROM book_files f LEFT JOIN books b ON b.id = f.book_id WHERE f.path = ?`, path).
-		Scan(&owner, &ownerTitle, &existingVariant, &existingLanguage, &existingVerification, &existingFormat)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		if _, err := tx.ExecContext(ctx, `INSERT INTO book_files
-			(book_id, format, path, size_bytes, created_at, variant_id, language, verification)
-			VALUES (?, ?, ?, 0, ?, ?, ?, ?)`, bookID, format, path, time.Now().UTC(), variantID, language, verification); err != nil {
-			return fmt.Errorf("book_files track variant insert: %w", err)
+	for _, variantID := range variantIDs {
+		updated, err := tx.ExecContext(ctx, `UPDATE book_variants SET status = 'imported' WHERE id = ? AND status = ?`, variantID, states[variantID].status)
+		if err != nil {
+			return fmt.Errorf("book_files mark variant imported: %w", err)
 		}
-	case err != nil:
-		return fmt.Errorf("book_files track variant path lookup: %w", err)
-	case owner.Int64 != bookID:
-		return &PathOwnedError{Path: path, OwnerBookID: owner.Int64, OwnerTitle: ownerTitle.String}
-	case existingVariant.Valid && existingVariant.Int64 == variantID && existingFormat == format && existingLanguage.String == language && existingVerification.String == verification:
-		// Idempotent retry: the already-tracked file keeps its metadata.
-	default:
-		return fmt.Errorf("book_files path %q already has a different or legacy claim", path)
+		if count, err := updated.RowsAffected(); err != nil || count != 1 {
+			return fmt.Errorf("book_files variant status changed before import: %v", err)
+		}
 	}
-
-	updated, err := tx.ExecContext(ctx, `UPDATE book_variants SET status = 'imported' WHERE id = ? AND status = ?`, variantID, status)
-	if err != nil {
-		return fmt.Errorf("book_files mark variant imported: %w", err)
-	}
-	if count, err := updated.RowsAffected(); err != nil || count != 1 {
-		return fmt.Errorf("book_files variant status changed before import: %v", err)
-	}
-	// Keep the old book-level status and paths in sync with the same commit.
+	// Refresh the compatibility columns only after all file claims are present.
 	if err := NewBookRepo(r.db).WithTx(tx).refreshBookStatus(ctx, bookID); err != nil {
 		return fmt.Errorf("book_files refresh variant book: %w", err)
 	}

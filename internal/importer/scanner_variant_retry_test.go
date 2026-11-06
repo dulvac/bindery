@@ -251,6 +251,150 @@ func TestVariantRetry_TrackedLinkBeforeDownloadStatusIsIdempotent(t *testing.T) 
 	}
 }
 
+// A Kindle bundle exercises two distinct public paths for the same requested
+// variant. Neither file has reliable text-language evidence, so each row must
+// retain its own unknown/unverified evidence instead of inheriting the release
+// marker's English label.
+func variantTwoKindleFiles(t *testing.T) (*variantReviewFixture, *models.Download, []string) {
+	t.Helper()
+	f := newVariantReviewFixture(t, "English catalogue label", "Sample Author", models.MediaTypeEbook, "eng")
+	files := []string{
+		filepath.Join(f.sources, "English catalogue label.mobi"),
+		filepath.Join(f.sources, "English catalogue label.azw3"),
+	}
+	for i, path := range files {
+		if err := os.WriteFile(path, bookSized([]string{"first seeded ebook", "second seeded ebook"}[i]), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return f, f.addDownload(t, "English catalogue label [ENG / MOBI]"), files
+}
+
+func importTwoKindleFiles(t *testing.T, f *variantReviewFixture, dl *models.Download, files []string) {
+	t.Helper()
+	f.scanner.tryImportInternal(f.ctx, dl, f.sources, "qbittorrent", "test-hash", "", func() error { t.Fatal("variant import called torrent cleanup"); return nil }, files)
+}
+
+func twoKindleVariantStatus(t *testing.T, f *variantReviewFixture) string {
+	t.Helper()
+	rows, err := f.books.VariantRepo().ListByBook(f.ctx, f.book.ID)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("load Kindle variant: %+v %v", rows, err)
+	}
+	return rows[0].Status
+}
+
+func TestVariantRetry_TwoFilesForSameVariantAreTrackedTogether(t *testing.T) {
+	f, dl, files := variantTwoKindleFiles(t)
+	before := make([]os.FileInfo, len(files))
+	for i, source := range files {
+		var err error
+		before[i], err = os.Lstat(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	importTwoKindleFiles(t, f, dl, files)
+	variantImportedDownload(t, f, dl.ID)
+	rows := variantImportedFiles(t, f, 2)
+	for i, source := range files {
+		path := variantEbookTarget(t, f, source)
+		var found bool
+		for _, row := range rows {
+			if row.Path != path {
+				continue
+			}
+			found = true
+			if row.VariantID == nil || *row.VariantID != f.variant.ID || row.Language != "" || row.Verification != "unverified" {
+				t.Fatalf("wrong variant or invented evidence for %q: %+v", source, row)
+			}
+		}
+		if !found {
+			t.Fatalf("missing tracked %q: %+v", path, rows)
+		}
+		linked, linkErr := os.Lstat(path)
+		seeded, seedErr := os.Lstat(source)
+		if linkErr != nil || seedErr != nil || !os.SameFile(before[i], linked) || !os.SameFile(before[i], seeded) ||
+			before[i].Size() != seeded.Size() || !before[i].ModTime().Equal(seeded.ModTime()) {
+			t.Fatalf("public hardlink or seeded source changed for %s: %v %v", source, linkErr, seedErr)
+		}
+	}
+	if got := twoKindleVariantStatus(t, f); got != models.VariantImported {
+		t.Fatalf("bundle status = %q, want imported", got)
+	}
+}
+
+func TestVariantRetry_SecondFileDBFailureRollsBackWholeBundle(t *testing.T) {
+	f, dl, files := variantTwoKindleFiles(t)
+	if _, err := f.database.ExecContext(f.ctx, `CREATE TRIGGER refuse_second_variant_file BEFORE INSERT ON book_files
+		WHEN NEW.path LIKE '%.azw3' BEGIN SELECT RAISE(ABORT, 'second bundle file rejected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	importTwoKindleFiles(t, f, dl, files)
+	variantBlocked(t, f, dl, "stranded")
+	variantBlocked(t, f, dl, "second bundle file rejected")
+	variantImportedFiles(t, f, 0)
+	if got := twoKindleVariantStatus(t, f); got != models.VariantWanted {
+		t.Fatalf("partially committed variant status = %q", got)
+	}
+	for _, source := range files {
+		public := variantEbookTarget(t, f, source)
+		linked, linkErr := os.Lstat(public)
+		seeded, seedErr := os.Lstat(source)
+		if linkErr != nil || seedErr != nil || !os.SameFile(linked, seeded) {
+			t.Fatalf("DB failure deleted verified public link or seeded source %s: %v %v", public, linkErr, seedErr)
+		}
+	}
+	// These links are public but untracked. An operator must reconcile them;
+	// retry must neither adopt an unverified path nor unlink either entry.
+	if _, err := f.database.ExecContext(f.ctx, `DROP TRIGGER refuse_second_variant_file`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.database.ExecContext(f.ctx, `UPDATE downloads SET status='completed' WHERE id=?`, dl.ID); err != nil {
+		t.Fatal(err)
+	}
+	importTwoKindleFiles(t, f, dl, files)
+	variantBlocked(t, f, dl, "no-replace")
+	variantImportedFiles(t, f, 0)
+	for _, source := range files {
+		public := variantEbookTarget(t, f, source)
+		linked, linkErr := os.Lstat(public)
+		seeded, seedErr := os.Lstat(source)
+		if linkErr != nil || seedErr != nil || !os.SameFile(linked, seeded) {
+			t.Fatalf("retry modified stranded public link %s: %v %v", public, linkErr, seedErr)
+		}
+	}
+}
+
+func TestVariantRetry_CompleteTwoFileBundleSurvivesInterruptedDownloadStatus(t *testing.T) {
+	f, dl, files := variantTwoKindleFiles(t)
+	importTwoKindleFiles(t, f, dl, files)
+	variantImportedDownload(t, f, dl.ID)
+	rows := variantImportedFiles(t, f, 2)
+	ids := make(map[string]int64, len(rows))
+	for _, row := range rows {
+		ids[row.Path] = row.ID
+	}
+	if _, err := f.database.ExecContext(f.ctx, `UPDATE downloads SET status='completed' WHERE id=?`, dl.ID); err != nil {
+		t.Fatal(err)
+	}
+	importTwoKindleFiles(t, f, dl, files)
+	variantImportedDownload(t, f, dl.ID)
+	rows = variantImportedFiles(t, f, 2)
+	for _, row := range rows {
+		if ids[row.Path] != row.ID || row.VariantID == nil || *row.VariantID != f.variant.ID {
+			t.Fatalf("interrupted retry replaced or reassigned %s: %+v", row.Path, row)
+		}
+	}
+	for _, source := range files {
+		linked, linkErr := os.Lstat(variantEbookTarget(t, f, source))
+		seeded, seedErr := os.Lstat(source)
+		if linkErr != nil || seedErr != nil || !os.SameFile(linked, seeded) {
+			t.Fatalf("interrupted retry changed source/public hardlink %s: %v %v", source, linkErr, seedErr)
+		}
+	}
+}
+
 func TestVariantRetry_TrackedAudioFolderBeforeDownloadStatusIsIdempotent(t *testing.T) {
 	f := newVariantReviewFixture(t, "Dune", "Frank Herbert", models.MediaTypeAudiobook, "eng")
 	folder, files := variantAudioSources(t, f)

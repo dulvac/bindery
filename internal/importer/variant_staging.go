@@ -304,22 +304,27 @@ func (s *Scanner) importTorrentVariant(ctx context.Context, dl *models.Download,
 	if err := validate(); err != nil {
 		return err
 	}
+	claims := make([]db.VariantFileClaim, 0, len(chosen))
 	for _, p := range chosen {
 		approval := db.VariantReviewApproval{ExpectedStatus: p.variant.Status}
 		if p.variant.Status == models.VariantReview {
 			approval.AuditEventID, approval.DownloadID = p.checked.auditEventID, dl.ID
 		}
-		if err := s.books.TrackVariantFileChecked(ctx, book.ID, p.variant.ID, format, p.dest, p.checked.detectedLanguage, p.checked.verification, func() error {
-			if variantCommitWindowHook != nil {
-				variantCommitWindowHook()
-			}
-			return validate()
-		}, approval); err != nil {
-			return fmt.Errorf("stranded verified public link at %s; reconcile manually (no public rollback): %w", p.dest, err)
-		}
+		claims = append(claims, db.VariantFileClaim{
+			VariantID: p.variant.ID, Format: format, Path: p.dest,
+			Language: p.checked.detectedLanguage, Verification: p.checked.verification, Approval: approval,
+		})
 		if format == models.MediaTypeAudiobook {
-			break
-		} // one folder, one association
+			break // one folder, one association
+		}
+	}
+	if err := s.books.TrackVariantFilesChecked(ctx, book.ID, claims, func() error {
+		if variantCommitWindowHook != nil {
+			variantCommitWindowHook()
+		}
+		return validate()
+	}); err != nil {
+		return fmt.Errorf("stranded verified public link(s), starting at %s; reconcile manually (no public rollback): %w", chosen[0].dest, err)
 	}
 	return nil
 }

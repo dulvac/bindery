@@ -1009,6 +1009,12 @@ func (r *BookRepo) TrackVariantFileChecked(ctx context.Context, bookID, variantI
 	return r.files.TrackVariantChecked(ctx, bookID, variantID, format, path, language, verification, validate, approval)
 }
 
+// TrackVariantFilesChecked records all published bundle members and their
+// variant statuses in one transaction, after checking every public path.
+func (r *BookRepo) TrackVariantFilesChecked(ctx context.Context, bookID int64, claims []VariantFileClaim, validate func() error) error {
+	return r.files.TrackVariantFilesChecked(ctx, bookID, claims, validate)
+}
+
 // AddBookFileIfMissing records a new on-disk file and reports whether this call
 // made the row the book's, refreshing the book's aggregate status either way.
 // See BookFileRepo.AddIfMissing for why the caller needs to know (#1635). A
