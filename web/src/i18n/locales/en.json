@@ -2869,6 +2869,8 @@
     "overrideTitle": "Wrong-language release",
     "overrideWarning": "This wrong-language release needs a named admin reason before grabbing it.",
     "overrideReason": "Reason for language override",
+    "optionalOverrideReason": "Optional admin reason for language override",
+    "inconclusiveReasonHint": "If you verified a different language, enter an admin reason. Leave blank for unknown language; the server makes the final decision.",
     "reasonRequired": "A reason is required.",
     "retry": "Search again",
     "retryTitle": "Mark wanted",

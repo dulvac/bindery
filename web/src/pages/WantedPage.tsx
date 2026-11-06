@@ -57,6 +57,7 @@ export default function WantedPage() {
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
   const [searchingId, setSearchingId] = useState<number | null>(null)
+  const searchRequestRef = useRef(0)
   const [results, setResults] = useState<SearchResult[]>([])
   const [detailBook, setDetailBook] = useState<Book | null>(null)
   const [selectedVariantId, setSelectedVariantId] = useState<number | null>(null)
@@ -75,6 +76,7 @@ export default function WantedPage() {
   const commitSearch = useCallback((q: string) => updateList({ q, page: null }, { replace: true }), [updateList])
   const [search, setSearch] = useUrlSearchInput(list.values.q, commitSearch)
   const [grabbingGuid, setGrabbingGuid] = useState<string | null>(null)
+  const grabInFlight = useRef(false)
   const [grabbedGuid, setGrabbedGuid] = useState<string | null>(null)
   const [unmonitoringId, setUnmonitoringId] = useState<number | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
@@ -160,11 +162,13 @@ export default function WantedPage() {
   const showToast = useCallback((msg: string) => { setToast(msg) }, [])
 
   const searchBook = async (book: Book) => {
+    const request = ++searchRequestRef.current
     setSearchingId(book.id)
     try {
       // List rows may contain negative pending-request display IDs. Resolve
       // the real variant from the owner-scoped single-book response instead.
       const fresh = await api.getBook(book.id)
+      if (request !== searchRequestRef.current) return
       setDetailBook(fresh)
       const available = wantedCopies(fresh)
       if (((book.variants?.length ?? 0) > 0 || (fresh.variants?.length ?? 0) > 0) && available.length === 0) {
@@ -182,15 +186,16 @@ export default function WantedPage() {
         return // Choose a format and language, then press Search again.
       }
       const res = await (choice ? api.searchBook(book.id, { mediaType: choice.mediaType, language: choice.language }) : api.searchBook(book.id))
+      if (request !== searchRequestRef.current) return
       setSearchedVariant(choice)
       setResults(choice ? res.results.filter(r => matchesVariantFormat(r, choice, fresh.mediaType === 'both') && !wrongLanguage(r, choice)) : res.results)
       setFiltered(choice ? (res.filtered ?? []).filter(r => matchesVariantFormat(r, choice, fresh.mediaType === 'both')) : res.filtered ?? [])
       setFilteredTotal(res.filteredTotal)
       setShowResults(book.id)
     } catch (err) {
-      showToast(errorText(err, t('bookDetail.searchFailed', 'Search failed')))
+      if (request === searchRequestRef.current) showToast(errorText(err, t('bookDetail.searchFailed', 'Search failed')))
     } finally {
-      setSearchingId(null)
+      setSearchingId(current => current === book.id ? null : current)
     }
   }
 
@@ -221,10 +226,12 @@ export default function WantedPage() {
   }
 
   const grab = async (result: SearchResult, book: Book) => {
+    if (grabInFlight.current) return
     const variant = searchedVariant
     if (variant && (!detailBook || detailBook.id !== book.id || !matchesVariantFormat(result, variant, detailBook.mediaType === 'both'))) return
     if (variant && wrongLanguage(result, variant) && !isAdmin) return
     if ((book.variants?.length || detailBook?.variants?.length) && !variant) return
+    grabInFlight.current = true
     setGrabbingGuid(result.guid)
     try {
       let overrideReason: string | undefined
@@ -272,6 +279,7 @@ export default function WantedPage() {
     } catch (err: unknown) {
       alert(errorText(err, t('wanted.grabFailed', 'Grab failed')))
     } finally {
+      grabInFlight.current = false
       setGrabbingGuid(null)
     }
   }
@@ -574,7 +582,8 @@ export default function WantedPage() {
                 {detailBook?.id === book.id && (detailBook.variants?.length ?? 0) > 0 && rowVariants.length > 0 && (
                   <div className="px-3 py-2"><ChooseBookVariant variants={rowVariants}
                     value={rowVariants.find(v => v.id === selectedVariantId)?.id ?? (rowVariants.length === 1 ? rowVariants[0].id : null)}
-                    onChange={next => { setSelectedVariantId(next); setShowResults(null); setSearchedVariant(null) }} /></div>
+                    disabled={searchingId === book.id}
+                    onChange={next => { searchRequestRef.current++; setSelectedVariantId(next); setShowResults(null); setSearchedVariant(null) }} /></div>
                 )}
                 {showResults === book.id && results.length === 0 && (
                   <div className="px-3 pb-2 text-xs text-fg-muted">
@@ -614,7 +623,7 @@ export default function WantedPage() {
                         <button
                           type="button"
                           onClick={() => grab(r, book)}
-                          disabled={grabbingGuid === r.guid || grabbedGuid === r.guid || (searchedVariant ? wrongLanguage(r, searchedVariant) && !isAdmin : false)}
+                          disabled={grabbingGuid !== null || grabbedGuid === r.guid || (searchedVariant ? wrongLanguage(r, searchedVariant) && !isAdmin : false)}
                           className={`px-2 py-2 rounded text-[10px] font-medium flex-shrink-0 touch-manipulation transition-colors disabled:cursor-default ${
                             grabbedGuid === r.guid
                               ? 'bg-emerald-700 text-white'

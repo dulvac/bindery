@@ -219,6 +219,9 @@ export default function QueuePage() {
           {mismatch && <label>{t('variants.overrideWarning', 'This wrong-language release needs a named admin reason before grabbing it.')}
             <input aria-label={t('variants.overrideReason', 'Reason for language override')} className="block w-full border rounded p-2" onChange={e => { reason = e.target.value }} />
           </label>}
+          {selected && codes.length === 0 && isAdmin && <label>{t('variants.inconclusiveReasonHint', 'If you verified a different language, enter an admin reason. Leave blank for unknown language; the server makes the final decision.')}
+            <input aria-label={t('variants.optionalOverrideReason', 'Optional admin reason for language override')} className="block w-full border rounded p-2" onChange={e => { reason = e.target.value }} />
+          </label>}
         </div>,
         acknowledgeLabel: t('variants.acknowledgeCost', 'I understand this grab may cost ratio'),
         confirmLabel: t('variants.confirmGrab', 'Confirm grab'),

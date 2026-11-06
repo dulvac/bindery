@@ -219,6 +219,55 @@ describe('WantedPage — bound manual grabs', () => {
     await waitFor(() => expect(api.grab).toHaveBeenCalledWith(expect.objectContaining({ guid: 'ro', bookId: 1, mediaType: 'ebook', variantId: 25 })))
   })
 
+  it('locks the variant picker during a deferred search so a late response cannot restore an old choice', async () => {
+    const variants = [
+      { id: 25, mediaType: 'ebook' as const, language: 'rum', status: 'wanted', verification: '' },
+      { id: 26, mediaType: 'audiobook' as const, language: 'eng', status: 'wanted', verification: '' },
+    ]
+    const book = makeBook({ id: 1, title: 'Dune', mediaType: 'both', variants })
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([book]))
+    vi.mocked(api.getBook).mockResolvedValue(book)
+    let resolveSearch: (value: Awaited<ReturnType<typeof api.searchBook>>) => void = () => {}
+    vi.mocked(api.searchBook).mockImplementation(() => new Promise(resolve => { resolveSearch = resolve }))
+    renderWantedPage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Search' }))
+    const picker = await screen.findByRole('combobox', { name: 'Wanted copy for manual search' })
+    fireEvent.change(picker, { target: { value: '25' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    await waitFor(() => expect(api.searchBook).toHaveBeenCalledWith(1, { mediaType: 'ebook', language: 'rum' }))
+    expect(picker).toBeDisabled()
+    expect(picker).toHaveValue('25')
+    await act(async () => { resolveSearch({ results: [makeResult({ guid: 'ro', title: 'Dune [ROM / EPUB]', mediaType: 'ebook' })], debug: null }) })
+    expect(await screen.findByText('Dune [ROM / EPUB]')).toBeInTheDocument()
+    expect(picker).toBeEnabled()
+    fireEvent.change(picker, { target: { value: '26' } })
+    expect(screen.queryByText('Dune [ROM / EPUB]')).not.toBeInTheDocument()
+  })
+
+  it('discards an older search result when another wanted book is searched before it resolves', async () => {
+    const bookA = makeBook({ id: 1, title: 'Dune', variants: [{ id: 25, mediaType: 'ebook', language: 'rum', status: 'wanted', verification: '' }] })
+    const bookB = makeBook({ id: 2, title: 'Hyperion', variants: [{ id: 26, mediaType: 'ebook', language: 'eng', status: 'wanted', verification: '' }] })
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([bookA, bookB]))
+    vi.mocked(api.getBook).mockImplementation(async id => id === 1 ? bookA : bookB)
+    let resolveA: (value: Awaited<ReturnType<typeof api.searchBook>>) => void = () => {}
+    let resolveB: (value: Awaited<ReturnType<typeof api.searchBook>>) => void = () => {}
+    vi.mocked(api.searchBook).mockImplementation(id => new Promise(resolve => {
+      if (id === 1) resolveA = resolve
+      else resolveB = resolve
+    }))
+    renderWantedPage()
+    const buttons = await screen.findAllByRole('button', { name: 'Search' })
+    fireEvent.click(buttons[0])
+    await waitFor(() => expect(api.searchBook).toHaveBeenCalledWith(1, { mediaType: 'ebook', language: 'rum' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    await waitFor(() => expect(api.searchBook).toHaveBeenCalledWith(2, { mediaType: 'ebook', language: 'eng' }))
+    await act(async () => { resolveB({ results: [makeResult({ guid: 'b', title: 'Hyperion [ENG / EPUB]', mediaType: 'ebook' })], debug: null }) })
+    expect(await screen.findByText('Hyperion [ENG / EPUB]')).toBeInTheDocument()
+    await act(async () => { resolveA({ results: [makeResult({ guid: 'a', title: 'Dune [ROM / EPUB]', mediaType: 'ebook' })], debug: null }) })
+    expect(screen.getByText('Hyperion [ENG / EPUB]')).toBeInTheDocument()
+    expect(screen.queryByText('Dune [ROM / EPUB]')).not.toBeInTheDocument()
+  })
+
   it('offers format/language choices, and refuses a forged audio result for the chosen ebook', async () => {
     const variants = [
       { id: 25, mediaType: 'ebook' as const, language: 'rum', status: 'wanted', verification: '' },
@@ -238,6 +287,63 @@ describe('WantedPage — bound manual grabs', () => {
     expect(screen.getByText('Unverified language')).toBeInTheDocument()
     expect(screen.queryByText('Dune [ENG / M4B]')).not.toBeInTheDocument()
     expect(api.searchBook).toHaveBeenCalledWith(1, { mediaType: 'ebook', language: 'rum' })
+  })
+
+  it('leaves an unknown three-letter marker available as unverified, without an override', async () => {
+    const variants = [{ id: 25, mediaType: 'ebook' as const, language: 'rum', status: 'wanted', verification: '' }]
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([makeBook({ id: 1, title: 'Dune', variants })]))
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({ id: 1, title: 'Dune', variants }))
+    vi.mocked(api.searchBook).mockResolvedValue({ results: [makeResult({ guid: 'xyz', title: 'Dune [XYZ / EPUB]', mediaType: 'ebook' })], debug: null })
+    renderWantedPage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Search' }))
+    const row = (await screen.findByText('Dune [XYZ / EPUB]')).closest('div.flex.items-center.justify-between') as HTMLElement
+    expect(within(row).getByText('Unverified language')).toBeInTheDocument()
+    fireEvent.click(within(row).getByRole('button', { name: 'Grab' }))
+    await waitFor(() => expect(api.grab).toHaveBeenCalledWith(expect.objectContaining({ guid: 'xyz', variantId: 25 })))
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
+  it('permits only one variant-bound grab when two result buttons are clicked in the same tick', async () => {
+    const variants = [{ id: 25, mediaType: 'ebook' as const, language: 'rum', status: 'wanted', verification: '' }]
+    const book = makeBook({ id: 1, title: 'Dune', variants })
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([book]))
+    vi.mocked(api.getBook).mockResolvedValue(book)
+    vi.mocked(api.searchBook).mockResolvedValue({ results: [
+      makeResult({ guid: 'first', title: 'Dune first [ROM / EPUB]', mediaType: 'ebook' }),
+      makeResult({ guid: 'second', title: 'Dune second [ROM / EPUB]', mediaType: 'ebook' }),
+    ], debug: null })
+    vi.mocked(api.grab).mockImplementation(() => new Promise(() => {}))
+    renderWantedPage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Search' }))
+    const first = (await screen.findByText('Dune first [ROM / EPUB]')).closest('div.flex.items-center.justify-between') as HTMLElement
+    const second = screen.getByText('Dune second [ROM / EPUB]').closest('div.flex.items-center.justify-between') as HTMLElement
+    await act(async () => {
+      fireEvent.click(within(first).getByRole('button', { name: 'Grab' }))
+      fireEvent.click(within(second).getByRole('button', { name: 'Grab' }))
+    })
+    await waitFor(() => expect(api.grab).toHaveBeenCalledTimes(1))
+    expect(api.grab).toHaveBeenCalledWith(expect.objectContaining({ guid: 'first', variantId: 25 }))
+    expect(api.getBook).toHaveBeenCalledTimes(2) // detail resolution + one preflight
+    expect(within(second).getByRole('button', { name: 'Grab' })).toBeDisabled()
+  })
+
+  it('keeps unstamped M4A and OGG audio out of ebook results while allowing the ebook', async () => {
+    const variants = [{ id: 25, mediaType: 'ebook' as const, language: 'rum', status: 'wanted', verification: '' }]
+    const book = makeBook({ id: 1, title: 'Dune', variants })
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([book]))
+    vi.mocked(api.getBook).mockResolvedValue(book)
+    vi.mocked(api.searchBook).mockResolvedValue({ results: [
+      makeResult({ guid: 'm4a', title: 'Dune.M4A' }),
+      makeResult({ guid: 'ogg', title: 'Dune.OGG' }),
+      makeResult({ guid: 'epub', title: 'Dune.epub' }),
+    ], debug: null })
+    renderWantedPage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Search' }))
+    const row = (await screen.findByText('Dune.epub')).closest('div.flex.items-center.justify-between') as HTMLElement
+    expect(screen.queryByText('Dune.M4A')).not.toBeInTheDocument()
+    expect(screen.queryByText('Dune.OGG')).not.toBeInTheDocument()
+    fireEvent.click(within(row).getByRole('button', { name: 'Grab' }))
+    await waitFor(() => expect(api.grab).toHaveBeenCalledWith(expect.objectContaining({ guid: 'epub', mediaType: 'ebook', variantId: 25 })))
   })
 
   it('does not present an indexer language attribute as verified for an unmarked release', async () => {

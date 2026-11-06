@@ -751,6 +751,18 @@ describe('BookDetailPage — real variant manual actions', () => {
     await waitFor(() => expect(api.grab).toHaveBeenCalledWith(expect.objectContaining({ guid: 'ebook-ro', bookId: 42, mediaType: 'ebook', variantId: 17 })))
   })
 
+  it('keeps an unknown format-qualified code eligible and labels it unverified', async () => {
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({ variants: [variants[0]] }))
+    vi.mocked(api.searchBook).mockResolvedValue({ results: [makeResult({ guid: 'web', title: 'Dune [WEB / EPUB]', mediaType: 'ebook' })], debug: null })
+    renderBookDetailPage()
+    fireEvent.click(await screen.findByRole('button', { name: /Search ebook indexers/ }))
+    const row = (await screen.findByText('Dune [WEB / EPUB]')).closest('div.flex.items-center.justify-between') as HTMLElement
+    expect(within(row).getByText(/Unverified language/)).toBeInTheDocument()
+    fireEvent.click(within(row).getByRole('button', { name: 'Grab' }))
+    await waitFor(() => expect(api.grab).toHaveBeenCalledWith(expect.objectContaining({ guid: 'web', variantId: 17 })))
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
   it('accepts a French FRA marker for the requested fre variant without an override', async () => {
     vi.mocked(api.getBook).mockResolvedValue(makeBook({ variants: [{ ...variants[0], id: 33, language: 'fre' }] }))
     vi.mocked(api.searchBook).mockResolvedValue({ results: [makeResult({ guid: 'fr', title: 'Dune [FRA / EPUB]', mediaType: 'ebook' })], debug: null })
@@ -769,6 +781,16 @@ describe('BookDetailPage — real variant manual actions', () => {
     fireEvent.click(await screen.findByRole('button', { name: /Search ebook indexers/ }))
     await waitFor(() => expect(api.searchBook).toHaveBeenCalledWith(42, { mediaType: 'ebook', language: 'rum' }))
     expect(screen.queryByText('Dune [ROM / M4B]')).not.toBeInTheDocument()
+    expect(api.grab).not.toHaveBeenCalled()
+  })
+
+  it.each(['M4A', 'OGG'])('hides an unstamped %s audiobook from an ebook variant search', async format => {
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({ variants: [variants[0]] }))
+    vi.mocked(api.searchBook).mockResolvedValue({ results: [makeResult({ guid: 'audio', title: `Dune.${format}` })], debug: null })
+    renderBookDetailPage()
+    fireEvent.click(await screen.findByRole('button', { name: /Search ebook indexers/ }))
+    await waitFor(() => expect(api.searchBook).toHaveBeenCalledWith(42, { mediaType: 'ebook', language: 'rum' }))
+    expect(screen.queryByText(`Dune.${format}`)).not.toBeInTheDocument()
     expect(api.grab).not.toHaveBeenCalled()
   })
 
