@@ -13,7 +13,8 @@ const PAGE_SIZE = 50
 function requestFormatsFromMediaType(mediaType: string): Array<'ebook' | 'audiobook'> {
   if (mediaType === 'both') return ['ebook', 'audiobook']
   if (mediaType === 'audiobook') return ['audiobook']
-  return ['ebook']
+  if (mediaType === 'ebook') return ['ebook']
+  return []
 }
 
 function requestFormatsFromRequest(request: LibraryRequest, overrideMediaType: string): Array<'ebook' | 'audiobook'> {
@@ -26,11 +27,11 @@ function requestFormatsFromRequest(request: LibraryRequest, overrideMediaType: s
         .filter((v): v is 'ebook' | 'audiobook' => v === 'ebook' || v === 'audiobook'),
     ),
   )
-  if (fromVariants.length > 0) return fromVariants
-  return ['ebook']
+  return fromVariants
 }
 
 function pendingVariants(request: LibraryRequest): NonNullable<LibraryRequest['variants']> {
+  if (!request.mediaType) return request.variants ?? []
   const existing = new Map((request.variants ?? []).map(v => [`${v.mediaType}/${v.language}`, v]))
   const rows: NonNullable<LibraryRequest['variants']> = []
   for (const format of requestFormatsFromMediaType(request.mediaType)) {
@@ -158,7 +159,9 @@ export default function MyRequestsPage() {
                 <div className="text-xs text-fg-muted mt-0.5">
                   {r.kind === 'author' ? t('requests.kindAuthor') : r.authorName || t('requests.kindBook')}
                   {' · '}
-                  {mediaTypeLabel(t, r.mediaType)}
+                  {r.kind === 'book' && r.status === 'pending' && !r.mediaType
+                    ? t('requests.variant.formatUnknown', 'Requested format unknown')
+                    : mediaTypeLabel(t, r.mediaType)}
                   {' · '}
                   {new Date(r.createdAt).toLocaleDateString()}
                 </div>

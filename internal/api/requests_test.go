@@ -758,6 +758,88 @@ func TestRequestsLibraryForeignBookIDOnlyForCurrentOwner(t *testing.T) {
 	}
 }
 
+func TestRequestsLibraryPendingPairsOnlyForCurrentBookOwner(t *testing.T) {
+	auth.SetEnforceTenancyForTests(t, false)
+	f := newRequestsFixture(t, wellsRequestStub(), &fakeAdder{})
+	ctx := context.Background()
+	author := seedWells(t, f.authors)
+	book := &models.Book{ForeignID: "OL27482W", AuthorID: author.ID, OwnerUserID: f.requester.ID,
+		Title: "The War of the Worlds", SortTitle: "war of the worlds", Status: models.BookStatusImported}
+	if err := f.books.Create(ctx, book); err != nil {
+		t.Fatal(err)
+	}
+	variants := db.NewBookVariantRepo(f.database)
+	english, err := variants.EnsureWanted(ctx, book.ID, models.MediaTypeEbook, []string{"eng"})
+	if err != nil || len(english) != 1 {
+		t.Fatalf("initial ebook = %+v %v", english, err)
+	}
+	if err := variants.SetStatus(ctx, english[0].ID, models.VariantImported); err != nil {
+		t.Fatal(err)
+	}
+	const marker = "/private/pending-library-test.epub"
+	if _, err := f.database.ExecContext(ctx, `INSERT INTO book_files (book_id, format, path, variant_id) VALUES (?, 'ebook', ?, ?)`, book.ID, marker, english[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	created := f.create(t, f.requester, `{"kind":"book","foreignId":"OL27482W","mediaType":"ebook","languages":["en","ro"]}`)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("pending request = %d %s", created.Code, created.Body.String())
+	}
+	library := func(u *db.User) requesterLibraryResponse {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		f.h.Library(rec, asUser(httptest.NewRequest(http.MethodGet, "/api/v1/requests/library", nil), u))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("library = %d %s", rec.Code, rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), marker) {
+			t.Fatalf("library exposed file path: %s", rec.Body.String())
+		}
+		var response requesterLibraryResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	own := library(f.requester)
+	if len(own.Items) != 1 || own.Items[0].ForeignBookID != book.ForeignID {
+		t.Fatalf("owned library book = %+v", own.Items)
+	}
+	got := own.Items[0].Variants
+	if len(got) != 2 || got[0].ID != english[0].ID || got[0].Status != models.VariantImported ||
+		got[0].Language != "eng" || got[1].ID >= 0 || got[1].MediaType != models.MediaTypeEbook ||
+		got[1].Language != "rum" || got[1].Status != models.VariantWanted {
+		t.Fatalf("owned library statuses = %+v; want imported English and pending Romanian", got)
+	}
+	shared := library(f.other)
+	if len(shared.Items) != 1 || shared.Items[0].ForeignBookID != "" || len(shared.Items[0].Variants) != 1 ||
+		shared.Items[0].Variants[0].Language != "eng" {
+		t.Fatalf("another owner's shared library exposed pending pairs: %+v", shared.Items)
+	}
+	if _, err := f.database.ExecContext(ctx, `UPDATE requests SET media_type = 'both' WHERE owner_user_id = ? AND foreign_id = ?`, f.requester.ID, book.ForeignID); err != nil {
+		t.Fatal(err)
+	}
+	both := library(f.requester).Items[0].Variants
+	if len(both) != 4 || both[0].ID != english[0].ID || both[1].MediaType != "ebook" || both[1].Language != "rum" ||
+		both[2].MediaType != "audiobook" || both[2].Language != "eng" || both[3].Language != "rum" {
+		t.Fatalf("both-format pending pairs = %+v", both)
+	}
+	if _, err := f.database.ExecContext(ctx, `UPDATE requests SET media_type = '' WHERE owner_user_id = ? AND foreign_id = ?`, f.requester.ID, book.ForeignID); err != nil {
+		t.Fatal(err)
+	}
+	if legacy := library(f.requester).Items[0].Variants; len(legacy) != 1 || legacy[0].Language != "eng" {
+		t.Fatalf("unknown legacy pending format invented a pair: %+v", legacy)
+	}
+	if _, err := f.database.ExecContext(ctx, `UPDATE requests SET media_type = 'ebook' WHERE owner_user_id = ? AND foreign_id = ?`, f.requester.ID, book.ForeignID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.database.ExecContext(ctx, `UPDATE books SET owner_user_id = ? WHERE id = ?`, f.other.ID, book.ID); err != nil {
+		t.Fatal(err)
+	}
+	if moved := library(f.other); len(moved.Items) != 1 || len(moved.Items[0].Variants) != 1 {
+		t.Fatalf("ownership change exposed former owner's pending pairs: %+v", moved.Items)
+	}
+}
+
 func TestCleanRequestText(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"  The   War\tof\nthe Worlds ", "The War of the Worlds"},

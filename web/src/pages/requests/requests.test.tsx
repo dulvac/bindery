@@ -53,6 +53,7 @@ vi.mock('react-i18next', () => {
     'queue.status.downloading': 'Downloading',
     'bookDetail.languageUnknown': 'Language unknown',
     'requests.variant.review': 'Review',
+    'requests.variant.formatUnknown': 'Requested format unknown',
     'requests.variant.verified': 'Verified',
     'requests.variant.unverified': 'Unverified',
     'requests.admin.title': 'Requests',
@@ -254,6 +255,23 @@ describe('MyRequestsPage', () => {
     expect(within(list).getByText('Waiting for an admin')).toBeInTheDocument()
   })
 
+  it('keeps a legacy empty-format pending request unknown instead of inventing an ebook', async () => {
+    vi.mocked(api.listMyRequests).mockResolvedValue({
+      items: [req({ id: 8, mediaType: '', languages: ['eng'], status: 'pending', variants: undefined })],
+      total: 1, limit: 50, offset: 0,
+    })
+    render(<MemoryRouter><MyRequestsPage /></MemoryRouter>)
+
+    const list = await screen.findByRole('list', { name: 'My requests' })
+    expect(within(list).getByText(/Requested format unknown/)).toBeInTheDocument()
+    expect(within(list).queryByText('Wanted')).not.toBeInTheDocument()
+    expect(within(list).queryByTestId('book-variant-statuses')).not.toBeInTheDocument()
+
+    fireEvent.click(within(list).getByRole('button', { name: 'Add another language' }))
+    expect(within(list).getByRole('button', { name: 'Send language request' })).toBeEnabled()
+    expect(api.createRequest).not.toHaveBeenCalled()
+  })
+
   it('disables a pending duplicate-only selection even without a variants projection', async () => {
     vi.mocked(api.listMyRequests).mockResolvedValue({
       items: [req({ id: 8, mediaType: 'ebook', languages: ['eng'], status: 'pending', variants: undefined })],
@@ -300,6 +318,40 @@ describe('RequesterLibraryPage', () => {
     await waitFor(() => expect(api.createRequest).toHaveBeenCalledWith('book', 'OL1W', 'ebook', ['eng', 'rum']))
     expect(await within(book).findByRole('status')).toHaveTextContent('Language request sent')
     expect(api.listMyRequests).not.toHaveBeenCalled()
+  })
+
+  it('blocks an already-pending language on reopen and page reload', async () => {
+    const english = { id: 31, mediaType: 'ebook' as const, language: 'eng', status: 'imported', verification: 'verified' }
+    const initial = {
+      id: 1, title: 'Dune', authorName: 'Frank Herbert', status: 'imported', formats: ['ebook'],
+      foreignBookId: 'OL1W', variants: [english],
+    }
+    const pending = {
+      ...initial,
+      variants: [english, { id: -2, mediaType: 'ebook' as const, language: 'rum', status: 'wanted', verification: '' }],
+    }
+    vi.mocked(api.requesterLibrary).mockResolvedValueOnce({ items: [initial], total: 1, limit: 60, offset: 0 })
+      .mockResolvedValue({ items: [pending], total: 1, limit: 60, offset: 0 })
+    vi.mocked(api.createRequest).mockResolvedValue(req({ id: 12, status: 'pending', mediaType: 'ebook', languages: ['eng', 'rum'] }))
+
+    const view = render(<MemoryRouter><RequesterLibraryPage /></MemoryRouter>)
+    let book = (await screen.findByText('Dune')).closest('li') as HTMLElement
+    fireEvent.click(within(book).getByRole('button', { name: 'Add another language' }))
+    fireEvent.click(within(book).getByRole('checkbox', { name: 'Romanian' }))
+    fireEvent.click(within(book).getByRole('button', { name: 'Send language request' }))
+    await waitFor(() => expect(api.createRequest).toHaveBeenCalledWith('book', 'OL1W', 'ebook', ['eng', 'rum']))
+    await waitFor(() => expect(api.requesterLibrary).toHaveBeenCalledTimes(2))
+    expect(await within(book).findByText('Romanian')).toBeInTheDocument()
+    fireEvent.click(within(book).getByRole('button', { name: 'Add another language' }))
+    expect(within(book).getByRole('button', { name: 'Send language request' })).toBeDisabled()
+
+    view.unmount()
+    render(<MemoryRouter><RequesterLibraryPage /></MemoryRouter>)
+    book = (await screen.findByText('Dune')).closest('li') as HTMLElement
+    expect(within(book).getByText('Romanian')).toBeInTheDocument()
+    fireEvent.click(within(book).getByRole('button', { name: 'Add another language' }))
+    expect(within(book).getByRole('button', { name: 'Send language request' })).toBeDisabled()
+    expect(api.createRequest).toHaveBeenCalledTimes(1)
   })
 
   it('shows variant status labels without exposing any file paths', async () => {

@@ -2,9 +2,11 @@ package db
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
+	"github.com/vavallee/bindery/internal/models"
 	"github.com/vavallee/bindery/internal/textutil"
 )
 
@@ -52,6 +54,58 @@ func (r *RequestRepo) ListOwnedLibraryForeignIDs(ctx context.Context, ownerID in
 			return nil, fmt.Errorf("scan owned library add ids: %w", err)
 		}
 		out[id] = foreignID
+	}
+	return out, rows.Err()
+}
+
+// PendingLibraryPair is an owner's selected copy before approval creates a
+// book variant. It carries no file or download data.
+type PendingLibraryPair struct {
+	MediaType string
+	Language  string
+}
+
+// ListOwnedPendingLibraryPairs returns pending pairs only for books still
+// owned by this requester. An empty legacy media type has no known pairs.
+func (r *RequestRepo) ListOwnedPendingLibraryPairs(ctx context.Context, ownerID int64, bookIDs []int64) (map[int64][]PendingLibraryPair, error) {
+	out := make(map[int64][]PendingLibraryPair)
+	if ownerID <= 0 || len(bookIDs) == 0 {
+		return out, nil
+	}
+	marks := strings.TrimSuffix(strings.Repeat("?,", len(bookIDs)), ",")
+	args := make([]any, 0, len(bookIDs)+1)
+	args = append(args, ownerID)
+	for _, id := range bookIDs {
+		args = append(args, id)
+	}
+	// #nosec G202 -- IN contains only placeholders, never caller text.
+	rows, err := r.db.QueryContext(ctx, `SELECT b.id, r.media_type, r.languages_json FROM requests r
+		JOIN books b ON b.foreign_id = r.foreign_id AND b.owner_user_id = r.owner_user_id
+		WHERE r.owner_user_id = ? AND r.kind = 'book' AND r.status IN ('pending', 'approving')
+		AND b.id IN (`+marks+`)`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("load owned pending library pairs: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var bookID int64
+		var mediaType, languagesJSON string
+		if err := rows.Scan(&bookID, &mediaType, &languagesJSON); err != nil {
+			return nil, fmt.Errorf("scan owned pending library pairs: %w", err)
+		}
+		formats := models.RequestedMediaTypes(mediaType)
+		if len(formats) == 0 {
+			continue
+		}
+		var languages []string
+		if err := json.Unmarshal([]byte(languagesJSON), &languages); err != nil {
+			return nil, fmt.Errorf("decode owned pending library languages: %w", err)
+		}
+		for _, format := range formats {
+			for _, language := range languages {
+				out[bookID] = append(out[bookID], PendingLibraryPair{MediaType: format, Language: language})
+			}
+		}
 	}
 	return out, rows.Err()
 }

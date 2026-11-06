@@ -74,7 +74,12 @@ func (h *RequestHandler) projectLibrary(ctx context.Context, rows []db.LibraryPr
 		accesses = append(accesses, db.BookStatusAccess{BookID: row.ID, OwnerUserID: scopeUserID})
 		bookIDs = append(bookIDs, row.ID)
 	}
-	foreignIDs, err := h.requests.ListOwnedLibraryForeignIDs(ctx, auth.UserIDFromContext(ctx), bookIDs)
+	ownerID := auth.UserIDFromContext(ctx)
+	foreignIDs, err := h.requests.ListOwnedLibraryForeignIDs(ctx, ownerID, bookIDs)
+	if err != nil {
+		return nil, err
+	}
+	pending, err := h.requests.ListOwnedPendingLibraryPairs(ctx, ownerID, bookIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -92,6 +97,22 @@ func (h *RequestHandler) projectLibrary(ctx context.Context, rows []db.LibraryPr
 			formats = append(formats, models.MediaTypeAudiobook)
 		}
 		projection := statuses[db.BookStatusAccess{BookID: row.ID, OwnerUserID: scopeUserID}]
+		variants := variantResponses(projection.Variants)
+		if foreignIDs[row.ID] != "" {
+			seen := make(map[string]bool, len(variants))
+			for _, v := range variants {
+				seen[v.MediaType+"/"+v.Language] = true
+			}
+			for _, pair := range pending[row.ID] {
+				key := pair.MediaType + "/" + pair.Language
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				variants = append(variants, variantResponse{ID: -int64(len(variants) + 1),
+					MediaType: pair.MediaType, Language: pair.Language, Status: models.VariantWanted})
+			}
+		}
 		items = append(items, requesterLibraryBook{
 			ID:             row.ID,
 			ForeignBookID:  foreignIDs[row.ID],
@@ -102,7 +123,7 @@ func (h *RequestHandler) projectLibrary(ctx context.Context, rows []db.LibraryPr
 			CoverURL:       ProxyImageURL(row.ImageURL),
 			Status:         row.Status,
 			Formats:        formats,
-			Variants:       variantResponses(projection.Variants),
+			Variants:       variants,
 			LegacyFiles:    legacyFileResponses(projection.LegacyFiles),
 		})
 	}

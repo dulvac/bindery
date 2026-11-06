@@ -70,6 +70,7 @@ export default function RequesterLibraryPage() {
     setError(null)
     try {
       await api.createRequest('book', book.foreignBookId, editMediaType, editLanguages)
+      await load(0, search)
       setEditingBookId(null)
       setSentBookId(book.id)
     } catch (err: unknown) {

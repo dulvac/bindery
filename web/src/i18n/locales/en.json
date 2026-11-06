@@ -2772,6 +2772,7 @@
       "authorProgress": "{{imported}} of {{total}} books here"
     },
     "variant": {
+      "formatUnknown": "Requested format unknown",
       "review": "Review",
       "verified": "Verified",
       "unverified": "Unverified"
