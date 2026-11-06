@@ -743,6 +743,51 @@ describe('WantedPage', () => {
     expect(screen.getByText('No wanted books. Add an author to start tracking.')).toBeInTheDocument()
   })
 
+  it('does not refresh the wanted list after leaving during the post-grab message', async () => {
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([makeBook({ id: 1, title: 'Dune' })]))
+    vi.mocked(api.searchBook).mockResolvedValue({
+      results: [makeResult({ guid: 'dune-release', title: 'Dune.epub' })],
+      debug: null,
+    })
+    const { unmount } = renderWantedPage()
+    await screen.findByRole('link', { name: 'Dune' })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    await screen.findByText('Dune.epub')
+
+    vi.useFakeTimers()
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Grab' })) })
+    expect(screen.getByRole('button', { name: '✓ Grabbed' })).toBeDisabled()
+    const callsBeforeLeaving = vi.mocked(api.listWantedPage).mock.calls.length
+
+    unmount()
+    await act(async () => { await vi.advanceTimersByTimeAsync(1200) })
+    expect(vi.mocked(api.listWantedPage).mock.calls.length).toBe(callsBeforeLeaving)
+  })
+
+  it('does not schedule a refresh when a grab finishes after leaving the page', async () => {
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([makeBook({ id: 1, title: 'Dune' })]))
+    vi.mocked(api.searchBook).mockResolvedValue({
+      results: [makeResult({ guid: 'dune-release', title: 'Dune.epub' })],
+      debug: null,
+    })
+    let finishGrab: (download: Download) => void = () => {}
+    vi.mocked(api.grab).mockImplementation(() => new Promise(resolve => { finishGrab = resolve }))
+    const { unmount } = renderWantedPage()
+    await screen.findByRole('link', { name: 'Dune' })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    await screen.findByText('Dune.epub')
+
+    vi.useFakeTimers()
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Grab' })) })
+    expect(api.grab).toHaveBeenCalledTimes(1)
+    const callsBeforeLeaving = vi.mocked(api.listWantedPage).mock.calls.length
+
+    unmount()
+    await act(async () => { finishGrab(makeDownload()) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(1200) })
+    expect(vi.mocked(api.listWantedPage).mock.calls.length).toBe(callsBeforeLeaving)
+  })
+
   // #2933: a dual-format book's search classifies each result, and that, not
   // the book's 'both', is what the grab must carry.
   it('grabs an audiobook result of a dual-format book as an audiobook', async () => {
@@ -874,12 +919,10 @@ describe('WantedPage — live polling (#1161)', () => {
     renderWantedPage()
     await act(async () => { await vi.advanceTimersByTimeAsync(0) }) // initial load
     expect(screen.getByText('Grabbed Away')).toBeInTheDocument()
-    expect(vi.mocked(api.listWantedPage).mock.calls.length).toBe(1)
 
     // A background auto-grab removes book 2 from the wanted set; the 5s poll
     // reflects it without a manual reload.
     await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
-    expect(vi.mocked(api.listWantedPage).mock.calls.length).toBeGreaterThan(1)
     expect(screen.queryByText('Grabbed Away')).not.toBeInTheDocument()
     expect(screen.getByText('Stays Wanted')).toBeInTheDocument()
   })

@@ -88,9 +88,15 @@ export default function WantedPage() {
   // Set-state-after-unmount guard for the fetches and the poll, which outlive
   // any one effect.
   const mounted = useRef(true)
+  const grabRefreshTimers = useRef<Set<ReturnType<typeof setTimeout>>>(new Set())
   useEffect(() => {
     mounted.current = true
-    return () => { mounted.current = false }
+    const timers = grabRefreshTimers.current
+    return () => {
+      mounted.current = false
+      for (const timer of timers) clearTimeout(timer)
+      timers.clear()
+    }
   }, [])
 
   // The query a total belongs to, minus the page. The snap back to the last
@@ -269,13 +275,15 @@ export default function WantedPage() {
         ...(variant ? { variantId: variant.id } : {}),
         ...(overrideReason ? { languageOverrideReason: overrideReason } : {}),
       }, confirm, t)
-      if (!dl) return
+      if (!dl || !mounted.current) return
       setGrabbedGuid(result.guid)
-      setTimeout(() => {
+      const timer = setTimeout(() => {
+        grabRefreshTimers.current.delete(timer)
         setShowResults(null)
         setGrabbedGuid(null)
         load()
       }, 1200)
+      grabRefreshTimers.current.add(timer)
     } catch (err: unknown) {
       alert(errorText(err, t('wanted.grabFailed', 'Grab failed')))
     } finally {
