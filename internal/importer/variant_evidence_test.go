@@ -221,14 +221,23 @@ func TestAssessVariantEvidence_ExactAudioTitleExplicitAuthor(t *testing.T) {
 	}{
 		{"wrong author with no tags", "Dune by Brian Herbert [ENG / M4B]", "", "", false, false, true},
 		{"wrong author with unreadable tags", "Dune by Brian Herbert [ENG / M4B]", "", "", true, false, true},
+		{"wrong author role before narrator", "Dune - Brian Herbert - author, Simon Vance - narrator [ENG/M4B]", "", "", false, false, true},
+		{"by author role before narrator", "Dune by Brian Herbert - author, Simon Vance - narrator [ENG/M4B]", "", "", false, false, true},
+		{"wrong author role after narrator", "Dune - Simon Vance - narrator, Brian Herbert - author [ENG/M4B]", "", "", false, false, true},
+		{"matching narrator cannot redeem wrong author role", "Dune - Brian Herbert - author, Frank Herbert - narrator [ENG/M4B]", "Dune", "Frank Herbert", false, false, true},
 		{"matching album with bare narrator artist cannot redeem release", "Dune by Brian Herbert [ENG / M4B]", "Dune", "Brian Herbert", false, false, true},
 		{"matching album with read-by narrator cannot redeem release", "Dune by Brian Herbert [ENG / M4B]", "Dune", "Read by Brian Herbert", false, false, true},
 		{"language override cannot waive wrong author", "Dune by Brian Herbert [ROM / M4B]", "Dune", "Frank Herbert", false, true, true},
 		{"correct author with no tags", "Dune by Frank Herbert [ENG / M4B]", "", "", false, false, false},
+		{"correct author role before narrator", "Dune - Frank Herbert - author, Brian Herbert - narrator [ENG/M4B]", "", "", false, false, false},
+		{"correct author role alone", "Dune - Frank Herbert - author [ENG/M4B]", "", "", false, false, false},
 		{"author-first release stays eligible", "Frank Herbert - Dune [ENG / M4B]", "Dune", "Frank Herbert", false, false, false},
 		{"correct author with narrator artist", "Dune by Frank Herbert [ENG / M4B]", "Dune", "Brian Herbert", false, false, false},
 		{"read by is not an author credit", "Dune - Read by Brian Herbert [ENG / M4B]", "Dune", "", false, false, false},
 		{"narrated by is not an author credit", "Dune Narrated by Brian Herbert [ENG / M4B]", "Dune", "Brian Herbert", false, false, false},
+		{"by narrator role is not an author", "Dune by Brian Herbert - narrator [ENG/M4B]", "", "", false, false, false},
+		{"by narrator role with tags is not an author", "Dune by Brian Herbert - narrator [ENG/M4B]", "Dune", "Brian Herbert", false, false, false},
+		{"dash narrator role is not an author", "Dune - Brian Herbert - narrator [ENG/M4B]", "", "", false, false, false},
 		{"same author may retitle a translation", "Duna by Frank Herbert [ENG / M4B]", "Dune", "Frank Herbert", false, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

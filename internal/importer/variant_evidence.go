@@ -61,16 +61,41 @@ func (s *Scanner) AssessVariantEvidence(ctx context.Context, download *models.Do
 			parsed.Title, parsed.Author = parsed.Author, parsed.Title
 		}
 	}
+	// The generic parser splits "Dune by Brian Herbert - narrator" at the
+	// dash, leaving "narrator" as the author. Restore the credit only when
+	// the part before "by" names the requested work and the dash names a role.
+	if by := byAuthorRe.FindStringSubmatch(parsed.Title); len(by) == 3 && equivalentWorkTitle(book.Title, by[1]) {
+		credit := by[2] + " - " + parsed.Author
+		if authorRoleRe.MatchString(credit) || contributorRoleRe.MatchString(credit) {
+			parsed.Title, parsed.Author = by[1], credit
+		}
+	}
+	// Prefer people explicitly labelled as authors; a narrator elsewhere in
+	// the contributor list must neither erase that credit nor agree for it.
+	creditedAuthor := parsed.Author
+	var authors []string
+	for _, part := range strings.Split(creditedAuthor, ",") {
+		if loc := authorRoleRe.FindStringIndex(part); loc != nil {
+			if name := strings.TrimSpace(part[:loc[0]]); name != "" {
+				authors = append(authors, name)
+			}
+		}
+	}
+	if len(authors) > 0 {
+		creditedAuthor = strings.Join(authors, " and ")
+	} else if candidates := contributorCandidates(creditedAuthor); len(candidates) > 0 {
+		creditedAuthor = strings.Join(candidates, " and ")
+	}
 	// "Read by" is a narrator credit, whether the parser kept it in Author
 	// ("Dune - Read by ...") or attached its role to Title ("Dune Read by ...").
-	narratorCredit := isNarratorCredit(parsed.Author) || contributorRoleRe.MatchString(parsed.Author)
+	narratorCredit := isNarratorCredit(creditedAuthor) || contributorRoleRe.MatchString(creditedAuthor)
 	if suffix, ok := strings.CutPrefix(strings.ToLower(parsed.Title), strings.ToLower(book.Title)+" "); ok {
-		narratorCredit = narratorCredit || isNarratorCredit(suffix+" by "+parsed.Author)
+		narratorCredit = narratorCredit || isNarratorCredit(suffix+" by "+creditedAuthor)
 	}
-	releaseAuthorAgrees, releaseAuthorNamed := ebookAuthorAgreement(names, parsed.Author)
+	releaseAuthorAgrees, releaseAuthorNamed := ebookAuthorAgreement(names, creditedAuthor)
 	if narratorCredit {
 		releaseAuthorAgrees, releaseAuthorNamed = true, false
-	} else if authorAndWorkDisagree(names, parsed.Title, parsed.Author) {
+	} else if authorAndWorkDisagree(names, parsed.Title, creditedAuthor) {
 		e.WrongWork = true
 		e.Reason = "release identifies a different work and author"
 	}

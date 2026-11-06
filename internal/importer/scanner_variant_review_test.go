@@ -212,13 +212,21 @@ func TestVariantImport_ExactTitleWrongAudioAuthorNeverLinks(t *testing.T) {
 	}{
 		{"wrong author, no tags", "Dune by Brian Herbert [ENG / M4B]", "", "", false, false, true},
 		{"wrong author, unreadable tags", "Dune by Brian Herbert [ENG / M4B]", "", "", true, false, true},
+		{"wrong author role before narrator", "Dune - Brian Herbert - author, Simon Vance - narrator [ENG/M4B]", "", "", false, false, true},
+		{"by author role before narrator", "Dune by Brian Herbert - author, Simon Vance - narrator [ENG/M4B]", "", "", false, false, true},
+		{"wrong author role after narrator", "Dune - Simon Vance - narrator, Brian Herbert - author [ENG/M4B]", "", "", false, false, true},
+		{"wrong author role with matching narrator tag", "Dune - Brian Herbert - author, Frank Herbert - narrator [ENG/M4B]", "Dune", "Frank Herbert", false, false, true},
 		{"wrong author, album Dune and bare narrator Brian", "Dune by Brian Herbert [ENG / M4B]", "Dune", "Brian Herbert", false, false, true},
 		{"wrong author, album Dune and read-by narrator", "Dune by Brian Herbert [ENG / M4B]", "Dune", "Read by Brian Herbert", false, false, true},
 		{"wrong author, named admin language override", "Dune by Brian Herbert [ROM / M4B]", "Dune", "Frank Herbert", false, true, true},
 		{"right author, no tags", "Dune by Frank Herbert [ENG / M4B]", "", "", false, false, false},
+		{"right author role before narrator", "Dune - Frank Herbert - author, Brian Herbert - narrator [ENG/M4B]", "", "", false, false, false},
+		{"right author role alone", "Dune - Frank Herbert - author [ENG/M4B]", "", "", false, false, false},
 		{"author-first release", "Frank Herbert - Dune [ENG / M4B]", "Dune", "Frank Herbert", false, false, false},
 		{"right author, narrator Brian", "Dune by Frank Herbert [ENG / M4B]", "Dune", "Brian Herbert", false, false, false},
 		{"narrator credit is not an author", "Dune - Read by Brian Herbert [ENG / M4B]", "Dune", "", false, false, false},
+		{"by narrator role is not an author", "Dune by Brian Herbert - narrator [ENG/M4B]", "", "", false, false, false},
+		{"dash narrator role is not an author", "Dune - Brian Herbert - narrator [ENG/M4B]", "", "", false, false, false},
 		{"same author retitle", "Duna by Frank Herbert [ENG / M4B]", "Dune", "Frank Herbert", false, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -265,34 +273,41 @@ func TestVariantImport_ExactTitleWrongAudioAuthorNeverLinks(t *testing.T) {
 }
 
 func TestVariantImport_ExactTitleKnownAuthorAliasStaysEligible(t *testing.T) {
-	f := newVariantReviewFixture(t, "Dune", "Frank Herbert", models.MediaTypeAudiobook, "eng")
-	aliases := db.NewAuthorAliasRepo(f.database)
-	if err := aliases.Create(f.ctx, &models.AuthorAlias{AuthorID: f.book.AuthorID, Name: "Francis Albus"}); err != nil {
-		t.Fatal(err)
-	}
-	folder := filepath.Join(f.sources, "recording")
-	if err := os.Mkdir(folder, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	source := filepath.Join(folder, "Dune.m4b")
-	if err := os.WriteFile(source, mp4File(atom("\xa9alb", dataAtom(1, []byte("Dune")))), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	dl := f.addDownload(t, "Dune by Francis Albus [ENG / M4B]")
-	author, err := db.NewAuthorRepo(f.database).GetByID(f.ctx, f.book.AuthorID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	without, err := f.scanner.AssessVariantEvidence(f.ctx, dl, f.book, author, &f.variant, []string{source}, false)
-	if err != nil || !without.WrongWork {
-		t.Fatalf("unrecognized author credit must require review: %+v, %v", without, err)
-	}
-	f.scanner.WithAuthorAliases(aliases)
-	f.scanner.tryImportInternal(withTorrentOwnFolder(f.ctx, true), dl, folder,
-		"qbittorrent", "test-hash", "", nil, []string{source})
-	f.assertVariantPlaced(t, dl)
-	if _, err := os.Stat(source); err != nil {
-		t.Fatalf("seed was changed: %v", err)
+	for _, release := range []string{
+		"Dune by Francis Albus [ENG / M4B]",
+		"Dune - Francis Albus - author, Simon Vance - narrator [ENG/M4B]",
+	} {
+		t.Run(release, func(t *testing.T) {
+			f := newVariantReviewFixture(t, "Dune", "Frank Herbert", models.MediaTypeAudiobook, "eng")
+			aliases := db.NewAuthorAliasRepo(f.database)
+			if err := aliases.Create(f.ctx, &models.AuthorAlias{AuthorID: f.book.AuthorID, Name: "Francis Albus"}); err != nil {
+				t.Fatal(err)
+			}
+			folder := filepath.Join(f.sources, "recording")
+			if err := os.Mkdir(folder, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			source := filepath.Join(folder, "Dune.m4b")
+			if err := os.WriteFile(source, mp4File(atom("\xa9alb", dataAtom(1, []byte("Dune")))), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			dl := f.addDownload(t, release)
+			author, err := db.NewAuthorRepo(f.database).GetByID(f.ctx, f.book.AuthorID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			without, err := f.scanner.AssessVariantEvidence(f.ctx, dl, f.book, author, &f.variant, []string{source}, false)
+			if err != nil || !without.WrongWork {
+				t.Fatalf("unrecognized author credit must require review: %+v, %v", without, err)
+			}
+			f.scanner.WithAuthorAliases(aliases)
+			f.scanner.tryImportInternal(withTorrentOwnFolder(f.ctx, true), dl, folder,
+				"qbittorrent", "test-hash", "", nil, []string{source})
+			f.assertVariantPlaced(t, dl)
+			if _, err := os.Stat(source); err != nil {
+				t.Fatalf("seed was changed: %v", err)
+			}
+		})
 	}
 }
 
