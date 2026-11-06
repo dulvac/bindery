@@ -162,11 +162,14 @@ func TestAssessVariantEvidence_UnreadableMetadataCannotHideExplicitLanguageMisma
 func writeVariantM4B(t *testing.T, album, artist string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "sample.m4b")
-	data := mp4File(
-		atom("\xa9nam", dataAtom(1, []byte("Chapter 1"))),
-		atom("\xa9alb", dataAtom(1, []byte(album))),
-		atom("\xa9ART", dataAtom(1, []byte(artist))),
-	)
+	data := mp4File()
+	if album != "" || artist != "" {
+		data = mp4File(
+			atom("\xa9nam", dataAtom(1, []byte("Chapter 1"))),
+			atom("\xa9alb", dataAtom(1, []byte(album))),
+			atom("\xa9ART", dataAtom(1, []byte(artist))),
+		)
+	}
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -204,6 +207,49 @@ func TestAssessVariantEvidence_AudioIdentityAndUnknownLanguage(t *testing.T) {
 			}
 			if tc.wrongWork && !strings.Contains(got.Reason, "work") {
 				t.Errorf("wrong work needs an explanation, got %q", got.Reason)
+			}
+		})
+	}
+}
+
+// An explicit author credit is release evidence even when its title exactly
+// matches the requested work. Tags cannot make that conflicting credit safe.
+func TestAssessVariantEvidence_ExactAudioTitleExplicitAuthor(t *testing.T) {
+	for _, tc := range []struct {
+		name, release, album, artist    string
+		unreadable, override, wrongWork bool
+	}{
+		{"wrong author with no tags", "Dune by Brian Herbert [ENG / M4B]", "", "", false, false, true},
+		{"wrong author with unreadable tags", "Dune by Brian Herbert [ENG / M4B]", "", "", true, false, true},
+		{"matching album with bare narrator artist cannot redeem release", "Dune by Brian Herbert [ENG / M4B]", "Dune", "Brian Herbert", false, false, true},
+		{"matching album with read-by narrator cannot redeem release", "Dune by Brian Herbert [ENG / M4B]", "Dune", "Read by Brian Herbert", false, false, true},
+		{"language override cannot waive wrong author", "Dune by Brian Herbert [ROM / M4B]", "Dune", "Frank Herbert", false, true, true},
+		{"correct author with no tags", "Dune by Frank Herbert [ENG / M4B]", "", "", false, false, false},
+		{"author-first release stays eligible", "Frank Herbert - Dune [ENG / M4B]", "Dune", "Frank Herbert", false, false, false},
+		{"correct author with narrator artist", "Dune by Frank Herbert [ENG / M4B]", "Dune", "Brian Herbert", false, false, false},
+		{"read by is not an author credit", "Dune - Read by Brian Herbert [ENG / M4B]", "Dune", "", false, false, false},
+		{"narrated by is not an author credit", "Dune Narrated by Brian Herbert [ENG / M4B]", "Dune", "Brian Herbert", false, false, false},
+		{"same author may retitle a translation", "Duna by Frank Herbert [ENG / M4B]", "Dune", "Frank Herbert", false, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeVariantM4B(t, tc.album, tc.artist)
+			if tc.unreadable {
+				if err := os.WriteFile(path, []byte("not an MP4"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			book := &models.Book{ID: 11, Title: "Dune"}
+			got, err := (&Scanner{}).AssessVariantEvidence(context.Background(),
+				&models.Download{ID: 42, Title: tc.release}, book, &models.Author{Name: "Frank Herbert"},
+				&models.BookVariant{BookID: book.ID, MediaType: models.MediaTypeAudiobook, Language: "eng"}, []string{path}, tc.override)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.WrongWork != tc.wrongWork || got.Verification != "unverified" {
+				t.Fatalf("release %q: evidence %+v, want wrongWork=%t and unverified", tc.release, got, tc.wrongWork)
+			}
+			if tc.wrongWork && !strings.Contains(got.Reason, "work") {
+				t.Fatalf("wrong work needs an explanation: %+v", got)
 			}
 		})
 	}

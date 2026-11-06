@@ -50,12 +50,27 @@ func (s *Scanner) AssessVariantEvidence(ctx context.Context, download *models.Do
 		e.Reason = "release language is ambiguous"
 	}
 
-	// An explicit title AND conflicting author are stronger work evidence than
-	// title overlap (e.g. "Dreamer of Dune" contains the word "Dune").
+	// An explicit conflicting author identifies another work even if its title
+	// is exactly the requested title. The filename parser also accepts the
+	// author-first convention; only flip that reading when the left side names
+	// a known author and the right side is the requested work.
 	names := s.authorNamesFor(ctx, author)
 	parsed := ParseFilename(strings.ReplaceAll(download.Title, "/", " "))
+	if equivalentWorkTitle(book.Title, parsed.Author) {
+		if agrees, named := ebookAuthorAgreement(names, parsed.Title); agrees && named {
+			parsed.Title, parsed.Author = parsed.Author, parsed.Title
+		}
+	}
+	// "Read by" is a narrator credit, whether the parser kept it in Author
+	// ("Dune - Read by ...") or attached its role to Title ("Dune Read by ...").
+	narratorCredit := isNarratorCredit(parsed.Author) || contributorRoleRe.MatchString(parsed.Author)
+	if suffix, ok := strings.CutPrefix(strings.ToLower(parsed.Title), strings.ToLower(book.Title)+" "); ok {
+		narratorCredit = narratorCredit || isNarratorCredit(suffix+" by "+parsed.Author)
+	}
 	releaseAuthorAgrees, releaseAuthorNamed := ebookAuthorAgreement(names, parsed.Author)
-	if authorAndWorkDisagree(book.Title, names, parsed.Title, parsed.Author) {
+	if narratorCredit {
+		releaseAuthorAgrees, releaseAuthorNamed = true, false
+	} else if authorAndWorkDisagree(names, parsed.Title, parsed.Author) {
 		e.WrongWork = true
 		e.Reason = "release identifies a different work and author"
 	}
@@ -64,7 +79,7 @@ func (s *Scanner) AssessVariantEvidence(ctx context.Context, download *models.Do
 	case models.MediaTypeEbook:
 		s.assessEbookVariant(ctx, book, author, variant.Language, sourceFiles, &e)
 	case models.MediaTypeAudiobook:
-		releaseTitleDiffers := usableWorkTitle(parsed.Title) && !equivalentWorkTitle(book.Title, parsed.Title)
+		releaseTitleDiffers := !narratorCredit && usableWorkTitle(parsed.Title) && !equivalentWorkTitle(book.Title, parsed.Title)
 		// A bare Artist tag may name the narrator. A different release title
 		// alone cannot corroborate it when the release names the right author.
 		s.assessAudiobookVariant(ctx, book, names, releaseTitleDiffers && !releaseAuthorNamed, !releaseAuthorAgrees, sourceFiles, &e)
@@ -126,11 +141,11 @@ func variantReleaseLanguages(title, bookTitle string) []string {
 	return codes
 }
 
-// authorAndWorkDisagree shares the content checks' author comparison but
-// demands an equal title form, not the broad whole-word containment that lets
-// "Dreamer of Dune" support a search for the novel "Dune".
-func authorAndWorkDisagree(wanted string, names []string, title, creditedAuthor string) bool {
-	if len(names) == 0 || !usableWorkTitle(title) || equivalentWorkTitle(wanted, title) {
+// authorAndWorkDisagree shares the content checks' alias-aware author
+// comparison. An explicit different author is a work conflict for both equal
+// and different titles; a missing or inconclusive credit is not evidence.
+func authorAndWorkDisagree(names []string, title, creditedAuthor string) bool {
+	if len(names) == 0 || !usableWorkTitle(title) {
 		return false
 	}
 	agrees, _ := ebookAuthorAgreement(names, creditedAuthor)
@@ -192,7 +207,7 @@ func (s *Scanner) assessEbookVariant(ctx context.Context, book *models.Book, aut
 		allDifferent := true
 		for _, path := range bounded {
 			meta, err := ReadEbookMetadata(path)
-			if err != nil || !authorAndWorkDisagree(book.Title, names, meta.Title, meta.Author) {
+			if err != nil || !authorAndWorkDisagree(names, meta.Title, meta.Author) {
 				allDifferent = false
 				break
 			}

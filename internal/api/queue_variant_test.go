@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/vavallee/bindery/internal/auth"
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/httpsec"
+	"github.com/vavallee/bindery/internal/importer"
 	"github.com/vavallee/bindery/internal/indexer/newznab"
 	"github.com/vavallee/bindery/internal/models"
 )
@@ -129,6 +132,56 @@ func TestQueueVariantGrabWrongLanguageAndMissingSelectionRefused(t *testing.T) {
 	}
 	if current[0].Status != models.VariantWanted || current[1].Status != models.VariantDownloading {
 		t.Fatalf("variant states = %+v", current)
+	}
+}
+
+// A manual grab may bypass search relevance. The fake download is still
+// reassessed against its exact release title before it can enter the library.
+func TestQueueVariantGrab_ExactTitleWrongAuthorCannotImportFromFakeClient(t *testing.T) {
+	defer httpsec.AllowLoopbackForTests()()
+	client, srv := newCategoryRecorder(t)
+	h, database, book, ctx := categoryFixture(t, srv.URL)
+	copies, err := db.NewBookVariantRepo(database).EnsureWanted(ctx, book.ID, models.MediaTypeAudiobook, []string{"eng"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const release = "The Primal Hunter 9 by Other Writer [ENG / M4B]"
+	grab := queueVariantGrab(t, h, ctx, map[string]any{
+		"guid": "manual-wrong-author", "title": release, "nzbUrl": srv.URL + "/manual.nzb",
+		"bookId": book.ID, "variantId": copies[0].ID, "protocol": "usenet", "mediaType": models.MediaTypeAudiobook,
+	})
+	if grab.Code != http.StatusAccepted {
+		t.Fatalf("fake grab: %d %s", grab.Code, grab.Body.String())
+	}
+	if category := client.last(t); category != audiobookCategory {
+		t.Fatalf("fake send category = %q, want audiobook", category)
+	}
+	dl, err := h.downloads.GetByGUID(ctx, "manual-wrong-author")
+	if err != nil || dl == nil || dl.Title != release || dl.VariantID == nil || *dl.VariantID != copies[0].ID {
+		t.Fatalf("grab lost release/variant identity: %+v, %v", dl, err)
+	}
+	folder, library := t.TempDir(), t.TempDir()
+	source := filepath.Join(folder, "recording.m4b")
+	data := []byte("unreadable synthetic audio tags")
+	if err := os.WriteFile(source, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	scanner := importer.NewScanner(h.downloads, db.NewDownloadClientRepo(database), h.books,
+		db.NewAuthorRepo(database), db.NewHistoryRepo(database), library, library, "", "", "")
+	scanner.ImportFilesFromPath(ctx, dl, folder, []string{source}, "")
+	files, err := h.books.ListFiles(ctx, book.ID)
+	if err != nil || len(files) != 0 {
+		t.Fatalf("manual wrong-author grab exposed a library file: %+v, %v", files, err)
+	}
+	variants, err := h.books.VariantRepo().ListByBook(ctx, book.ID)
+	if err != nil || len(variants) != 1 || variants[0].Status != models.VariantReview {
+		t.Fatalf("manual wrong-author grab did not enter review: %+v, %v", variants, err)
+	}
+	if rejected, err := h.books.RejectionRepo().IsRejected(ctx, book.ID, copies[0].ID, source); err != nil || !rejected {
+		t.Fatalf("source not durably rejected: rejected=%t, err=%v", rejected, err)
+	}
+	if after, err := os.ReadFile(source); err != nil || string(after) != string(data) {
+		t.Fatalf("source was changed after fake download: %v", err)
 	}
 }
 

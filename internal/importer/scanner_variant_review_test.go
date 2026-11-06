@@ -203,6 +203,99 @@ func TestVariantImport_EbookEvidenceBeforeAnyLink(t *testing.T) {
 	}
 }
 
+// A manual or older grab can bypass search relevance. Its completed torrent
+// must still pass release identity review before any public hardlink is made.
+func TestVariantImport_ExactTitleWrongAudioAuthorNeverLinks(t *testing.T) {
+	for _, tc := range []struct {
+		name, release, album, artist string
+		unreadable, override, reject bool
+	}{
+		{"wrong author, no tags", "Dune by Brian Herbert [ENG / M4B]", "", "", false, false, true},
+		{"wrong author, unreadable tags", "Dune by Brian Herbert [ENG / M4B]", "", "", true, false, true},
+		{"wrong author, album Dune and bare narrator Brian", "Dune by Brian Herbert [ENG / M4B]", "Dune", "Brian Herbert", false, false, true},
+		{"wrong author, album Dune and read-by narrator", "Dune by Brian Herbert [ENG / M4B]", "Dune", "Read by Brian Herbert", false, false, true},
+		{"wrong author, named admin language override", "Dune by Brian Herbert [ROM / M4B]", "Dune", "Frank Herbert", false, true, true},
+		{"right author, no tags", "Dune by Frank Herbert [ENG / M4B]", "", "", false, false, false},
+		{"author-first release", "Frank Herbert - Dune [ENG / M4B]", "Dune", "Frank Herbert", false, false, false},
+		{"right author, narrator Brian", "Dune by Frank Herbert [ENG / M4B]", "Dune", "Brian Herbert", false, false, false},
+		{"narrator credit is not an author", "Dune - Read by Brian Herbert [ENG / M4B]", "Dune", "", false, false, false},
+		{"same author retitle", "Duna by Frank Herbert [ENG / M4B]", "Dune", "Frank Herbert", false, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newVariantReviewFixture(t, "Dune", "Frank Herbert", models.MediaTypeAudiobook, "eng")
+			folder := filepath.Join(f.sources, "recording")
+			if err := os.Mkdir(folder, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			source := filepath.Join(folder, "Dune.m4b")
+			data := mp4File()
+			if tc.album != "" || tc.artist != "" {
+				data = mp4File(atom("\xa9alb", dataAtom(1, []byte(tc.album))), atom("\xa9ART", dataAtom(1, []byte(tc.artist))))
+			}
+			if tc.unreadable {
+				data = []byte("not an MP4")
+			}
+			if err := os.WriteFile(source, data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			dl := f.addDownload(t, tc.release)
+			if tc.override {
+				audit, _ := json.Marshal(map[string]any{"actorUserId": 42, "variantId": f.variant.ID,
+					"downloadId": dl.ID, "reason": "admin approved this language"})
+				if err := f.history.Create(f.ctx, &models.HistoryEvent{BookID: &f.book.ID,
+					EventType: "variantLanguageOverride", SourceTitle: tc.release, Data: string(audit)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.scanner.tryImportInternal(withTorrentOwnFolder(f.ctx, true), dl, folder,
+				"qbittorrent", "test-hash", "", nil, []string{source})
+			if tc.reject {
+				f.assertReview(t, folder)
+				if got, err := f.downloads.GetByID(f.ctx, dl.ID); err != nil || got.Status == models.StateImported {
+					t.Fatalf("wrong work imported: %+v, %v", got, err)
+				}
+			} else {
+				f.assertVariantPlaced(t, dl)
+			}
+			if after, err := os.ReadFile(source); err != nil || string(after) != string(data) {
+				t.Fatalf("torrent source changed: %v", err)
+			}
+		})
+	}
+}
+
+func TestVariantImport_ExactTitleKnownAuthorAliasStaysEligible(t *testing.T) {
+	f := newVariantReviewFixture(t, "Dune", "Frank Herbert", models.MediaTypeAudiobook, "eng")
+	aliases := db.NewAuthorAliasRepo(f.database)
+	if err := aliases.Create(f.ctx, &models.AuthorAlias{AuthorID: f.book.AuthorID, Name: "Francis Albus"}); err != nil {
+		t.Fatal(err)
+	}
+	folder := filepath.Join(f.sources, "recording")
+	if err := os.Mkdir(folder, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(folder, "Dune.m4b")
+	if err := os.WriteFile(source, mp4File(atom("\xa9alb", dataAtom(1, []byte("Dune")))), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dl := f.addDownload(t, "Dune by Francis Albus [ENG / M4B]")
+	author, err := db.NewAuthorRepo(f.database).GetByID(f.ctx, f.book.AuthorID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	without, err := f.scanner.AssessVariantEvidence(f.ctx, dl, f.book, author, &f.variant, []string{source}, false)
+	if err != nil || !without.WrongWork {
+		t.Fatalf("unrecognized author credit must require review: %+v, %v", without, err)
+	}
+	f.scanner.WithAuthorAliases(aliases)
+	f.scanner.tryImportInternal(withTorrentOwnFolder(f.ctx, true), dl, folder,
+		"qbittorrent", "test-hash", "", nil, []string{source})
+	f.assertVariantPlaced(t, dl)
+	if _, err := os.Stat(source); err != nil {
+		t.Fatalf("seed was changed: %v", err)
+	}
+}
+
 func TestVariantImport_AudioWorkEvidencePrecedesIdempotency(t *testing.T) {
 	for _, tc := range []struct {
 		name, release, album, artist string
