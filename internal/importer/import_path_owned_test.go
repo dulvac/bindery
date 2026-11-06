@@ -238,8 +238,39 @@ func TestImport_AudiobookPathOwnedByOtherBook_FailsNamingOwner(t *testing.T) {
 	f.importDownload(t)
 
 	f.assertBlockedNamingOwner(t)
+	dl, _ := f.reload(t)
+	if !strings.Contains(dl.ErrorMessage, "reconcile") || !strings.Contains(dl.ErrorMessage, dest) {
+		t.Errorf("strict hardlink conflict does not name public reconciliation path: %q", dl.ErrorMessage)
+	}
+	sourceInfo, srcErr := os.Stat(filepath.Join(f.dir, "Defiance of the Fall 3.m4b"))
+	linkedInfo, linkErr := os.Stat(filepath.Join(dest, "Defiance of the Fall 3.m4b"))
+	if srcErr != nil || linkErr != nil || !os.SameFile(sourceInfo, linkedInfo) {
+		t.Errorf("strict hardlink should remain for reconciliation without moving the seed: %v, %v", srcErr, linkErr)
+	}
+}
+
+// A non-qBittorrent download retains the old copy-mode rollback on a path
+// conflict; only the qBittorrent strict-hardlink path leaves public links.
+func TestImport_AudiobookNonQbitCopyPathOwned_CleansDestination(t *testing.T) {
+	f := newPathOwnedFixture(t, models.MediaTypeAudiobook)
+	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(f.dir, "Defiance of the Fall 3.m4b"), make([]byte, 4096), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dest, err := f.scanner.destRenamer(ctx).AudiobookDestDir(f.scanner.effectiveAudiobookDir(ctx, f.author), f.author, f.right, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.books.SetFormatFilePath(ctx, f.wrong.ID, models.MediaTypeAudiobook, dest); err != nil {
+		t.Fatal(err)
+	}
+	f.scanner.tryImportInternal(ctx, f.dl, f.dir, "transmission", "abc123", "", nil, nil)
+	f.assertBlockedNamingOwner(t)
 	if _, err := os.Stat(dest); !os.IsNotExist(err) {
-		t.Errorf("copied audiobook folder left at %s after a blocked import (stat err %v)", dest, err)
+		t.Errorf("non-qBittorrent copy left a folder at %s (stat err %v)", dest, err)
+	}
+	if _, err := os.Stat(filepath.Join(f.dir, "Defiance of the Fall 3.m4b")); err != nil {
+		t.Errorf("non-qBittorrent copy removed source: %v", err)
 	}
 }
 

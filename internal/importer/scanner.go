@@ -2240,8 +2240,10 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 				// attempt instead — but only when the sources still exist.
 				// After a move they do not, and those files are the only
 				// copy, so they stay put and the error tells the user where.
+				// Strict hardlinks also stay: a public name may now belong to
+				// another writer, even though its source still exists.
 				//
-				// The rollback runs even when nothing was placed (#2504).
+				// Non-strict rollback runs even when nothing was placed (#2504).
 				// Failing on the FIRST file leaves placed empty, and gating on
 				// it skipped the cleanup for exactly the case where there is
 				// nothing to weigh against removing the folder: the MkdirAll
@@ -2251,10 +2253,15 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 				// files already placed the folder still stays, since removing
 				// it would take the only copy of them with it.
 				if dirErr != nil {
-					if mode == "move" && len(placed) > 0 {
+					switch {
+					case mode == "hardlink-strict":
+						// Public names may have been replaced since placement.
+						// Leave them for reconciliation instead of unlinking.
+						dirErr = strictHardlinkPartialError(destDir, dirErr)
+					case mode == "move" && len(placed) > 0:
 						slog.Warn("audiobook move failed partway; placed files left in place because their sources are already gone",
 							"dst", destDir, "placed", len(placed))
-					} else {
+					default:
 						rollbackPlacedFiles(destDir, placed)
 					}
 				}
@@ -2333,11 +2340,12 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 					// though the single-file branch below shares it (#2686).
 					// The flatten paths cannot take a pre-existing destDir:
 					// they document and rely on having created it themselves,
-					// and remove it wholesale (os.RemoveAll) to roll back any
-					// error, which against a shared folder would delete the
-					// ebook sitting in it. They keep the historical UniqueDir
-					// behaviour, so a library using an audiobook naming
-					// template or multi-disc flattening still splits into
+					// and historically removed it wholesale on error, which
+					// against a shared folder would delete the ebook sitting in
+					// it. Strict hardlinks now preserve partial public links on
+					// failure; they still require their own destination folder.
+					// The historical UniqueDir behavior still splits a library
+					// using a naming template or multi-disc flattening into
 					// "Title (2)" until flatten's rollback is reworked to only
 					// remove what it placed. The per-file placement branch
 					// (usePerFile) keeps it for the same reason: it flattens
@@ -2431,15 +2439,17 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 					// original (#2504). Move mode passes no name: the file
 					// either arrived or it did not, and a partial destination
 					// whose source is already gone is not ours to delete.
-					// rollbackPlacedFiles removes the folder through its
-					// parent, which only succeeds while it is empty, so a
-					// shared folder holding this book's ebook is safe either
-					// way: the half-placed file goes, the folder and the ebook
-					// in it stay.
+					// For non-strict modes rollbackPlacedFiles removes the
+					// folder through its parent only while empty, so a shared
+					// folder holding this book's ebook survives. Strict mode
+					// preserves the public name for reconciliation instead.
 					if dirErr != nil {
-						if mode == "move" {
+						switch mode {
+						case "hardlink-strict":
+							dirErr = strictHardlinkPartialError(destDir, dirErr)
+						case "move":
 							rollbackPlacedFiles(destDir, nil)
-						} else {
+						default:
 							rollbackPlacedFiles(destDir, []string{name})
 						}
 					}
@@ -2478,12 +2488,24 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 			if setErr != nil {
 				slog.Error("failed to record audiobook file path — failing import to avoid a re-grab duplicate",
 					"bookID", book.ID, "dst", destDir, "error", setErr)
-				// copy/hardlink left the source intact, so remove the
-				// just-placed destination and let the import retry cleanly.
-				// move already consumed the source, so keep the placed folder
-				// and point the user at it rather than deleting their only copy.
+				// Non-strict copy/hardlink left the source intact, so their
+				// destination can still be rolled back under the legacy policy.
+				// Strict links remain public for reconciliation: a writer may
+				// have replaced the directory or added files after placement.
+				// Move already consumed the source, so keep its placed folder
+				// rather than deleting the only copy.
 				switch {
-				case owned != nil && !mergedIntoExistingFolder && (mode == "copy" || mode == "hardlink" || mode == "hardlink-strict"):
+				case mode == "hardlink-strict":
+					// A published directory may now contain another writer's
+					// files. Do not remove it even when the DB path conflicts.
+					reason := fmt.Sprintf("audiobook strict hardlinks at %s could not be recorded (%v); reconcile public files", destDir, setErr)
+					if owned != nil {
+						reason += " and resolve ownership with Fix match"
+					} else {
+						reason += " before retry"
+					}
+					s.failImport(ctx, dl, models.StateImportBlocked, reason)
+				case owned != nil && !mergedIntoExistingFolder && (mode == "copy" || mode == "hardlink"):
 					// Another book holds the folder's path (#2937). destDir
 					// came from UniqueDir, so this import created it and it
 					// holds only what was just placed: remove it, and name
@@ -2514,7 +2536,7 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 					// skips whatever is already there.
 					s.failImport(ctx, dl, models.StateImportBlocked,
 						fmt.Sprintf("audiobook merged into %s but could not be recorded (%v); the files are preserved there — retry the import to record them", destDir, setErr))
-				case mode == "copy" || mode == "hardlink" || mode == "hardlink-strict":
+				case mode == "copy" || mode == "hardlink":
 					if rmErr := os.RemoveAll(destDir); rmErr != nil {
 						slog.Warn("failed to remove audiobook destination after DB error", "dst", destDir, "error", rmErr)
 					}

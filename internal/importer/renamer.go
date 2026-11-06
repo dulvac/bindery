@@ -1211,7 +1211,9 @@ func HardlinkDir(src, dst string) error {
 	return hardlinkDir(src, dst, true)
 }
 
-// HardlinkDirStrict leaves seeded data untouched if any link fails.
+// HardlinkDirStrict leaves seeded data untouched if any link fails. A failed
+// placement may leave public links in dst for manual reconciliation; it never
+// removes a path that another writer might have replaced.
 func HardlinkDirStrict(src, dst string) error {
 	return hardlinkDir(src, dst, false)
 }
@@ -1247,10 +1249,21 @@ func hardlinkDir(src, dst string, allowCopy bool) error {
 	defer func() { _ = dstRoot.Close() }()
 
 	if err := hardlinkDirRooted(srcRoot, dstRoot, ".", allowCopy); err != nil {
+		if !allowCopy {
+			return strictHardlinkPartialError(dst, err)
+		}
 		_ = os.RemoveAll(dst)
 		return err
 	}
 	return nil
+}
+
+// A strict import can publish some links before a later step fails. Neither
+// unlinking recorded names nor removing the destination directory is safe:
+// another writer may have replaced either since placement. Surface the path
+// so reconciliation can distinguish a partial import from a clean failure.
+func strictHardlinkPartialError(dst string, cause error) error {
+	return fmt.Errorf("strict hardlink placement at %q may be partial; reconcile public files before retry: %w", dst, cause)
 }
 
 // HardlinkDirMerge is HardlinkDir's merge-aware sibling — see
@@ -1263,7 +1276,8 @@ func HardlinkDirMerge(src, dst string) (skipped []string, err error) {
 	return hardlinkDirMerge(src, dst, true)
 }
 
-// HardlinkDirMergeStrict refuses copies while merging a seeded folder.
+// HardlinkDirMergeStrict refuses copies while merging a seeded folder. On
+// failure it preserves partial public links for reconciliation, not rollback.
 func HardlinkDirMergeStrict(src, dst string) (skipped []string, err error) {
 	return hardlinkDirMerge(src, dst, false)
 }
@@ -1296,23 +1310,16 @@ func hardlinkDirMerge(src, dst string, allowCopy bool) (skipped []string, err er
 	defer func() { _ = dstRoot.Close() }()
 
 	acc := &mergeSkipTracker{}
-	var linked []string
-	if err := mergeHardlinkDirRooted(srcRoot, dstRoot, ".", acc, allowCopy, &linked); err != nil {
-		// A strict import must not expose half an audiobook beside the
-		// existing ebook. Remove only links this attempt created.
+	if err := mergeHardlinkDirRooted(srcRoot, dstRoot, ".", acc, allowCopy); err != nil {
 		if !allowCopy {
-			for i := len(linked) - 1; i >= 0; i-- {
-				if rmErr := dstRoot.Remove(linked[i]); rmErr != nil {
-					err = errors.Join(err, fmt.Errorf("undo hardlink %q: %w", linked[i], rmErr))
-				}
-			}
+			return acc.skipped, strictHardlinkPartialError(dst, err)
 		}
 		return acc.skipped, err
 	}
 	return acc.skipped, nil
 }
 
-func mergeHardlinkDirRooted(srcRoot, dstRoot *os.Root, rel string, acc *mergeSkipTracker, allowCopy bool, linked *[]string) error {
+func mergeHardlinkDirRooted(srcRoot, dstRoot *os.Root, rel string, acc *mergeSkipTracker, allowCopy bool) error {
 	f, err := srcRoot.Open(rel)
 	if err != nil {
 		return err
@@ -1334,7 +1341,7 @@ func mergeHardlinkDirRooted(srcRoot, dstRoot *os.Root, rel string, acc *mergeSki
 			if err := dstRoot.Mkdir(child, dirperm.Library()); err != nil && !os.IsExist(err) {
 				return err
 			}
-			if err := mergeHardlinkDirRooted(srcRoot, dstRoot, child, acc, allowCopy, linked); err != nil {
+			if err := mergeHardlinkDirRooted(srcRoot, dstRoot, child, acc, allowCopy); err != nil {
 				return err
 			}
 			continue
@@ -1353,9 +1360,6 @@ func mergeHardlinkDirRooted(srcRoot, dstRoot *os.Root, rel string, acc *mergeSki
 				continue
 			}
 			return linkError(srcPath, dstPath, err)
-		}
-		if !allowCopy {
-			*linked = append(*linked, child)
 		}
 	}
 	return nil

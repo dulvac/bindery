@@ -218,6 +218,9 @@ func flattenAudiobookDirFiltered(ctx context.Context, mode, srcRoot, destDir str
 	reserved := make(map[string]struct{}, len(tracks))
 	for i, tr := range tracks {
 		if err := ctx.Err(); err != nil {
+			if mode == "hardlink-strict" {
+				return strictHardlinkPartialError(destDir, err)
+			}
 			_ = os.RemoveAll(destDir)
 			return err
 		}
@@ -226,14 +229,22 @@ func flattenAudiobookDirFiltered(ctx context.Context, mode, srcRoot, destDir str
 		if _, clash := reserved[name]; clash {
 			// A template that omits {Part} would collapse every track to one
 			// name and silently drop all but the last. Fail loudly instead.
+			cause := fmt.Errorf("audiobook file template produced a duplicate name %q for %q — include {Part}", name, tr.rel)
+			if mode == "hardlink-strict" {
+				return strictHardlinkPartialError(destDir, cause)
+			}
 			_ = os.RemoveAll(destDir)
-			return fmt.Errorf("audiobook file template produced a duplicate name %q for %q — include {Part}", name, tr.rel)
+			return cause
 		}
 		reserved[name] = struct{}{}
 		dst := filepath.Join(destDir, name)
 		if err := placeFlattened(ctx, mode, tr.src, dst); err != nil {
+			cause := fmt.Errorf("place %q: %w", tr.rel, err)
+			if mode == "hardlink-strict" {
+				return strictHardlinkPartialError(destDir, cause)
+			}
 			_ = os.RemoveAll(destDir)
-			return fmt.Errorf("place %q: %w", tr.rel, err)
+			return cause
 		}
 	}
 
@@ -248,6 +259,9 @@ func flattenAudiobookDirFiltered(ctx context.Context, mode, srcRoot, destDir str
 	// folder afterwards. Failing to carry a volume then fails the flatten, so
 	// the source is kept rather than destroying the archive.
 	if err := carryRootSidecars(ctx, mode, srcRoot, destDir, reserved, skip); err != nil {
+		if mode == "hardlink-strict" {
+			return strictHardlinkPartialError(destDir, err)
+		}
 		removeFlattenDest(destDir)
 		return err
 	}

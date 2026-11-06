@@ -169,7 +169,7 @@ func TestLegacyQbitImport_HardlinkFailureBlocksWithoutCopyOrRemoval(t *testing.T
 	}
 }
 
-func TestLegacyQbitAudioMerge_LinkFailureLeavesExistingLibraryUntouched(t *testing.T) {
+func TestLegacyQbitAudioMerge_LinkFailureLeavesPartialLinksForReconciliation(t *testing.T) {
 	library := t.TempDir()
 	s, book, downloads, books, settings, _, ctx := sharedFormatFixture(t, library)
 	if err := settings.Set(ctx, "import.mode", "copy"); err != nil {
@@ -232,19 +232,28 @@ func TestLegacyQbitAudioMerge_LinkFailureLeavesExistingLibraryUntouched(t *testi
 	s.tryImportInternal(withTorrentOwnFolder(ctx, true), qbit, audioDir, "qbittorrent", "hash", "", nil, audio)
 
 	got, err := downloads.GetByID(ctx, qbit.ID)
-	if err != nil || got.Status != models.StateImportBlocked || !strings.Contains(got.ErrorMessage, "hardlink") {
-		t.Fatalf("second hardlink failure must block: %+v, %v", got, err)
+	if err != nil || got.Status != models.StateImportBlocked || !strings.Contains(got.ErrorMessage, "hardlink") || !strings.Contains(got.ErrorMessage, "reconcile") || !strings.Contains(got.ErrorMessage, publicDir) {
+		t.Fatalf("second hardlink failure must block with public reconciliation path: %+v, %v", got, err)
 	}
 	if b, err := os.ReadFile(rows[0].Path); err != nil || !bytes.Equal(b, originalEbook) {
 		t.Fatalf("existing ebook modified: %v", err)
 	}
+	placed := 0
 	for i, path := range audio {
-		if _, err := os.Stat(filepath.Join(publicDir, filepath.Base(path))); !os.IsNotExist(err) {
-			t.Fatalf("partially linked audiobook exposed in library: %v", err)
+		if linked, err := os.Stat(filepath.Join(publicDir, filepath.Base(path))); err == nil {
+			if !os.SameFile(infos[i], linked) {
+				t.Errorf("public audio is not the seeded inode: %s", path)
+			}
+			placed++
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("stat public audio: %v", err)
 		}
 		if after, err := os.Stat(path); err != nil || !os.SameFile(infos[i], after) {
 			t.Fatalf("seed file changed: %v", err)
 		}
+	}
+	if placed != 1 {
+		t.Errorf("placed %d links, want one partial link left for reconciliation", placed)
 	}
 }
 
