@@ -365,8 +365,12 @@ func RemoveTransmissionTorrent(ctx context.Context, trans *transmission.Client, 
 	return trans.RemoveTorrentByHash(ctx, ref, deleteFiles)
 }
 
+// ErrProtectedQbittorrentTorrent is returned before contacting qBittorrent
+// when a caller attempts to remove a seeded torrent.
+var ErrProtectedQbittorrentTorrent = errors.New("protected qBittorrent torrent: refusing removal")
+
 // RemoveDownload removes a download from its client, optionally taking the data
-// with it.
+// with it. qBittorrent torrents are protected regardless of category or flags.
 //
 // globalRemap is the BINDERY_DOWNLOAD_PATH_REMAP fallback. Only rTorrent reads
 // it: every other client deletes the data itself and never tells Bindery a path,
@@ -385,8 +389,7 @@ func RemoveDownload(ctx context.Context, client *models.DownloadClient, dl *mode
 		if dl.TorrentID == nil || *dl.TorrentID == "" {
 			return nil
 		}
-		qb := QbittorrentFor(client)
-		return qb.DeleteTorrent(ctx, *dl.TorrentID, deleteFiles)
+		return ErrProtectedQbittorrentTorrent
 	case "deluge":
 		if dl.TorrentID == nil || *dl.TorrentID == "" {
 			return nil

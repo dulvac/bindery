@@ -196,7 +196,7 @@ func flattenAudiobookDirNamed(ctx context.Context, mode, srcRoot, destDir string
 // left behind chosen by the caller, as copyDirFiltered is for copyDirContext.
 // See flattenSidecarSkip.
 func flattenAudiobookDirFiltered(ctx context.Context, mode, srcRoot, destDir string, nameFor func(index, count int, ext string) string, skip func(string) bool) error {
-	if mode != "copy" && mode != "hardlink" {
+	if mode != "copy" && mode != "hardlink" && mode != "hardlink-strict" {
 		return fmt.Errorf("flatten supports copy/hardlink only, got %q", mode)
 	}
 	tracks, err := collectFlattenTracks(srcRoot)
@@ -257,6 +257,8 @@ func flattenAudiobookDirFiltered(ctx context.Context, mode, srcRoot, destDir str
 // placeFlattened copies or hardlinks a single track to dst.
 func placeFlattened(ctx context.Context, mode, src, dst string) error {
 	switch mode {
+	case "hardlink-strict":
+		return HardlinkFileStrict(src, dst)
 	case "hardlink":
 		return HardlinkFile(src, dst)
 	default: // "copy" — guarded by flattenAudiobookDir
@@ -303,13 +305,15 @@ func carryRootSidecars(ctx context.Context, mode, srcRoot, destDir string, reser
 			continue
 		}
 		var cerr error
-		if mode == "hardlink" {
+		if mode == "hardlink-strict" {
+			cerr = HardlinkFileStrict(src, dst)
+		} else if mode == "hardlink" {
 			cerr = HardlinkFile(src, dst)
 		} else {
 			cerr = CopyFileCtx(ctx, src, dst)
 		}
-		if cerr != nil && isArchivePart(name) {
-			return fmt.Errorf("carry archive volume %q: %w", name, cerr)
+		if cerr != nil && (isArchivePart(name) || mode == "hardlink-strict") {
+			return fmt.Errorf("carry sidecar %q: %w", name, cerr)
 		}
 	}
 	return nil

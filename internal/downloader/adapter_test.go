@@ -896,21 +896,11 @@ func TestRemoveDownload_Transmission_NilID(t *testing.T) {
 }
 
 func TestRemoveDownload_Qbittorrent(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v2/auth/login":
-			_, _ = w.Write([]byte("Ok."))
-		default:
-			_, _ = w.Write([]byte(""))
-		}
-	}))
-	defer srv.Close()
-	host, port := serverHostPort(t, srv.URL)
-	client := &models.DownloadClient{Type: "qbittorrent", Host: host, Port: port, Username: "u", Password: "p"}
+	client := &models.DownloadClient{Type: "qbittorrent"}
 	hash := "abc123"
 	dl := &models.Download{TorrentID: &hash}
-	if err := RemoveDownload(context.Background(), client, dl, true, ""); err != nil {
-		t.Fatalf("RemoveDownload: %v", err)
+	if err := RemoveDownload(context.Background(), client, dl, true, ""); !errors.Is(err, ErrProtectedQbittorrentTorrent) {
+		t.Fatalf("RemoveDownload: got %v, want protected-torrent error", err)
 	}
 }
 

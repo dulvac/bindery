@@ -279,7 +279,8 @@ func TestImport_AudiobookMoveModePathOwned_PointsAtOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f.importDownload(t)
+	// Move mode remains available for non-qBittorrent torrent clients.
+	f.scanner.tryImportInternal(ctx, f.dl, f.dir, "transmission", "abc123", "", nil, nil)
 
 	f.assertBlockedNamingOwner(t)
 	dl, _ := f.reload(t)

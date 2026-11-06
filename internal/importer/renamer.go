@@ -999,11 +999,20 @@ func CopyFile(src, dst string) error {
 // which would break seeding. The cost is extra disk for the imported copy.
 // Non-EXDEV errors (permissions, missing source) are returned as-is.
 func HardlinkFile(src, dst string) error {
+	return hardlinkFile(src, dst, true)
+}
+
+// HardlinkFileStrict refuses a cross-device link instead of copying seeded data.
+func HardlinkFileStrict(src, dst string) error {
+	return hardlinkFile(src, dst, false)
+}
+
+func hardlinkFile(src, dst string, allowCopy bool) error {
 	if err := os.MkdirAll(filepath.Dir(dst), dirperm.Library()); err != nil {
 		return fmt.Errorf("create dir: %w", err)
 	}
 	if err := osLink(src, dst); err != nil {
-		if crossDeviceErr(err) {
+		if allowCopy && crossDeviceErr(err) {
 			return copyFile(src, dst)
 		}
 		return linkError(src, dst, err)
@@ -1199,6 +1208,15 @@ func mergeCopyDirRooted(ctx context.Context, srcRoot, dstRoot *os.Root, rel stri
 //
 // Uses os.Root to scope traversal, preventing symlink-based TOCTOU (gosec G122).
 func HardlinkDir(src, dst string) error {
+	return hardlinkDir(src, dst, true)
+}
+
+// HardlinkDirStrict leaves seeded data untouched if any link fails.
+func HardlinkDirStrict(src, dst string) error {
+	return hardlinkDir(src, dst, false)
+}
+
+func hardlinkDir(src, dst string, allowCopy bool) error {
 	info, err := os.Stat(src)
 	if err != nil {
 		return fmt.Errorf("stat source dir: %w", err)
@@ -1228,7 +1246,7 @@ func HardlinkDir(src, dst string) error {
 	}
 	defer func() { _ = dstRoot.Close() }()
 
-	if err := hardlinkDirRooted(srcRoot, dstRoot, "."); err != nil {
+	if err := hardlinkDirRooted(srcRoot, dstRoot, ".", allowCopy); err != nil {
 		_ = os.RemoveAll(dst)
 		return err
 	}
@@ -1242,6 +1260,15 @@ func HardlinkDir(src, dst string) error {
 // at the destination is skipped (not overwritten, not re-linked), and its
 // relative path is returned.
 func HardlinkDirMerge(src, dst string) (skipped []string, err error) {
+	return hardlinkDirMerge(src, dst, true)
+}
+
+// HardlinkDirMergeStrict refuses copies while merging a seeded folder.
+func HardlinkDirMergeStrict(src, dst string) (skipped []string, err error) {
+	return hardlinkDirMerge(src, dst, false)
+}
+
+func hardlinkDirMerge(src, dst string, allowCopy bool) (skipped []string, err error) {
 	info, err := os.Stat(src)
 	if err != nil {
 		return nil, fmt.Errorf("stat source dir: %w", err)
@@ -1269,13 +1296,23 @@ func HardlinkDirMerge(src, dst string) (skipped []string, err error) {
 	defer func() { _ = dstRoot.Close() }()
 
 	acc := &mergeSkipTracker{}
-	if err := mergeHardlinkDirRooted(srcRoot, dstRoot, ".", acc); err != nil {
+	var linked []string
+	if err := mergeHardlinkDirRooted(srcRoot, dstRoot, ".", acc, allowCopy, &linked); err != nil {
+		// A strict import must not expose half an audiobook beside the
+		// existing ebook. Remove only links this attempt created.
+		if !allowCopy {
+			for i := len(linked) - 1; i >= 0; i-- {
+				if rmErr := dstRoot.Remove(linked[i]); rmErr != nil {
+					err = errors.Join(err, fmt.Errorf("undo hardlink %q: %w", linked[i], rmErr))
+				}
+			}
+		}
 		return acc.skipped, err
 	}
 	return acc.skipped, nil
 }
 
-func mergeHardlinkDirRooted(srcRoot, dstRoot *os.Root, rel string, acc *mergeSkipTracker) error {
+func mergeHardlinkDirRooted(srcRoot, dstRoot *os.Root, rel string, acc *mergeSkipTracker, allowCopy bool, linked *[]string) error {
 	f, err := srcRoot.Open(rel)
 	if err != nil {
 		return err
@@ -1297,7 +1334,7 @@ func mergeHardlinkDirRooted(srcRoot, dstRoot *os.Root, rel string, acc *mergeSki
 			if err := dstRoot.Mkdir(child, dirperm.Library()); err != nil && !os.IsExist(err) {
 				return err
 			}
-			if err := mergeHardlinkDirRooted(srcRoot, dstRoot, child, acc); err != nil {
+			if err := mergeHardlinkDirRooted(srcRoot, dstRoot, child, acc, allowCopy, linked); err != nil {
 				return err
 			}
 			continue
@@ -1309,7 +1346,7 @@ func mergeHardlinkDirRooted(srcRoot, dstRoot *os.Root, rel string, acc *mergeSki
 		srcPath := filepath.Join(srcRoot.Name(), child)
 		dstPath := filepath.Join(dstRoot.Name(), child)
 		if err := osLink(srcPath, dstPath); err != nil {
-			if crossDeviceErr(err) {
+			if allowCopy && crossDeviceErr(err) {
 				if cerr := copyFileRooted(srcRoot, dstRoot, child); cerr != nil {
 					return fmt.Errorf("hardlink cross-device copy fallback %q → %q: %w", srcPath, dstPath, cerr)
 				}
@@ -1317,11 +1354,14 @@ func mergeHardlinkDirRooted(srcRoot, dstRoot *os.Root, rel string, acc *mergeSki
 			}
 			return linkError(srcPath, dstPath, err)
 		}
+		if !allowCopy {
+			*linked = append(*linked, child)
+		}
 	}
 	return nil
 }
 
-func hardlinkDirRooted(srcRoot, dstRoot *os.Root, rel string) error {
+func hardlinkDirRooted(srcRoot, dstRoot *os.Root, rel string, allowCopy bool) error {
 	f, err := srcRoot.Open(rel)
 	if err != nil {
 		return err
@@ -1343,7 +1383,7 @@ func hardlinkDirRooted(srcRoot, dstRoot *os.Root, rel string) error {
 			if err := dstRoot.Mkdir(child, dirperm.Library()); err != nil && !os.IsExist(err) {
 				return err
 			}
-			if err := hardlinkDirRooted(srcRoot, dstRoot, child); err != nil {
+			if err := hardlinkDirRooted(srcRoot, dstRoot, child, allowCopy); err != nil {
 				return err
 			}
 			continue
@@ -1354,7 +1394,7 @@ func hardlinkDirRooted(srcRoot, dstRoot *os.Root, rel string) error {
 			// Cross-mount (EXDEV): fall back to a seeding-safe rooted copy for
 			// this entry instead of failing the whole audiobook folder. See
 			// HardlinkFile for the copy-vs-move rationale.
-			if crossDeviceErr(err) {
+			if allowCopy && crossDeviceErr(err) {
 				if cerr := copyFileRooted(srcRoot, dstRoot, child); cerr != nil {
 					return fmt.Errorf("hardlink cross-device copy fallback %q → %q: %w", srcPath, dstPath, cerr)
 				}
@@ -1651,7 +1691,7 @@ func CopyFileCtx(ctx context.Context, src, dst string) error {
 // only removed after the staged copy has been Sync+Close'd successfully, so
 // a failure in the slow-path copy never destroys the still-seeding source.
 //
-// The mode strings match those used by scanner.go: "hardlink", "copy",
+// The mode strings match scanner.go: "hardlink", "hardlink-strict", "copy",
 // and the default (anything else) is move.
 func StagedImport(ctx context.Context, mode, src, dst string) (stagedPath string, commit func() error, rollback func(), err error) {
 	if err := os.MkdirAll(filepath.Dir(dst), dirperm.Library()); err != nil {
@@ -1675,10 +1715,10 @@ func StagedImport(ctx context.Context, mode, src, dst string) (stagedPath string
 	movedSrcInPlace := false
 
 	switch mode {
-	case "hardlink":
+	case "hardlink", "hardlink-strict":
 		if err := osLink(src, staged); err != nil {
-			// Non-EXDEV errors (permissions, missing source) fail loudly.
-			if !crossDeviceErr(err) {
+			// Seeded qBittorrent imports must never fall back to copying.
+			if mode == "hardlink-strict" || !crossDeviceErr(err) {
 				return "", nil, nil, fmt.Errorf("stage hardlink: %w", err)
 			}
 			// src and staged turned out to be on different mounts despite

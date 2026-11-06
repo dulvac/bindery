@@ -1577,6 +1577,7 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 	// variant import from the persisted row before the external handoff or
 	// the no-source idempotency shortcut can create any library link.
 	variantDownload := dl.VariantID != nil
+	clientID := dl.DownloadClientID
 	if dl.ID > 0 && s.downloads != nil {
 		stored, err := s.downloads.GetByID(ctx, dl.ID)
 		if err != nil {
@@ -1584,6 +1585,7 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 			return
 		}
 		if stored != nil {
+			clientID = stored.DownloadClientID
 			if stored.VariantID != nil {
 				if dl.VariantID != nil && *dl.VariantID != *stored.VariantID {
 					s.failImport(ctx, dl, models.StateImportFailed, "download variant changed before import")
@@ -1604,6 +1606,32 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 		return
 	}
 
+	// Resolve the persisted client as well as the caller's label: a manual or
+	// future importer can pass an empty/stale label for a legacy qBittorrent
+	// row. Unknown client identity blocks import rather than risking a move.
+	qbitTorrent := cleanupClientType == "qbittorrent"
+	if clientID != nil {
+		if s.clients == nil {
+			s.failImport(ctx, dl, models.StateImportFailed, "cannot resolve download client before import")
+			return
+		}
+		client, err := s.clients.GetByID(ctx, *clientID)
+		if err != nil {
+			s.failImport(ctx, dl, models.StateImportFailed, fmt.Sprintf("cannot resolve download client before import: %v", err))
+			return
+		}
+		if client == nil {
+			s.failImport(ctx, dl, models.StateImportFailed, "download client not found before import")
+			return
+		}
+		qbitTorrent = qbitTorrent || client.Type == "qbittorrent"
+	}
+	// qBittorrent is a read-only seeding source. Never run a cleanup callback,
+	// including the no-source and already-imported shortcuts below.
+	if qbitTorrent {
+		cleanupFunc = nil
+	}
+
 	// Read the configured import mode ONCE for the whole download (issue #705
 	// finding 2). Re-reading "import.mode" per file means an operator toggling
 	// copy↔move in the UI mid-run mixes copy and move within a single download;
@@ -1621,9 +1649,13 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 	// both formats share import.mode and this is the same single read as
 	// before.
 	configuredMode := effectiveConfiguredMode(s.downloadImportMode(ctx, downloadPath, formatHint, explicitFiles), cleanupClientType)
-	// Variant torrent imports may never move or delete the seeding source,
-	// regardless of an operator's global import-mode setting.
-	if variantDownload && dl.Protocol == "torrent" && configuredMode != "external" {
+	// Variant torrent imports may never move or delete the seeding source.
+	// Legacy (unbound) qBittorrent torrents need the same protection, even
+	// when mutable settings request external handoff. Strict hardlinks must
+	// fail on EXDEV instead of silently falling back to a copy.
+	if qbitTorrent {
+		configuredMode = "hardlink-strict"
+	} else if variantDownload && dl.Protocol == "torrent" && configuredMode != "external" {
 		configuredMode = "hardlink"
 	}
 
@@ -2186,6 +2218,8 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 					dstFile := filepath.Join(destDir, names[i])
 					var fileErr error
 					switch mode {
+					case "hardlink-strict":
+						fileErr = HardlinkFileStrict(srcFile, dstFile)
 					case "hardlink":
 						fileErr = HardlinkFile(srcFile, dstFile)
 					case "copy":
@@ -2241,7 +2275,7 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 				// flattens via copy then removes the source, matching the
 				// multi-disc contract below.
 				if tmpl := s.audiobookFileTemplate(ctx); tmpl != "" &&
-					(mode == "copy" || mode == "hardlink" || mode == "move") {
+					(mode == "copy" || mode == "hardlink" || mode == "hardlink-strict" || mode == "move") {
 					flattenMode := mode
 					if mode == "move" {
 						flattenMode = "copy"
@@ -2262,7 +2296,7 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 							slog.Warn("could not remove source after move-mode audiobook rename", "src", audiobookSource, "error", rmErr)
 						}
 					}
-				} else if (mode == "copy" || mode == "hardlink" || mode == "move") &&
+				} else if (mode == "copy" || mode == "hardlink" || mode == "hardlink-strict" || mode == "move") &&
 					// Multi-disc flattening (#886): when enabled AND the source is
 					// a multi-disc audiobook, place every track flat into destDir
 					// as "Part 001.ext", … instead of mirroring the disc-folder
@@ -2314,6 +2348,8 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 					slog.Info("merging audiobook into the book's existing shared folder",
 						"title", book.Title, "bookID", book.ID, "dst", destDir, "mode", mode)
 					switch mode {
+					case "hardlink-strict":
+						mergeSkippedFiles, dirErr = HardlinkDirMergeStrict(audiobookSource, destDir)
 					case "hardlink":
 						mergeSkippedFiles, dirErr = HardlinkDirMerge(audiobookSource, destDir)
 					case "copy":
@@ -2327,6 +2363,8 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 					}
 				} else {
 					switch mode {
+					case "hardlink-strict":
+						dirErr = HardlinkDirStrict(audiobookSource, destDir)
 					case "hardlink":
 						dirErr = HardlinkDir(audiobookSource, destDir)
 					case "copy":
@@ -2378,6 +2416,8 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 					switch {
 					case skipped:
 						// nothing to place
+					case mode == "hardlink-strict":
+						dirErr = HardlinkFileStrict(audiobookSource, dstFile)
 					case mode == "hardlink":
 						dirErr = HardlinkFile(audiobookSource, dstFile)
 					case mode == "copy":
@@ -2443,7 +2483,7 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 				// move already consumed the source, so keep the placed folder
 				// and point the user at it rather than deleting their only copy.
 				switch {
-				case owned != nil && !mergedIntoExistingFolder && (mode == "copy" || mode == "hardlink"):
+				case owned != nil && !mergedIntoExistingFolder && (mode == "copy" || mode == "hardlink" || mode == "hardlink-strict"):
 					// Another book holds the folder's path (#2937). destDir
 					// came from UniqueDir, so this import created it and it
 					// holds only what was just placed: remove it, and name
@@ -2474,7 +2514,7 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 					// skips whatever is already there.
 					s.failImport(ctx, dl, models.StateImportBlocked,
 						fmt.Sprintf("audiobook merged into %s but could not be recorded (%v); the files are preserved there — retry the import to record them", destDir, setErr))
-				case mode == "copy" || mode == "hardlink":
+				case mode == "copy" || mode == "hardlink" || mode == "hardlink-strict":
 					if rmErr := os.RemoveAll(destDir); rmErr != nil {
 						slog.Warn("failed to remove audiobook destination after DB error", "dst", destDir, "error", rmErr)
 					}
