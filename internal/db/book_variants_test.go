@@ -904,9 +904,9 @@ func TestDownloadBookReassignmentKeepsOtherVariantClaims(t *testing.T) {
 	}
 }
 
-// Losing verification on the only file must reopen the variant even when
-// the file keeps the same variant ID.
-func TestBookFileRepoSetVariantReopensUnverifiedClaim(t *testing.T) {
+// A file that loses verification still fills its variant; the UI must show
+// the unverified badge rather than silently request another copy.
+func TestBookFileRepoSetVariantKeepsUnverifiedClaimImported(t *testing.T) {
 	database, _, book := openTestDB(t)
 	ctx := context.Background()
 	variants := NewBookVariantRepo(database)
@@ -934,12 +934,12 @@ func TestBookFileRepoSetVariantReopensUnverifiedClaim(t *testing.T) {
 		t.Fatalf("file after losing verification = %#v, %v", file, err)
 	}
 	got, err := variants.ListByBook(ctx, book.ID)
-	if err != nil || len(got) != 1 || got[0].Status != models.VariantWanted {
-		t.Fatalf("variant after losing verification = %#v, %v; want wanted", got, err)
+	if err != nil || len(got) != 1 || got[0].Status != models.VariantImported {
+		t.Fatalf("variant after losing verification = %#v, %v; want imported", got, err)
 	}
 	wanted, err := variants.ListWanted(ctx)
-	if err != nil || len(wanted) != 1 || wanted[0].ID != id {
-		t.Fatalf("wanted after losing verification = %#v, %v", wanted, err)
+	if err != nil || len(wanted) != 0 {
+		t.Fatalf("unverified import incorrectly wanted again: %#v, %v", wanted, err)
 	}
 }
 

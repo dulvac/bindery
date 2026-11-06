@@ -1027,16 +1027,28 @@ func (r *BookRepo) trackBookFile(ctx context.Context, bookID int64, format, path
 // Only an explicit user action that says the file belongs to toBookID (Fix
 // match) may call this; an import must use AddBookFile, which refuses (#2937).
 func (r *BookRepo) MoveBookFile(ctx context.Context, path string, toBookID int64, format string) (int64, error) {
-	prev, err := r.files.MoveToBook(ctx, toBookID, format, path)
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("move book file begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	prev, err := r.files.moveToBookTx(ctx, tx, toBookID, format, path)
 	if err != nil {
 		return 0, err
 	}
+	books := r.WithTx(tx)
 	if prev != 0 && prev != toBookID {
-		if err := r.refreshBookStatus(ctx, prev); err != nil {
-			return prev, err
+		if err := books.refreshBookStatus(ctx, prev); err != nil {
+			return 0, err
 		}
 	}
-	return prev, r.refreshBookStatus(ctx, toBookID)
+	if err := books.refreshBookStatus(ctx, toBookID); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("move book file commit: %w", err)
+	}
+	return prev, nil
 }
 
 // ListFiles returns all book_files rows for the given book.
@@ -1048,18 +1060,8 @@ func (r *BookRepo) ListFiles(ctx context.Context, bookID int64) ([]models.BookFi
 // refreshes the book's aggregate status. Returns the updated book, or nil if
 // the path was not in book_files.
 func (r *BookRepo) RemoveBookFile(ctx context.Context, path string) (*models.Book, error) {
-	bookID, err := r.files.DeleteByPath(ctx, path)
-	if err != nil {
-		return nil, err
-	}
-	if bookID == 0 {
-		return nil, nil // not tracked
-	}
-	b, err := r.GetByID(ctx, bookID)
-	if err != nil || b == nil {
-		return nil, err
-	}
-	if err := r.refreshBookStatus(ctx, bookID); err != nil {
+	bookID, err := r.UntrackFilePath(ctx, path)
+	if err != nil || bookID == 0 {
 		return nil, err
 	}
 	return r.GetByID(ctx, bookID)
@@ -1076,8 +1078,24 @@ func (r *BookRepo) RemoveBookFile(ctx context.Context, path string) (*models.Boo
 // (#1635). Refreshing the status matters: dropping the row can leave a
 // monitored format with nothing behind it.
 func (r *BookRepo) UntrackFilePath(ctx context.Context, path string) (int64, error) {
+	if _, inTx := r.exec.(*sql.Tx); !inTx {
+		tx, err := r.db.BeginTx(ctx, nil)
+		if err != nil {
+			return 0, fmt.Errorf("untrack file path begin: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		bookID, err := r.WithTx(tx).UntrackFilePath(ctx, path)
+		if err != nil {
+			return 0, err
+		}
+		if err := tx.Commit(); err != nil {
+			return 0, fmt.Errorf("untrack file path commit: %w", err)
+		}
+		return bookID, nil
+	}
 	var bookID int64
-	err := r.exec.QueryRowContext(ctx, `SELECT book_id FROM book_files WHERE path = ?`, path).Scan(&bookID)
+	var variantID sql.NullInt64
+	err := r.exec.QueryRowContext(ctx, `SELECT book_id, variant_id FROM book_files WHERE path = ?`, path).Scan(&bookID, &variantID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
@@ -1087,8 +1105,11 @@ func (r *BookRepo) UntrackFilePath(ctx context.Context, path string) (int64, err
 	if _, err := r.exec.ExecContext(ctx, `DELETE FROM book_files WHERE path = ?`, path); err != nil {
 		return 0, fmt.Errorf("untrack file path delete: %w", err)
 	}
+	if err := reconcileVariantAfterDetach(ctx, r.exec.(*sql.Tx), variantID); err != nil {
+		return 0, err
+	}
 	if err := r.refreshBookStatus(ctx, bookID); err != nil {
-		return bookID, err
+		return 0, err
 	}
 	return bookID, nil
 }
@@ -1176,10 +1197,30 @@ func (r *BookRepo) BookIDForFile(ctx context.Context, fileID int64) (int64, erro
 // owning book's aggregate status so the computed ebook/audiobook path views
 // track the new location.
 func (r *BookRepo) UpdateBookFilePath(ctx context.Context, fileID, bookID int64, newPath string) error {
-	if err := r.files.UpdatePath(ctx, fileID, newPath); err != nil {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("update book file path begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, `UPDATE book_files SET path = ? WHERE id = ? AND book_id = ?`, newPath, fileID, bookID)
+	if err != nil {
+		return fmt.Errorf("update book file path: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update book file path rows: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("update book file path: no row with id %d on book %d", fileID, bookID)
+	}
+	if err := r.WithTx(tx).refreshBookStatus(ctx, bookID); err != nil {
 		return err
 	}
-	return r.refreshBookStatus(ctx, bookID)
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("update book file path commit: %w", err)
+	}
+	pathEpochFor(r.db).Add(1)
+	return nil
 }
 
 // legacyFilePathFor picks the value for the legacy books.file_path column,

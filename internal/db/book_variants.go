@@ -87,8 +87,9 @@ func (r *BookVariantRepo) list(ctx context.Context, query string, args ...any) (
 }
 
 // reconcileVariantAfterDetach runs in the caller's ownership-change transaction.
-// A verified file satisfies the variant; an in-flight download keeps it busy.
-// Imported downloads alone are history, not proof that the file is still here.
+// An associated file satisfies the variant even when its language evidence
+// is unverified. An in-flight download keeps a fileless variant busy;
+// imported downloads alone are history, not proof the file is still here.
 // Review stays a manual decision rather than being reopened automatically.
 func reconcileVariantAfterDetach(ctx context.Context, tx *sql.Tx, variantID sql.NullInt64) error {
 	if !variantID.Valid {
@@ -97,8 +98,9 @@ func reconcileVariantAfterDetach(ctx context.Context, tx *sql.Tx, variantID sql.
 	_, err := tx.ExecContext(ctx, `UPDATE book_variants SET status = CASE
 		WHEN EXISTS (SELECT 1 FROM book_files f
 			WHERE f.variant_id = book_variants.id AND f.book_id = book_variants.book_id
-			AND f.format = book_variants.media_type AND f.language = book_variants.language
-			AND f.verification = 'verified') THEN 'imported'
+			AND f.format = book_variants.media_type
+			AND (f.verification = 'verified' AND f.language = book_variants.language
+				OR f.verification = 'unverified' AND f.language IN ('', book_variants.language))) THEN 'imported'
 		WHEN EXISTS (SELECT 1 FROM downloads d
 			WHERE d.variant_id = book_variants.id AND d.book_id = book_variants.book_id
 			AND d.status IN (?, ?, ?, ?, ?, ?, ?, ?)) THEN 'downloading'

@@ -189,11 +189,86 @@ func (r *BookFileRepo) Add(ctx context.Context, bookID int64, format, path strin
 	return err
 }
 
+// TrackVariant records a successfully placed path and its language evidence in
+// one transaction. The caller must finish private staging and collision-safe
+// placement before calling; this method never touches a public or source file.
+// A legacy path or another variant's path cannot be relabeled by an import.
+// Review requires an explicit manual retry before a new claim is accepted.
+func (r *BookFileRepo) TrackVariant(ctx context.Context, bookID, variantID int64, format, path, language, verification string) error {
+	if bookID <= 0 || variantID <= 0 || !filepath.IsAbs(path) || filepath.Clean(path) != path || path == string(filepath.Separator) {
+		return fmt.Errorf("invalid variant book, variant or path %q", path)
+	}
+	if format != models.MediaTypeEbook && format != models.MediaTypeAudiobook || models.BookFileFormatFor(path, format) != format {
+		return fmt.Errorf("invalid variant file format %q for %q", format, path)
+	}
+	if verification != "verified" && verification != "unverified" {
+		return fmt.Errorf("invalid file verification %q", verification)
+	}
+	if language != "" && language != "eng" && language != "rum" && language != "fre" || verification == "verified" && language == "" {
+		return fmt.Errorf("invalid file language %q for %q verification", language, verification)
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("book_files track variant begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var variantBookID int64
+	var variantFormat, variantLanguage, status string
+	if err := tx.QueryRowContext(ctx, `SELECT book_id, media_type, language, status FROM book_variants WHERE id = ?`, variantID).
+		Scan(&variantBookID, &variantFormat, &variantLanguage, &status); err != nil {
+		return fmt.Errorf("book_files variant lookup: %w", err)
+	}
+	if variantBookID != bookID || variantFormat != format || language != "" && language != variantLanguage || status == models.VariantReview {
+		return fmt.Errorf("book_files variant %d does not match book, format or language, or is in review", variantID)
+	}
+
+	var owner, existingVariant sql.NullInt64
+	var ownerTitle, existingLanguage, existingVerification sql.NullString
+	var existingFormat string
+	err = tx.QueryRowContext(ctx, `SELECT f.book_id, b.title, f.variant_id, f.language, f.verification, f.format
+		FROM book_files f LEFT JOIN books b ON b.id = f.book_id WHERE f.path = ?`, path).
+		Scan(&owner, &ownerTitle, &existingVariant, &existingLanguage, &existingVerification, &existingFormat)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		if _, err := tx.ExecContext(ctx, `INSERT INTO book_files
+			(book_id, format, path, size_bytes, created_at, variant_id, language, verification)
+			VALUES (?, ?, ?, 0, ?, ?, ?, ?)`, bookID, format, path, time.Now().UTC(), variantID, language, verification); err != nil {
+			return fmt.Errorf("book_files track variant insert: %w", err)
+		}
+	case err != nil:
+		return fmt.Errorf("book_files track variant path lookup: %w", err)
+	case owner.Int64 != bookID:
+		return &PathOwnedError{Path: path, OwnerBookID: owner.Int64, OwnerTitle: ownerTitle.String}
+	case existingVariant.Valid && existingVariant.Int64 == variantID && existingFormat == format && existingLanguage.String == language && existingVerification.String == verification:
+		// Idempotent retry: the already-tracked file keeps its metadata.
+	default:
+		return fmt.Errorf("book_files path %q already has a different or legacy claim", path)
+	}
+
+	if _, err := tx.ExecContext(ctx, `UPDATE book_variants SET status = 'imported' WHERE id = ? AND status != 'review'`, variantID); err != nil {
+		return fmt.Errorf("book_files mark variant imported: %w", err)
+	}
+	// Keep the old book-level status and paths in sync with the same commit.
+	if err := NewBookRepo(r.db).WithTx(tx).refreshBookStatus(ctx, bookID); err != nil {
+		return fmt.Errorf("book_files refresh variant book: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("book_files track variant commit: %w", err)
+	}
+	return nil
+}
+
 // SetVariant records a file's checked language claim. A non-nil variant must
-// belong to the file's current book and format, and a verified claim must
-// match its language. Replacing or un-verifying a claim reconciles the former
+// belong to the file's current book and format; any stated language must
+// match the variant. Replacing or un-verifying a claim reconciles the former
 // variant in the same transaction.
 func (r *BookFileRepo) SetVariant(ctx context.Context, path string, variantID *int64, language, verification string) error {
+	if verification != "verified" && verification != "unverified" ||
+		(language != "" && language != "eng" && language != "rum" && language != "fre") ||
+		verification == "verified" && language == "" {
+		return fmt.Errorf("invalid variant file language %q or verification %q", language, verification)
+	}
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("book_files set variant begin: %w", err)
@@ -210,8 +285,8 @@ func (r *BookFileRepo) SetVariant(ctx context.Context, path string, variantID *i
 		WHERE path = ? AND (? IS NULL OR EXISTS (
 			SELECT 1 FROM book_variants v
 			WHERE v.id = ? AND v.book_id = book_files.book_id AND v.media_type = book_files.format
-			AND (? != 'verified' OR v.language = ?)
-		))`, variantID, language, verification, path, variantID, variantID, verification, language)
+			AND ((? = '' AND ? = 'unverified') OR v.language = ?)
+		))`, variantID, language, verification, path, variantID, variantID, language, verification, language)
 	if err != nil {
 		return fmt.Errorf("book_files set variant: %w", err)
 	}
@@ -220,9 +295,9 @@ func (r *BookFileRepo) SetVariant(ctx context.Context, path string, variantID *i
 		return fmt.Errorf("book_files set variant rows: %w", err)
 	}
 	if count == 0 {
-		return fmt.Errorf("book_files set variant: path %q missing or variant does not match its book, format, or verified language", path)
+		return fmt.Errorf("book_files set variant: path %q missing or variant does not match its book, format, or language", path)
 	}
-	if oldVariant.Valid && (variantID == nil || oldVariant.Int64 != *variantID || oldVerification == "verified" && verification != "verified") {
+	if oldVariant.Valid && (variantID == nil || oldVariant.Int64 != *variantID || oldVerification != verification) {
 		if err := reconcileVariantAfterDetach(ctx, tx, oldVariant); err != nil {
 			return err
 		}
@@ -261,10 +336,32 @@ func (r *BookFileRepo) MoveToBook(ctx context.Context, bookID int64, format, pat
 		return 0, fmt.Errorf("book_files move begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	prev, err := r.moveToBookTx(ctx, tx, bookID, format, path)
+	if err != nil {
+		return 0, err
+	}
+	books := NewBookRepo(r.db).WithTx(tx)
+	if prev != 0 && prev != bookID {
+		if err := books.refreshBookStatus(ctx, prev); err != nil {
+			return 0, err
+		}
+	}
+	if err := books.refreshBookStatus(ctx, bookID); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("book_files move commit: %w", err)
+	}
+	return prev, nil
+}
 
+// moveToBookTx lets BookRepo commit the ownership change with both books'
+// compatibility views. No SQL leaves the caller's transaction.
+func (r *BookFileRepo) moveToBookTx(ctx context.Context, tx *sql.Tx, bookID int64, format, path string) (int64, error) {
+	format = models.BookFileFormatFor(path, format)
 	var prev int64
 	var oldVariant sql.NullInt64
-	err = tx.QueryRowContext(ctx, `SELECT book_id, variant_id FROM book_files WHERE path = ?`, path).Scan(&prev, &oldVariant)
+	err := tx.QueryRowContext(ctx, `SELECT book_id, variant_id FROM book_files WHERE path = ?`, path).Scan(&prev, &oldVariant)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		if _, err := tx.ExecContext(ctx,
@@ -284,9 +381,6 @@ func (r *BookFileRepo) MoveToBook(ctx context.Context, bookID int64, format, pat
 		if err := reconcileVariantAfterDetach(ctx, tx, oldVariant); err != nil {
 			return 0, err
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("book_files move commit: %w", err)
 	}
 	return prev, nil
 }
@@ -402,29 +496,77 @@ func (r *BookFileRepo) ListByBooks(ctx context.Context, bookIDs []int64) (map[in
 	return result, rows.Err()
 }
 
-// DeleteByBook removes all book_files rows for the given book.
+// DeleteByBook removes a book's file rows and reconciles every affected
+// variant before committing. It does not remove anything from disk.
 func (r *BookFileRepo) DeleteByBook(ctx context.Context, bookID int64) error {
-	_, err := r.db.ExecContext(ctx, `DELETE FROM book_files WHERE book_id = ?`, bookID)
+	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
+		return fmt.Errorf("book_files delete by book begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT variant_id FROM book_files WHERE book_id = ? AND variant_id IS NOT NULL`, bookID)
+	if err != nil {
+		return fmt.Errorf("book_files delete by book variants: %w", err)
+	}
+	var affected []sql.NullInt64
+	for rows.Next() {
+		var id sql.NullInt64
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("book_files delete by book scan: %w", err)
+		}
+		affected = append(affected, id)
+	}
+	err = rows.Err()
+	_ = rows.Close()
+	if err != nil {
+		return fmt.Errorf("book_files delete by book rows: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM book_files WHERE book_id = ?`, bookID); err != nil {
 		return fmt.Errorf("book_files delete by book: %w", err)
+	}
+	for _, id := range affected {
+		if err := reconcileVariantAfterDetach(ctx, tx, id); err != nil {
+			return err
+		}
+	}
+	if err := NewBookRepo(r.db).WithTx(tx).refreshBookStatus(ctx, bookID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("book_files delete by book commit: %w", err)
 	}
 	return nil
 }
 
-// DeleteByPath removes the book_files row matching the given path and returns
-// the book_id of the deleted row (0 if no row matched).
+// DeleteByPath removes a tracked path and reconciles its variant in the same
+// transaction, returning the book id (0 when the path was not tracked).
 func (r *BookFileRepo) DeleteByPath(ctx context.Context, path string) (int64, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("book_files delete by path begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
 	var bookID int64
-	err := r.db.QueryRowContext(ctx,
-		`SELECT book_id FROM book_files WHERE path = ?`, path).Scan(&bookID)
-	if err == sql.ErrNoRows {
+	var variantID sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT book_id, variant_id FROM book_files WHERE path = ?`, path).Scan(&bookID, &variantID)
+	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
 	if err != nil {
 		return 0, fmt.Errorf("book_files lookup by path: %w", err)
 	}
-	if _, err := r.db.ExecContext(ctx, `DELETE FROM book_files WHERE path = ?`, path); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM book_files WHERE path = ?`, path); err != nil {
 		return 0, fmt.Errorf("book_files delete by path: %w", err)
+	}
+	if err := reconcileVariantAfterDetach(ctx, tx, variantID); err != nil {
+		return 0, err
+	}
+	if err := NewBookRepo(r.db).WithTx(tx).refreshBookStatus(ctx, bookID); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("book_files delete by path commit: %w", err)
 	}
 	return bookID, nil
 }
