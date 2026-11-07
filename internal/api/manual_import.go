@@ -1138,6 +1138,13 @@ func (h *ManualImportHandler) MatchDownload(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "download is not in a recoverable import-failed state"})
 		return
 	}
+	// Match to book uses the legacy import/retry path, which must never
+	// bypass a variant's reviewed source and content checks, even when the
+	// chosen book is the same one already attached to the download.
+	if dl.VariantID != nil && *dl.VariantID > 0 {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "reviewed variant download requires reviewed-variant retry or owner review"})
+		return
+	}
 	book, err := h.books.GetByID(ctx, req.BookID)
 	if err != nil {
 		writeServerError(w, r, err)
@@ -1149,6 +1156,10 @@ func (h *ManualImportHandler) MatchDownload(w http.ResponseWriter, r *http.Reque
 	}
 	// Attach the chosen book so whichever import path runs targets it.
 	if err := h.downloads.SetBookID(ctx, req.DownloadID, req.BookID); err != nil {
+		if errors.Is(err, db.ErrVariantBookReassignment) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "reviewed variant download requires reviewed-variant retry or owner review"})
+			return
+		}
 		writeServerError(w, r, err)
 		return
 	}

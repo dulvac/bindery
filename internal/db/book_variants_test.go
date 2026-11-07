@@ -420,7 +420,7 @@ func TestBookFileOwnershipChangeClearsVariant(t *testing.T) {
 	}
 }
 
-func TestDownloadBookReassignmentClearsVariant(t *testing.T) {
+func TestDownloadBookReassignmentKeepsVariant(t *testing.T) {
 	database, author, book := openTestDB(t)
 	ctx := context.Background()
 	other := &models.Book{ForeignID: "download-new-book", AuthorID: author.ID, Title: "Other", SortTitle: "Other", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted}
@@ -443,12 +443,12 @@ func TestDownloadBookReassignmentClearsVariant(t *testing.T) {
 	if err != nil || unchanged == nil || unchanged.VariantID == nil || *unchanged.VariantID != variants[0].ID {
 		t.Fatalf("same-book reassignment lost the variant: %#v, %v", unchanged, err)
 	}
-	if err := repo.SetBookID(ctx, d.ID, other.ID); err != nil {
-		t.Fatal(err)
+	if err := repo.SetBookID(ctx, d.ID, other.ID); err != ErrVariantBookReassignment {
+		t.Fatalf("cross-book reassignment error = %v", err)
 	}
 	got, err := repo.GetByID(ctx, d.ID)
-	if err != nil || got == nil || got.BookID == nil || *got.BookID != other.ID || got.VariantID != nil {
-		t.Fatalf("reassigned download = %#v, %v", got, err)
+	if err != nil || got == nil || got.BookID == nil || *got.BookID != book.ID || got.VariantID == nil || *got.VariantID != variants[0].ID {
+		t.Fatalf("refused reassignment changed download = %#v, %v", got, err)
 	}
 }
 
@@ -770,9 +770,9 @@ func TestBookFileOwnershipChangeKeepsOtherVariantClaims(t *testing.T) {
 	}
 }
 
-// A download moving to another book must not leave the former variant hidden
-// from the wanted sweep when it was the only live claim.
-func TestDownloadBookReassignmentReopensUnclaimedVariant(t *testing.T) {
+// A rejected book move must leave both the download's association and the
+// variant's state intact, whether the download is active or historical.
+func TestDownloadBookReassignmentPreservesVariantStatus(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		download models.DownloadState
@@ -802,16 +802,20 @@ func TestDownloadBookReassignmentReopensUnclaimedVariant(t *testing.T) {
 			if err := variants.SetStatus(ctx, id, tc.variant); err != nil {
 				t.Fatal(err)
 			}
-			if err := downloads.SetBookID(ctx, d.ID, other.ID); err != nil {
-				t.Fatal(err)
+			if err := downloads.SetBookID(ctx, d.ID, other.ID); err != ErrVariantBookReassignment {
+				t.Fatalf("cross-book reassignment error = %v", err)
+			}
+			row, err := downloads.GetByID(ctx, d.ID)
+			if err != nil || row == nil || row.BookID == nil || *row.BookID != book.ID || row.VariantID == nil || *row.VariantID != id {
+				t.Fatalf("refused reassignment changed download = %#v, %v", row, err)
 			}
 			got, err := variants.ListByBook(ctx, book.ID)
-			if err != nil || len(got) != 1 || got[0].Status != models.VariantWanted {
-				t.Fatalf("former variant after %s = %#v, %v; want wanted", tc.name, got, err)
+			if err != nil || len(got) != 1 || got[0].Status != tc.variant {
+				t.Fatalf("variant after refused move %s = %#v, %v; want %s", tc.name, got, err, tc.variant)
 			}
 			wanted, err := variants.ListWanted(ctx)
-			if err != nil || len(wanted) != 1 || wanted[0].ID != id {
-				t.Fatalf("wanted after %s = %#v, %v", tc.name, wanted, err)
+			if err != nil || len(wanted) != 0 {
+				t.Fatalf("refused move exposed wanted after %s = %#v, %v", tc.name, wanted, err)
 			}
 		})
 	}
@@ -819,12 +823,11 @@ func TestDownloadBookReassignmentReopensUnclaimedVariant(t *testing.T) {
 
 func TestDownloadBookReassignmentKeepsOtherVariantClaims(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		wantStatus string
+		name string
 	}{
-		{"verified file", models.VariantImported},
-		{"active download", models.VariantDownloading},
-		{"failed download", models.VariantWanted},
+		{"verified file"},
+		{"active download"},
+		{"failed download"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			database, author, book := openTestDB(t)
@@ -870,12 +873,12 @@ func TestDownloadBookReassignmentKeepsOtherVariantClaims(t *testing.T) {
 			if err := variants.SetStatus(ctx, id, models.VariantDownloading); err != nil {
 				t.Fatal(err)
 			}
-			if err := downloads.SetBookID(ctx, d.ID, other.ID); err != nil {
-				t.Fatal(err)
+			if err := downloads.SetBookID(ctx, d.ID, other.ID); err != ErrVariantBookReassignment {
+				t.Fatalf("cross-book reassignment error = %v", err)
 			}
 			got, err := variants.ListByBook(ctx, book.ID)
-			if err != nil || len(got) != 1 || got[0].Status != tc.wantStatus {
-				t.Fatalf("variant with remaining %s = %#v, %v; want %s", tc.name, got, err, tc.wantStatus)
+			if err != nil || len(got) != 1 || got[0].Status != models.VariantDownloading {
+				t.Fatalf("variant after refused move with %s = %#v, %v; want downloading", tc.name, got, err)
 			}
 		})
 	}

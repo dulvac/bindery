@@ -21,6 +21,10 @@ type DownloadRepo struct {
 // moved out of wanted before this grab could reserve it.
 var ErrVariantUnavailable = errors.New("book variant is not available for a grab")
 
+// ErrVariantBookReassignment prevents generic book matching from stripping a
+// reviewed download's variant association and bypassing its source checks.
+var ErrVariantBookReassignment = errors.New("variant-bound download cannot be matched to another book")
+
 // ImportRetryLimit is shared with the scanner so an importFailed row whose
 // automatic retry budget is spent enters review on the same DB transition.
 const ImportRetryLimit = 5
@@ -813,9 +817,9 @@ func (r *DownloadRepo) SetTorrentID(ctx context.Context, id int64, torrentID str
 
 // SetBookID associates a download with a catalogue book after the fact. Used by
 // the importer when it recovers the association for a download that was grabbed
-// without one (e.g. a free-text Search grab) — issue #1014. Changing books
-// clears any variant assigned to the former book; setting the same book again
-// keeps its association.
+// without one (e.g. a free-text Search grab) — issue #1014. A variant-bound
+// download cannot move to another book: that would drop the reviewed source
+// association. Setting the same book again keeps its variant.
 func (r *DownloadRepo) SetBookID(ctx context.Context, id, bookID int64) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -830,6 +834,9 @@ func (r *DownloadRepo) SetBookID(ctx context.Context, id, bookID int64) error {
 	}
 	if err != nil {
 		return fmt.Errorf("reassign download lookup: %w", err)
+	}
+	if oldVariant.Valid && oldVariant.Int64 > 0 && (!oldBookID.Valid || oldBookID.Int64 != bookID) {
+		return ErrVariantBookReassignment
 	}
 	if _, err := tx.ExecContext(ctx,
 		"UPDATE downloads SET variant_id = CASE WHEN book_id = ? THEN variant_id ELSE NULL END, book_id = ? WHERE id = ?",
