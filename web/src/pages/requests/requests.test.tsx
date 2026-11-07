@@ -113,7 +113,7 @@ vi.mock('../../api/client', () => ({
 }))
 
 import { api } from '../../api/client'
-import type { LibraryRequest } from '../../api/client'
+import type { LibraryRequest, LibraryRequestList } from '../../api/client'
 
 function req(overrides: Partial<LibraryRequest>): LibraryRequest {
   return {
@@ -123,7 +123,40 @@ function req(overrides: Partial<LibraryRequest>): LibraryRequest {
 }
 
 describe('MyRequestsPage', () => {
-  beforeEach(() => vi.clearAllMocks())
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(api.listMyRequests).mockReset()
+    vi.mocked(api.createRequest).mockReset()
+  })
+
+  function mockPagedOwner(total: number) {
+    const english = { id: 31, mediaType: 'ebook' as const, language: 'eng', status: 'imported', verification: 'verified' }
+    const initial = req({ id: 3, mediaType: 'ebook', status: 'approved', fulfilled: true, languages: ['eng'], variants: [english] })
+    const refreshed = req({
+      ...initial, fulfilled: false, languages: ['eng', 'rum'],
+      variants: [english, { id: 32, mediaType: 'ebook', language: 'rum', status: 'wanted', verification: '' }],
+    })
+    let rows = [initial, ...Array.from({ length: total - 1 }, (_, index) => req({
+      id: index + 4, title: `Author ${index}`, kind: 'author', status: 'approved',
+    }))]
+    const list = async ({ limit = 50, offset = 0 }: { limit?: number; offset?: number } = {}): Promise<LibraryRequestList> => {
+      const capped = Math.min(limit, 200) // GET /requests clamps at 200.
+      return { items: rows.slice(offset, offset + capped), total: rows.length, limit: capped, offset }
+    }
+    vi.mocked(api.listMyRequests).mockImplementation(list)
+    vi.mocked(api.createRequest).mockImplementation(async () => {
+      rows = [refreshed, ...rows.slice(1)]
+      return { ...refreshed, variants: undefined } // POST /requests omits the projection.
+    })
+    return { list }
+  }
+
+  async function submitRomanian() {
+    const book = (await screen.findByText('Dune')).closest('li') as HTMLElement
+    fireEvent.click(within(book).getByRole('button', { name: 'Add another language' }))
+    fireEvent.click(within(book).getByRole('checkbox', { name: 'Romanian' }))
+    fireEvent.click(within(book).getByRole('button', { name: 'Send language request' }))
+  }
 
   it('lists what became of each request and withdraws a pending one', async () => {
     vi.mocked(api.listMyRequests).mockResolvedValue({
@@ -207,6 +240,121 @@ describe('MyRequestsPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Add another language' }))
     fireEvent.click(screen.getByRole('checkbox', { name: 'English' }))
     expect(screen.getByRole('button', { name: 'Send language request' })).toBeDisabled()
+    expect(api.createRequest).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps already-loaded pages when an immediate approval refreshes the owner list', async () => {
+    mockPagedOwner(75)
+    render(<MemoryRouter><MyRequestsPage /></MemoryRouter>)
+
+    expect(await screen.findByText('Author 48')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'requests.loadMore' }))
+    expect(await screen.findByText('Author 73')).toBeInTheDocument()
+
+    await submitRomanian()
+    await waitFor(() => expect(screen.getByTestId('book-variant-status-variant-32')).toHaveTextContent('Romanian'))
+    expect(screen.getByText('Author 73')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'requests.loadMore' })).not.toBeInTheDocument()
+    expect(api.listMyRequests).toHaveBeenNthCalledWith(3, { limit: 50, offset: 0 })
+    expect(api.listMyRequests).toHaveBeenNthCalledWith(4, { limit: 25, offset: 50 })
+    expect(api.createRequest).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps more than 200 loaded owner rows and refetches only bounded pages', async () => {
+    mockPagedOwner(251)
+    render(<MemoryRouter><MyRequestsPage /></MemoryRouter>)
+
+    expect(await screen.findByText('Author 48')).toBeInTheDocument()
+    for (const index of [98, 148, 198, 248, 249]) {
+      fireEvent.click(screen.getByRole('button', { name: 'requests.loadMore' }))
+      expect(await screen.findByText(`Author ${index}`)).toBeInTheDocument()
+    }
+
+    await submitRomanian()
+    await waitFor(() => expect(screen.getByTestId('book-variant-status-variant-32')).toHaveTextContent('Romanian'))
+    expect(screen.getByText('Author 249')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'requests.loadMore' })).not.toBeInTheDocument()
+    expect(vi.mocked(api.listMyRequests).mock.calls.slice(6)).toEqual(
+      [0, 50, 100, 150, 200, 250].map(offset => [{ limit: offset === 250 ? 1 : 50, offset }]),
+    )
+    expect(api.createRequest).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not send an add-language request while Load More is in flight', async () => {
+    const { list } = mockPagedOwner(51)
+    let finishPage!: (page: LibraryRequestList) => void
+    const inFlight = new Promise<LibraryRequestList>(resolve => { finishPage = resolve })
+    vi.mocked(api.listMyRequests).mockImplementationOnce(list).mockImplementationOnce(() => inFlight)
+    render(<MemoryRouter><MyRequestsPage /></MemoryRouter>)
+
+    expect(await screen.findByText('Author 48')).toBeInTheDocument()
+    const book = screen.getByText('Dune').closest('li') as HTMLElement
+    fireEvent.click(within(book).getByRole('button', { name: 'Add another language' }))
+    fireEvent.click(within(book).getByRole('checkbox', { name: 'Romanian' }))
+    const submit = within(book).getByRole('button', { name: 'Send language request' })
+    expect(submit).toBeEnabled()
+    fireEvent.click(screen.getByRole('button', { name: 'requests.loadMore' }))
+    await waitFor(() => expect(api.listMyRequests).toHaveBeenCalledWith({ limit: 50, offset: 50 }))
+    expect(submit).toBeDisabled()
+    fireEvent.click(submit)
+    expect(api.createRequest).not.toHaveBeenCalled()
+
+    finishPage(await list({ limit: 50, offset: 50 }))
+    expect(await screen.findByText('Author 49')).toBeInTheDocument()
+    await waitFor(() => expect(submit).toBeEnabled())
+    fireEvent.click(submit)
+    await waitFor(() => expect(screen.getByTestId('book-variant-status-variant-32')).toHaveTextContent('Romanian'))
+    expect(screen.getByText('Author 49')).toBeInTheDocument()
+    expect(api.listMyRequests).toHaveBeenNthCalledWith(4, { limit: 1, offset: 50 })
+    expect(api.createRequest).toHaveBeenCalledTimes(1)
+  })
+
+  it('blocks Load More during an approved request and its refresh', async () => {
+    const { list } = mockPagedOwner(75)
+    const create = vi.mocked(api.createRequest).getMockImplementation()!
+    let finishRequest!: () => void
+    const inFlightRequest = new Promise<void>(resolve => { finishRequest = resolve })
+    let finishRefresh!: (page: LibraryRequestList) => void
+    const inFlightRefresh = new Promise<LibraryRequestList>(resolve => { finishRefresh = resolve })
+    vi.mocked(api.createRequest).mockImplementationOnce(async (...args) => {
+      await inFlightRequest
+      return create(...args)
+    })
+    vi.mocked(api.listMyRequests).mockImplementationOnce(list).mockImplementationOnce(() => inFlightRefresh)
+    render(<MemoryRouter><MyRequestsPage /></MemoryRouter>)
+
+    expect(await screen.findByText('Author 48')).toBeInTheDocument()
+    await submitRomanian()
+    expect(screen.getByRole('button', { name: 'requests.loadMore' })).toBeDisabled()
+    expect(api.listMyRequests).toHaveBeenCalledTimes(1)
+    finishRequest()
+    await waitFor(() => expect(api.listMyRequests).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole('button', { name: 'requests.loadMore' })).toBeDisabled()
+    finishRefresh(await list({ limit: 50, offset: 0 }))
+    await waitFor(() => expect(screen.getByTestId('book-variant-status-variant-32')).toHaveTextContent('Romanian'))
+    expect(screen.getByRole('button', { name: 'requests.loadMore' })).toBeEnabled()
+    fireEvent.click(screen.getByRole('button', { name: 'requests.loadMore' }))
+    expect(await screen.findByText('Author 73')).toBeInTheDocument()
+    expect(api.createRequest).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps loaded pages but marks the touched row unknown if a later refresh page fails', async () => {
+    const { list } = mockPagedOwner(75)
+    vi.mocked(api.listMyRequests)
+      .mockImplementationOnce(list).mockImplementationOnce(list)
+      .mockImplementationOnce(list).mockRejectedValueOnce(new Error('refresh page 2 failed'))
+    render(<MemoryRouter><MyRequestsPage /></MemoryRouter>)
+
+    expect(await screen.findByText('Author 48')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'requests.loadMore' }))
+    expect(await screen.findByText('Author 73')).toBeInTheDocument()
+    await submitRomanian()
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Reload to confirm.')
+    expect(screen.getByText('Author 73')).toBeInTheDocument()
+    expect(screen.queryByTestId('book-variant-status-variant-31')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('book-variant-status-variant-32')).not.toBeInTheDocument()
+    expect(api.listMyRequests).toHaveBeenNthCalledWith(4, { limit: 25, offset: 50 })
     expect(api.createRequest).toHaveBeenCalledTimes(1)
   })
 

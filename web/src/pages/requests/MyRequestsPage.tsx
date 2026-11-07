@@ -126,9 +126,18 @@ export default function MyRequestsPage() {
 
       if (created.status === 'approved' && created.variants === undefined) {
         try {
-          const page = await api.listMyRequests({ limit: Math.max(PAGE_SIZE, items.length), offset: 0 })
-          setItems(page.items)
-          setTotal(page.total)
+          const visibleCount = Math.max(PAGE_SIZE, items.length)
+          const refreshed: LibraryRequest[] = []
+          let refreshedTotal = 0
+          while (refreshed.length < visibleCount) {
+            const limit = Math.min(PAGE_SIZE, visibleCount - refreshed.length)
+            const page = await api.listMyRequests({ limit, offset: refreshed.length })
+            refreshed.push(...page.items)
+            refreshedTotal = page.total
+            if (page.items.length === 0 || refreshed.length >= refreshedTotal) break
+          }
+          setItems(refreshed)
+          setTotal(refreshedTotal)
         } catch {
           setItems(prev => prev.map(item => (touchesRequest(item) ? created : item)))
           setError(t('requests.mine.statusUnknownReload'))
@@ -222,7 +231,7 @@ export default function MyRequestsPage() {
                     <button
                       type="button"
                       onClick={() => void sendExtend(r)}
-                      disabled={sendingExtend || editLanguages.length === 0 || !canSubmitExtend}
+                      disabled={loading || sendingExtend || editLanguages.length === 0 || !canSubmitExtend}
                       className={`px-3 py-1.5 ${primaryFill} disabled:opacity-50 disabled:cursor-not-allowed rounded-md text-sm font-medium`}
                     >
                       {sendingExtend
@@ -252,7 +261,7 @@ export default function MyRequestsPage() {
 
       {loading && <p className="text-sm text-fg-muted">{t('common.loading')}</p>}
       {!loading && items.length < total && (
-        <button type="button" onClick={() => void load(items.length)} className="px-4 py-2 text-sm rounded-md border border-slate-300 dark:border-zinc-700">
+        <button type="button" onClick={() => void load(items.length)} disabled={sendingExtend} className="px-4 py-2 text-sm rounded-md border border-slate-300 dark:border-zinc-700 disabled:opacity-50 disabled:cursor-not-allowed">
           {t('requests.loadMore')}
         </button>
       )}
