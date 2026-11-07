@@ -58,6 +58,9 @@ vi.mock('react-i18next', () => ({
         'queue.retryThisTorrentReason': 'Reason for retrying this torrent',
         'queue.retryThisTorrentReasonRequired': 'A reason is required.',
         'queue.retryThisTorrentSearchAgain': 'Need a different release? Open this book and use Search again for a new copy.',
+        'queue.retryThisTorrentStale': 'This queue row or reviewed torrent changed. Refresh the queue before retrying.',
+        'queue.variantRetryAdminHint': 'Review this copy and its download on the book before retrying. Generic Match and Retry cannot handle copy-specific failures.',
+        'queue.variantRetryRequesterHint': 'Only an admin can decide how to retry a copy-specific failure. Ask an admin to review this download.',
         'queue.errorDetails': 'Show full error',
         'queue.clearAllFailed': 'Clear all failed',
         'queue.retryAllFailed': 'Retry all failed',
@@ -192,7 +195,7 @@ function renderQueuePage() {
 }
 
 beforeEach(() => {
-  vi.clearAllMocks()
+  vi.resetAllMocks()
   document.title = 'Bindery'
   vi.mocked(api.listQueue).mockResolvedValue({ items: [] })
   vi.mocked(api.listPending).mockResolvedValue([])
@@ -1000,12 +1003,14 @@ describe('QueuePage reviewed torrent retry (R13)', () => {
   const reviewedBook = { id: 42, title: 'Dune', mediaType: 'ebook', variants: [reviewedVariant] } as Book
   const reviewedQueueRow = makeQueueItem({
     id: 71,
+    bookId: 42,
     title: 'Dune [ENG / EPUB]',
     status: 'importBlocked',
     protocol: 'torrent',
     book: { id: 42, title: 'Dune', authorId: 7, authorName: 'Frank Herbert' },
     variantId: 17,
     torrentId: 'abc123hash',
+    reviewedRetryEligible: true,
   })
 
   it('shows an admin-only Retry this torrent action for a reviewed retained torrent row', async () => {
@@ -1040,6 +1045,7 @@ describe('QueuePage reviewed torrent retry (R13)', () => {
       17,
       71,
       'Owner reviewed this torrent; retry same retained files',
+      'abc123hash',
     ))
     expect(api.retryImport).not.toHaveBeenCalled()
     expect(api.matchDownload).not.toHaveBeenCalled()
@@ -1083,6 +1089,146 @@ describe('QueuePage reviewed torrent retry (R13)', () => {
 
     await screen.findByText('negative variant')
     expect(screen.queryByRole('button', { name: 'Retry this torrent' })).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['requester with review projection', false, 'importBlocked', 3, true, false],
+    ['admin with failed projection lookup', true, 'importBlocked', 3, undefined, false],
+    ['admin with retryable importFailed', true, 'importFailed', 1, false, false],
+    ['admin with exhausted importFailed', true, 'importFailed', 3, true, true],
+    ['admin with blocked import', true, 'importBlocked', 3, true, true],
+  ])('keeps %s off generic Match and Retry and gives copy-specific guidance', async (_label, admin, status, retryCount, eligible, named) => {
+    authState.isAdmin = admin
+    vi.mocked(api.listQueue).mockResolvedValue({ items: [{
+      ...reviewedQueueRow, status, importRetryCount: retryCount,
+      reviewedRetryEligible: eligible,
+    }] })
+    vi.mocked(api.getBook).mockRejectedValue(new Error('book lookup unavailable'))
+
+    renderQueuePage()
+    await screen.findByText('Dune [ENG / EPUB]')
+    if (named) expect(await screen.findByRole('button', { name: 'Retry this torrent' })).toBeInTheDocument()
+    else expect(screen.queryByRole('button', { name: 'Retry this torrent' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Retry import' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'queue.matchBookChange' })).not.toBeInTheDocument()
+    expect(screen.getByText(admin && !named ? /Generic Match and Retry cannot handle copy-specific failures/ : /Ask an admin|Only an admin|Search again/)).toBeInTheDocument()
+    expect(api.getBook).not.toHaveBeenCalled()
+  })
+
+  it('excludes variant-bound rows from bulk Retry all and Retry selected, but keeps legacy rows', async () => {
+    vi.mocked(api.listQueue).mockResolvedValue({ items: [
+      reviewedQueueRow,
+      makeQueueItem({ ...reviewedQueueRow, id: 72, status: 'importFailed', importRetryCount: 1, reviewedRetryEligible: false }),
+      makeQueueItem({ id: 73, title: 'Legacy import', status: 'importFailed' }),
+      makeQueueItem({ id: 74, title: 'Legacy failed grab', status: 'failed' }),
+    ] })
+    renderQueuePage()
+    await screen.findByText('Legacy failed grab')
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all' }))
+    clickBulkAction('Retry selected')
+    await acceptConfirm()
+    await waitFor(() => expect(api.bulkRetryQueue).toHaveBeenCalledWith([73, 74]))
+    fireEvent.click(screen.getByRole('button', { name: 'Retry all failed' }))
+    await acceptConfirm()
+    await waitFor(() => expect(api.bulkRetryQueue).toHaveBeenCalledTimes(2))
+    expect(api.bulkRetryQueue).toHaveBeenLastCalledWith([73, 74])
+  })
+
+  it('does not offer generic resend for a variant-bound failed download', async () => {
+    authState.isAdmin = false
+    vi.mocked(api.listQueue).mockResolvedValue({ items: [{
+      ...reviewedQueueRow, status: 'failed', torrentId: undefined, reviewedRetryEligible: false,
+    }] })
+    renderQueuePage()
+    await screen.findByText('Dune [ENG / EPUB]')
+    expect(screen.queryByRole('button', { name: 'Retry download' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Retry all failed' })).not.toBeInTheDocument()
+    expect(screen.getByText(/Only an admin/)).toBeInTheDocument()
+  })
+
+  it('does not offer bulk retry when all failed rows are variant-bound', async () => {
+    vi.mocked(api.listQueue).mockResolvedValue({ items: [reviewedQueueRow] })
+    renderQueuePage()
+    await screen.findByText('Dune [ENG / EPUB]')
+    expect(screen.queryByRole('button', { name: 'Retry all failed' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all' }))
+    expect(() => clickBulkAction('Retry selected')).toThrow()
+  })
+
+  it('does not fan out book lookups for off-page reviewed candidates on repeated polls', async () => {
+    vi.useFakeTimers()
+    const items = Array.from({ length: 120 }, (_, n) => makeQueueItem({
+      ...reviewedQueueRow,
+      id: n + 200,
+      bookId: n + 200,
+      book: { ...reviewedQueueRow.book!, id: n + 200 },
+    }))
+    vi.mocked(api.listQueue).mockResolvedValue({ items })
+    renderQueuePage()
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    await act(async () => { vi.advanceTimersByTime(15000); await Promise.resolve() })
+    expect(api.listQueue).toHaveBeenCalledTimes(4)
+    expect(api.getBook).not.toHaveBeenCalled()
+  })
+
+  it('only polls the queue, not each book, and ignores a late older poll for the same download id', async () => {
+    vi.useFakeTimers()
+    const older = deferred<QueueListResponse>()
+    const newer = deferred<QueueListResponse>()
+    vi.mocked(api.listQueue)
+      .mockResolvedValueOnce({ items: [reviewedQueueRow] })
+      .mockReturnValueOnce(older.promise)
+      .mockReturnValueOnce(newer.promise)
+    renderQueuePage()
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    expect(screen.getByRole('button', { name: 'Retry this torrent' })).toBeInTheDocument()
+    await act(async () => { vi.advanceTimersByTime(5000); await Promise.resolve() })
+    await act(async () => { vi.advanceTimersByTime(5000); await Promise.resolve() })
+    await act(async () => {
+      newer.resolve({ items: [{ ...reviewedQueueRow, title: 'Changed torrent', torrentId: 'new-hash', reviewedRetryEligible: false }] })
+      await Promise.resolve()
+    })
+    await act(async () => {
+      older.resolve({ items: [reviewedQueueRow] })
+      await Promise.resolve()
+    })
+    expect(screen.getByText('Changed torrent')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Retry this torrent' })).not.toBeInTheDocument()
+    expect(api.getBook).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['changed hash', { torrentId: 'another-torrent' }],
+    ['variant no longer in review', { reviewedRetryEligible: false }],
+    ['changed variant association', { variantId: 18 }],
+    ['removed row', null],
+  ])('refuses confirmation when the %s changed after opening the modal', async (_label, changed) => {
+    vi.mocked(api.listQueue)
+      .mockResolvedValueOnce({ items: [reviewedQueueRow] })
+      .mockResolvedValueOnce({ items: changed ? [{ ...reviewedQueueRow, ...changed }] : [] })
+      .mockResolvedValue({ items: [] })
+    renderQueuePage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Retry this torrent' }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.change(within(dialog).getByRole('textbox', { name: 'Reason for retrying this torrent' }), { target: { value: 'reviewed retry' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Retry this torrent' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(/changed|no longer available/i)
+    expect(api.retryReviewedVariantImport).not.toHaveBeenCalled()
+  })
+
+  it('keeps a 409 visible after the queue row disappears on refresh', async () => {
+    vi.mocked(api.listQueue)
+      .mockResolvedValueOnce({ items: [reviewedQueueRow] })
+      .mockResolvedValueOnce({ items: [reviewedQueueRow] })
+      .mockResolvedValue({ items: [] })
+    vi.mocked(api.retryReviewedVariantImport).mockRejectedValue(new Error('409: variant or torrent is not available for a reviewed import retry'))
+    renderQueuePage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Retry this torrent' }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.change(within(dialog).getByRole('textbox', { name: 'Reason for retrying this torrent' }), { target: { value: 'reviewed retry' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Retry this torrent' }))
+    expect(await screen.findByText('Queue is empty')).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent('409: variant or torrent is not available for a reviewed import retry')
   })
 
   it('surfaces stale-state retry-import conflicts honestly', async () => {

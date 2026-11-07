@@ -504,6 +504,10 @@ type QueueItem struct {
 	TimeLeft   string   `json:"timeLeft,omitempty"`
 	Speed      string   `json:"speed,omitempty"`
 	Book       *bookRef `json:"book,omitempty"`
+	// Admin-only hint. A positive value means the bound copy is reviewed and
+	// the retained torrent is terminal; the named retry still checks the live
+	// database state atomically when it is submitted.
+	ReviewedRetryEligible bool `json:"reviewedRetryEligible,omitempty"`
 }
 
 type enrichedQueueItem struct {
@@ -731,6 +735,42 @@ func (h *QueueHandler) List(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Only the admin receives a reviewed-retry hint. Query variants in bounded
+	// database batches for the candidate books from THIS queue response, rather
+	// than having each open browser poll every candidate book over HTTP. The
+	// queue's owner filter ran before this projection; a failed lookup is not
+	// evidence of eligibility and leaves every action closed.
+	if isAdminCtx(r.Context()) && h.books != nil {
+		candidateBooks := make(map[int64]bool)
+		for _, item := range items {
+			if reviewedRetryCandidate(item.Download) {
+				candidateBooks[*item.BookID] = true
+			}
+		}
+		if len(candidateBooks) > 0 {
+			ids := make([]int64, 0, len(candidateBooks))
+			for id := range candidateBooks {
+				ids = append(ids, id)
+			}
+			byBook, err := h.books.VariantRepo().ListByBookIDs(r.Context(), ids)
+			if err != nil {
+				slog.Warn("queue: failed to load reviewed retry eligibility", "error", err)
+			} else {
+				for i := range items {
+					if !reviewedRetryCandidate(items[i].Download) {
+						continue
+					}
+					for _, v := range byBook[*items[i].BookID] {
+						if v.ID == *items[i].VariantID && v.Status == models.VariantReview {
+							items[i].ReviewedRetryEligible = true
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// Attach a linkable book + author projection so the UI can deep-link each
 	// row to /book/:id and /author/:id. Best-effort: this endpoint is hot
 	// (polled every 5s) and a book lookup failure must not blank the queue.
@@ -749,6 +789,16 @@ func (h *QueueHandler) List(w http.ResponseWriter, r *http.Request) {
 		Partial:      len(diagnostics) > 0,
 		StaleClients: diagnostics,
 	})
+}
+
+// reviewedRetryCandidate is the cheap, row-local part of the named retry
+// contract. Review status comes from the variant projection above; file,
+// rejection, and concurrent-download guards remain inside the DB transaction.
+func reviewedRetryCandidate(d models.Download) bool {
+	return d.ID > 0 && d.BookID != nil && *d.BookID > 0 && d.VariantID != nil && *d.VariantID > 0 &&
+		d.DownloadClientID != nil && d.Protocol == "torrent" && d.TorrentID != nil &&
+		strings.TrimSpace(*d.TorrentID) != "" && (d.Status == models.StateImportBlocked ||
+		(d.Status == models.StateImportFailed && d.ImportRetryCount >= db.ImportRetryLimit))
 }
 
 // failedStates are the download states the queue shows as failed: the ones

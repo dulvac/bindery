@@ -10,6 +10,7 @@ export interface Download {
   // are display-only on some projections.
   bookId?: number
   variantId?: number
+  importRetryCount?: number
   title: string
   status: string
   size: number
@@ -24,6 +25,9 @@ export interface Download {
 }
 
 export interface QueueItem extends Download {
+  // Admin-only queue hint. The server batches the review lookup and the
+  // named endpoint still guards the current variant and torrent atomically.
+  reviewedRetryEligible?: boolean
   percentage?: string
   timeLeft?: string
 }

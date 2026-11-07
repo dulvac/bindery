@@ -572,6 +572,19 @@ func (r *DownloadRepo) claimForRegrab(ctx context.Context, d *models.Download, q
 // source, tracked file, other active download, or mismatched association
 // refuses the retry without changing anything.
 func (r *DownloadRepo) RetryReviewedImport(ctx context.Context, bookID, variantID, downloadID, actorID int64, reason string) (bool, error) {
+	return r.retryReviewedImport(ctx, bookID, variantID, downloadID, actorID, reason, "")
+}
+
+// RetryReviewedImportMatchingTorrent adds an expected torrent identity to the
+// named retry's atomic claim. Browser confirmations include the hash they saw;
+// an old modal cannot silently retry a newly associated torrent under the same
+// download ID. The original route without an expected identity remains usable
+// by existing API clients.
+func (r *DownloadRepo) RetryReviewedImportMatchingTorrent(ctx context.Context, bookID, variantID, downloadID, actorID int64, reason, expectedTorrentID string) (bool, error) {
+	return r.retryReviewedImport(ctx, bookID, variantID, downloadID, actorID, reason, expectedTorrentID)
+}
+
+func (r *DownloadRepo) retryReviewedImport(ctx context.Context, bookID, variantID, downloadID, actorID int64, reason, expectedTorrentID string) (bool, error) {
 	reason = strings.TrimSpace(reason)
 	if bookID <= 0 || variantID <= 0 || downloadID <= 0 || actorID <= 0 || reason == "" || len(reason) > 500 {
 		return false, fmt.Errorf("reviewed import retry requires book, variant, download, actor and reason (max 500 bytes)")
@@ -589,9 +602,12 @@ func (r *DownloadRepo) RetryReviewedImport(ctx context.Context, bookID, variantI
 		AND NOT EXISTS (SELECT 1 FROM variant_rejections rejection
 			WHERE rejection.variant_id=book_variants.id AND rejection.download_id=?)
 		AND EXISTS (SELECT 1 FROM downloads d WHERE d.id=? AND d.book_id=book_variants.book_id
-			AND d.variant_id=book_variants.id AND d.status IN ('importFailed', 'importBlocked')
+			AND d.variant_id=book_variants.id AND (d.status='importBlocked' OR
+				(d.status='importFailed' AND d.import_retry_count >= ?))
 			AND d.protocol='torrent' AND d.torrent_id IS NOT NULL AND TRIM(d.torrent_id) != ''
-			AND d.download_client_id IS NOT NULL)`, variantID, bookID, downloadID, downloadID, downloadID)
+			AND (? = '' OR d.torrent_id = ?)
+			AND d.download_client_id IS NOT NULL)`, variantID, bookID, downloadID, downloadID, downloadID,
+		ImportRetryLimit, expectedTorrentID, expectedTorrentID)
 	if err != nil {
 		return false, fmt.Errorf("claim reviewed variant for old torrent: %w", err)
 	}

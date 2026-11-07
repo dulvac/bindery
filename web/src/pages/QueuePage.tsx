@@ -30,17 +30,24 @@ type RetryExistingTorrentTarget = {
   variantId: number
   bookTitle: string
   releaseTitle: string
+  torrentId: string
+}
+
+function isVariantBound(item: QueueItem): boolean {
+  return item.variantId != null
 }
 
 function isExistingTorrentRetryCandidate(item: QueueItem): item is QueueItem & { variantId: number; torrentId: string; book: NonNullable<QueueItem['book']> } {
   return (item.status === 'importFailed' || item.status === 'importBlocked')
     && item.id > 0
+    && item.protocol === 'torrent'
     && typeof item.variantId === 'number'
     && item.variantId > 0
     && typeof item.torrentId === 'string'
     && item.torrentId.trim().length > 0
     && !!item.book
     && item.book.id > 0
+    && item.bookId === item.book.id
 }
 
 export default function QueuePage() {
@@ -63,7 +70,8 @@ export default function QueuePage() {
   const [pendingError, setPendingError] = useState<Record<number, string>>({})
   const [retryingImportIds, setRetryingImportIds] = useState<Set<number>>(() => new Set())
   const [retryImportErrors, setRetryImportErrors] = useState<Record<number, string>>({})
-  const [reviewedRetryRows, setReviewedRetryRows] = useState<Record<number, boolean>>({})
+  // Page-level notice survives a queue refresh that removes the rejected row.
+  const [retryNotice, setRetryNotice] = useState<string | null>(null)
   const [retryExistingTorrentTarget, setRetryExistingTorrentTarget] = useState<RetryExistingTorrentTarget | null>(null)
   const [retryExistingTorrentReason, setRetryExistingTorrentReason] = useState('')
   const [matchMessages, setMatchMessages] = useState<Record<number, string>>({})
@@ -100,60 +108,30 @@ export default function QueuePage() {
   // resolves after a newer tick or after unmount is ignored. Mirrors
   // AuthorsPage's poll guard.
   const mounted = useRef(true)
+  const loadGeneration = useRef(0)
   useEffect(() => {
     mounted.current = true
     return () => { mounted.current = false }
   }, [])
 
   const load = useCallback(() => {
+    const generation = ++loadGeneration.current
     Promise.all([
       api.listQueue(),
       api.listPending(),
     ]).then(([q, p]) => {
-      if (!mounted.current) return
+      if (!mounted.current || generation !== loadGeneration.current) return
       setQueue(q.items ?? [])
       notifyFailedQueueChanged((q.items ?? []).filter(it => isFailed(it.status)).length)
       setPartial(!!q.partial)
       setStaleClients((q.staleClients ?? []).map(c => c.name).filter((n): n is string => !!n))
       setPending(p)
-    }).catch(console.error).finally(() => { if (mounted.current) setLoading(false) })
+    }).catch(console.error).finally(() => {
+      if (mounted.current && generation === loadGeneration.current) setLoading(false)
+    })
   }, [])
 
   useEffect(() => { load() }, [load])
-
-  // The named existing-torrent retry is valid only for reviewed variants. Queue
-  // rows carry ids and torrent identity, but not variant status, so resolve the
-  // current status from each linked book.
-  useEffect(() => {
-    if (!isAdmin) {
-      setReviewedRetryRows({})
-      return
-    }
-    const candidates = queue.filter(isExistingTorrentRetryCandidate)
-    if (candidates.length === 0) {
-      setReviewedRetryRows({})
-      return
-    }
-    let cancelled = false
-    const bookIDs = [...new Set(candidates.map(item => item.book.id))]
-    Promise.all(bookIDs.map(async bookId => {
-      try {
-        return [bookId, await api.getBook(bookId)] as const
-      } catch {
-        return [bookId, null] as const
-      }
-    })).then(results => {
-      if (cancelled || !mounted.current) return
-      const byBook = new Map<number, Book | null>(results)
-      const next: Record<number, boolean> = {}
-      for (const item of candidates) {
-        const variant = byBook.get(item.book.id)?.variants?.find(v => v.id === item.variantId)
-        next[item.id] = variant?.status === 'review'
-      }
-      setReviewedRetryRows(next)
-    })
-    return () => { cancelled = true }
-  }, [queue, isAdmin])
 
   // Poll while the tab is visible. usePolling pauses on document.hidden, so a
   // queue left open in a background window stops asking (#2360).
@@ -334,7 +312,8 @@ export default function QueuePage() {
   }
 
   const openRetryExistingTorrent = (item: QueueItem) => {
-    if (!isExistingTorrentRetryCandidate(item)) return
+    if (!isAdmin || !isExistingTorrentRetryCandidate(item) || item.reviewedRetryEligible !== true) return
+    setRetryNotice(null)
     clearRetryImportError(item.id)
     setRetryExistingTorrentReason('')
     setRetryExistingTorrentTarget({
@@ -343,6 +322,7 @@ export default function QueuePage() {
       variantId: item.variantId,
       bookTitle: item.book.title,
       releaseTitle: item.title,
+      torrentId: item.torrentId,
     })
   }
 
@@ -358,21 +338,28 @@ export default function QueuePage() {
     const reason = retryExistingTorrentReason.trim()
     if (!reason) return
     setRetryingImportIds(prev => new Set(prev).add(target.downloadId))
-    clearRetryImportError(target.downloadId)
+    setRetryNotice(null)
     try {
-      await api.retryReviewedVariantImport(target.bookId, target.variantId, target.downloadId, reason)
-      setRetryExistingTorrentTarget(null)
-      setRetryExistingTorrentReason('')
+      // A five-second poll and an open modal can both hold an old download id.
+      // Read the current queue once at confirmation, including the server's
+      // latest review hint, before asking the named endpoint to claim it.
+      const currentQueue = await api.listQueue()
+      const current = currentQueue.items?.find(item => item.id === target.downloadId)
+      if (currentQueue.partial || !current || !isExistingTorrentRetryCandidate(current)
+        || current.reviewedRetryEligible !== true || current.book.id !== target.bookId
+        || current.variantId !== target.variantId || current.torrentId !== target.torrentId) {
+        setRetryNotice(t('queue.retryThisTorrentStale', 'This queue row or reviewed torrent changed. Refresh the queue before retrying.'))
+        load()
+        return
+      }
+      await api.retryReviewedVariantImport(target.bookId, target.variantId, target.downloadId, reason, target.torrentId)
       load()
     } catch (e) {
-      setRetryImportErrors(prev => ({
-        ...prev,
-        [target.downloadId]: errorText(e, t('queue.retryFailed', 'Retry failed')),
-      }))
-      setRetryExistingTorrentTarget(null)
-      setRetryExistingTorrentReason('')
+      setRetryNotice(t('queue.retryImportError', { error: errorText(e, t('queue.retryFailed', 'Retry failed')) }))
       load()
     } finally {
+      setRetryExistingTorrentTarget(null)
+      setRetryExistingTorrentReason('')
       setRetryingImportIds(prev => {
         const next = new Set(prev)
         next.delete(target.downloadId)
@@ -462,7 +449,7 @@ export default function QueuePage() {
   // The selected rows a retry can actually do something with. Remove selected
   // works on anything; a retry only applies to a failed row, so the button is
   // offered only when the selection holds one (#2295).
-  const retryableSelection = selectedShown.filter(q => isRetryable(q.status) || isResendable(q.status))
+  const retryableSelection = selectedShown.filter(q => !isVariantBound(q) && (isRetryable(q.status) || isResendable(q.status)))
 
   // Bulk actions over failed/blocked items, done client-side over the existing
   // per-item endpoints (no new API). Retry covers every state the retry-import
@@ -529,7 +516,7 @@ export default function QueuePage() {
   // Every failed row, both stages: an import failure re-arms its import, a
   // failed download has its release re-sent. The button used to cover the import
   // stage alone while the count beside it included the download stage too.
-  const retryAllFailed = () => retryMany(queue.filter(q => isRetryable(q.status) || isResendable(q.status)))
+  const retryAllFailed = () => retryMany(queue.filter(q => !isVariantBound(q) && (isRetryable(q.status) || isResendable(q.status))))
   const retrySelected = () => retryMany(retryableSelection)
 
   // Remove the arbitrarily-selected items in one call. unmonitorBooks (default
@@ -608,6 +595,11 @@ export default function QueuePage() {
     <div className={selectedShown.length > 0 ? 'pb-16' : ''}>
       {confirmDialog}
       <h2 className="text-2xl font-bold mb-6">{t('queue.title')}</h2>
+      {retryNotice && (
+        <div role="alert" className="mb-4 px-3 py-2 text-sm text-red-700 dark:text-red-400 bg-red-400/10 rounded border border-red-400/30 break-words">
+          {retryNotice}
+        </div>
+      )}
 
       {/* The API answers with a partial flag when a download client missed its
           poll deadline, and the rows behind that client are then missing from
@@ -644,7 +636,7 @@ export default function QueuePage() {
                     {t('queue.failedCount', { count: failedItems.length, defaultValue: '{{count}} failed' })}
                   </span>
                   <div className="flex gap-2">
-                    {queue.some(q => isRetryable(q.status) || isResendable(q.status)) && (
+                    {queue.some(q => !isVariantBound(q) && (isRetryable(q.status) || isResendable(q.status))) && (
                       <button
                         onClick={retryAllFailed}
                         disabled={bulkBusy}
@@ -705,10 +697,9 @@ export default function QueuePage() {
                 />
               )}
               {queuePage.map(item => {
-                const reviewedTorrentRetryCandidate = isAdmin && isExistingTorrentRetryCandidate(item)
-                const reviewedTorrentRetryReady = reviewedTorrentRetryCandidate && reviewedRetryRows[item.id] === true
-                const reviewedTorrentRetryPending = reviewedTorrentRetryCandidate && reviewedRetryRows[item.id] === undefined
-                const showMatchActions = isMatchable(item.status) && !reviewedTorrentRetryReady && !reviewedTorrentRetryPending
+                const variantBound = isVariantBound(item)
+                const reviewedTorrentRetryReady = isAdmin && isExistingTorrentRetryCandidate(item) && item.reviewedRetryEligible === true
+                const showMatchActions = isMatchable(item.status) && !variantBound
                 return (
                 <div key={item.id} className={`flex flex-wrap sm:flex-nowrap items-center justify-between p-3 border rounded-lg bg-slate-100 dark:bg-zinc-900 ${selectedIds.has(item.id) ? 'border-emerald-500' : 'border-slate-200 dark:border-zinc-800'}`}>
                   <Checkbox
@@ -795,12 +786,16 @@ export default function QueuePage() {
                         {t('queue.matchedTo', { title: item.book.title, defaultValue: `Matched to ${item.book.title} — use Retry import to import it.` })}
                       </div>
                     )}
-                    {reviewedTorrentRetryReady && item.book && (
+                    {variantBound && (isMatchable(item.status) || isResendable(item.status)) && (
                       <div className="mt-1 text-xs text-fg-muted bg-slate-200/70 dark:bg-zinc-800/70 rounded px-2 py-1 break-words">
-                        <p>{t('queue.retryThisTorrentSearchAgain', 'Need a different release? Open this book and use Search again for a new copy.')}</p>
-                        <Link to={`/book/${item.book.id}`} className="underline text-accent-text">
+                        <p>{reviewedTorrentRetryReady
+                          ? t('queue.retryThisTorrentSearchAgain', 'Need a different release? Open this book and use Search again for a new copy.')
+                          : isAdmin
+                            ? t('queue.variantRetryAdminHint', 'Review this copy and its download on the book before retrying. Generic Match and Retry cannot handle copy-specific failures.')
+                            : t('queue.variantRetryRequesterHint', 'Only an admin can decide how to retry a copy-specific failure. Ask an admin to review this download.')}</p>
+                        {item.book && <Link to={`/book/${item.book.id}`} className="underline text-accent-text">
                           {t('queue.retryThisTorrentOpenBook', 'Open book')}
-                        </Link>
+                        </Link>}
                       </div>
                     )}
                     {retryImportErrors[item.id] && (
@@ -860,7 +855,7 @@ export default function QueuePage() {
                         {retryingImportIds.has(item.id) ? t('queue.retryingImport') : t('queue.retryThisTorrent', 'Retry this torrent')}
                       </button>
                     )}
-                    {isResendable(item.status) && (
+                    {!variantBound && isResendable(item.status) && (
                       <button
                         onClick={() => handleRetryDownload(item.id)}
                         disabled={retryingImportIds.has(item.id)}

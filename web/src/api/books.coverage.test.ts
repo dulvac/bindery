@@ -103,11 +103,11 @@ describe('booksApi request shapes', () => {
     const seen = record()
     await booksApi.searchBook(42, { mediaType: 'ebook', language: 'rum' })
     await booksApi.retryReviewedVariant(42, 17, 'Wrong-language import reviewed')
-    await booksApi.retryReviewedVariantImport(42, 17, 99, 'Retry same retained torrent')
+    await booksApi.retryReviewedVariantImport(42, 17, 99, 'Retry same retained torrent', 'abc123hash')
     expect(seen.map(s => [s.method, s.path + s.query, s.body])).toEqual([
       ['POST', '/book/42/search?mediaType=ebook&language=rum', undefined],
       ['POST', '/book/42/variants/17/retry', { reason: 'Wrong-language import reviewed' }],
-      ['POST', '/book/42/variants/17/retry-import', { downloadId: 99, reason: 'Retry same retained torrent' }],
+      ['POST', '/book/42/variants/17/retry-import', { downloadId: 99, reason: 'Retry same retained torrent', torrentId: 'abc123hash' }],
     ])
   })
 

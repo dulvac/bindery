@@ -299,9 +299,9 @@ export const booksApi = {
     request<{ status: string }>(`/book/${bookId}/variants/${variantId}/retry`, {
       method: 'POST', body: JSON.stringify({ reason }),
     }),
-  retryReviewedVariantImport: (bookId: number, variantId: number, downloadId: number, reason: string) =>
+  retryReviewedVariantImport: (bookId: number, variantId: number, downloadId: number, reason: string, torrentId: string) =>
     request<{ status: string }>(`/book/${bookId}/variants/${variantId}/retry-import`, {
-      method: 'POST', body: JSON.stringify({ downloadId, reason }),
+      method: 'POST', body: JSON.stringify({ downloadId, reason, torrentId }),
     }),
   getLastSearchDebug: () => request<SearchDebug>(`/search/last-debug`),
   enrichAudiobook: (id: number) => request<Book>(`/book/${id}/enrich-audiobook`, { method: 'POST' }),

@@ -100,8 +100,9 @@ func (h *BookHandler) RetryReviewedVariantImport(w http.ResponseWriter, r *http.
 		return
 	}
 	var input struct {
-		DownloadID int64  `json:"downloadId"`
-		Reason     string `json:"reason"`
+		DownloadID int64   `json:"downloadId"`
+		Reason     string  `json:"reason"`
+		TorrentID  *string `json:"torrentId"`
 	}
 	if err := decodeStrict(w, r, 4096, false, &input); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid retry request"})
@@ -110,6 +111,10 @@ func (h *BookHandler) RetryReviewedVariantImport(w http.ResponseWriter, r *http.
 	input.Reason = strings.TrimSpace(input.Reason)
 	if input.DownloadID <= 0 || input.Reason == "" || len(input.Reason) > 500 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "downloadId and reason are required (max 500 bytes)"})
+		return
+	}
+	if input.TorrentID != nil && (strings.TrimSpace(*input.TorrentID) == "" || len(*input.TorrentID) > 128) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid torrent identity"})
 		return
 	}
 	variants, err := h.books.VariantRepo().ListByBook(r.Context(), book.ID)
@@ -137,7 +142,12 @@ func (h *BookHandler) RetryReviewedVariantImport(w http.ResponseWriter, r *http.
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "download not found"})
 		return
 	}
-	changed, err := h.downloads.RetryReviewedImport(r.Context(), book.ID, variantID, input.DownloadID, actor, input.Reason)
+	var changed bool
+	if input.TorrentID != nil {
+		changed, err = h.downloads.RetryReviewedImportMatchingTorrent(r.Context(), book.ID, variantID, input.DownloadID, actor, input.Reason, *input.TorrentID)
+	} else {
+		changed, err = h.downloads.RetryReviewedImport(r.Context(), book.ID, variantID, input.DownloadID, actor, input.Reason)
+	}
 	if err != nil {
 		writeServerError(w, r, err)
 		return

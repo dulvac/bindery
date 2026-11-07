@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -41,7 +42,7 @@ func TestVariantRetryExistingTorrentNamedAdminRoute(t *testing.T) {
 	const hash = "abcdef1234567890abcdef1234567890abcdef12"
 	downloads := db.NewDownloadRepo(f.database)
 	old := &models.Download{GUID: "retry-old-torrent", BookID: &own.ID, VariantID: &ownCopy[0].ID,
-		Title: "Retry Old [ENG / EPUB]", Protocol: "torrent", DownloadClientID: &client.ID, Status: models.StateGrabbed}
+		OwnerUserID: f.requester.ID, Title: "Retry Old [ENG / EPUB]", Protocol: "torrent", DownloadClientID: &client.ID, Status: models.StateGrabbed}
 	if err := downloads.Create(ctx, old); err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +122,71 @@ func TestVariantRetryExistingTorrentNamedAdminRoute(t *testing.T) {
 	if queueRec.Code != http.StatusConflict || !strings.Contains(queueRec.Body.String(), "named admin") || !strings.Contains(queueRec.Body.String(), fmt.Sprintf("/book/%d/variants/%d/retry-import", own.ID, ownCopy[0].ID)) {
 		t.Fatalf("generic retry did not explain reviewed-torrent action: %d %s", queueRec.Code, queueRec.Body.String())
 	}
-	if rec := post(f.admin, own.ID, ownCopy[0].ID, old.ID, valid); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"status":"downloading"`) {
+	queueRow := func(user *db.User) map[string]any {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		queueHandler.List(rec, asUser(httptest.NewRequest(http.MethodGet, "/api/v1/queue", nil), user))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("queue projection = %d: %s", rec.Code, rec.Body.String())
+		}
+		var payload struct {
+			Items []map[string]any `json:"items"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range payload.Items {
+			if row["id"] == float64(old.ID) {
+				return row
+			}
+		}
+		t.Fatalf("own download missing from queue: %+v", payload.Items)
+		return nil
+	}
+	if got := queueRow(f.admin)["reviewedRetryEligible"]; got != true {
+		t.Fatalf("admin queue should project reviewed old-torrent eligibility, got %v", got)
+	}
+	if got := queueRow(f.requester)["reviewedRetryEligible"]; got != nil {
+		t.Fatalf("requester queue leaked admin retry eligibility: %v", got)
+	}
+	if _, err := f.database.ExecContext(ctx, `UPDATE downloads SET status='importFailed', import_retry_count=1 WHERE id=?`, old.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := queueRow(f.admin)["reviewedRetryEligible"]; got != nil {
+		t.Fatalf("retryable importFailed should not be offered as a terminal retry: %v", got)
+	}
+	if _, err := f.database.ExecContext(ctx, `UPDATE downloads SET import_retry_count=? WHERE id=?`, db.ImportRetryLimit, old.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := queueRow(f.admin)["reviewedRetryEligible"]; got != true {
+		t.Fatalf("exhausted importFailed should allow named retry: %v", got)
+	}
+	if _, err := f.database.ExecContext(ctx, `UPDATE downloads SET status='importBlocked' WHERE id=?`, old.ID); err != nil {
+		t.Fatal(err)
+	}
+	// A modal can be left open while the same download id is assigned a new
+	// torrent. The submitted identity must be checked inside the retry claim,
+	// not only by the browser's last queue poll.
+	if err := downloads.SetTorrentID(ctx, old.ID, "different-retained-torrent"); err != nil {
+		t.Fatal(err)
+	}
+	withHash := fmt.Sprintf(`{"downloadId":0,"reason":"qBittorrent Files list recovered","torrentId":%q}`, hash)
+	if rec := post(f.admin, own.ID, ownCopy[0].ID, old.ID, withHash); rec.Code != http.StatusConflict {
+		t.Fatalf("changed torrent hash = %d %s, want 409", rec.Code, rec.Body.String())
+	}
+	if copies, err := f.books.VariantRepo().ListByBook(ctx, own.ID); err != nil || len(copies) != 1 || copies[0].Status != models.VariantReview {
+		t.Fatalf("hash mismatch changed review: %+v %v", copies, err)
+	}
+	if row, err := downloads.GetByID(ctx, old.ID); err != nil || row == nil || row.Status != models.StateImportBlocked {
+		t.Fatalf("hash mismatch changed download: %+v %v", row, err)
+	}
+	if events, err := db.NewHistoryRepo(f.database).ListByBook(ctx, own.ID); err != nil || len(events) != 0 {
+		t.Fatalf("hash mismatch wrote audit: %+v %v", events, err)
+	}
+	if err := downloads.SetTorrentID(ctx, old.ID, hash); err != nil {
+		t.Fatal(err)
+	}
+	if rec := post(f.admin, own.ID, ownCopy[0].ID, old.ID, withHash); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"status":"downloading"`) {
 		t.Fatalf("named existing-torrent retry = %d %s", rec.Code, rec.Body.String())
 	}
 	row, err := downloads.GetByID(ctx, old.ID)

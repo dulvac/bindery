@@ -72,6 +72,8 @@ A `user` account grabs releases from the search results Bindery showed it. `POST
 
 With `BINDERY_ENFORCE_TENANCY` on, a grab's `bookId` must be a book the caller owns (otherwise 404, as for any other book route), and a release whose queue row belongs to another user answers 409 without describing that row. A grab claims another user's row only on the terms the scheduler's automatic grab uses: a failed row once it has been dead for six hours, or an imported row whose book was deleted. A claimed row is reset completely, owner and book included. Rows in `importBlocked` and live rows are never claimed this way.
 
+A `user` can see their Queue rows, but a failed download linked to a language copy does not offer generic Match or Retry. The Queue points them to an admin for a copy-specific decision. Only a named admin can retry a reviewed, retained torrent through **Retry this torrent**; the admin must give a reason. Requesters cannot see the Queue.
+
 ## Requester
 
 A requester asks for books; an admin decides. It is the role for people who share an instance but should not grab, delete or configure anything: family, friends, a book club.
