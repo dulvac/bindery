@@ -1675,17 +1675,17 @@ func CopyFileCtx(ctx context.Context, src, dst string) error {
 //     whose name is dst's basename plus a per-call random suffix. The caller
 //     can now perform any DB work that should be reversible without leaving
 //     a half-imported file in the library.
-//   - commit performs an os.Rename(staged, dst). On POSIX same-filesystem
-//     this is atomic; both sides of StagedImport require the staged path to
-//     be on the same filesystem as dst (which it is by construction since
-//     they share a directory).
+//   - commit atomically promotes the staged file: os.Rename for non-strict
+//     modes, or a no-replace hardlink for hardlink-strict. The stage and dst
+//     normally share a directory; a final link failure, including EXDEV,
+//     blocks strict promotion instead of falling back to a copy.
 //   - rollback removes the staged file and returns. It is safe to call
-//     after a successful commit (it becomes a no-op because the staged path
-//     no longer exists).
+//     after a successful commit (it becomes a no-op).
 //
 // Hardlink mode is supported: a hard link is created at the staging path,
-// then renamed onto dst. The inode count of the source ends up at 2 (source
-// + dst), matching the non-staged hardlink mode exactly.
+// then promoted onto dst. Strict mode refuses an existing destination and
+// removes its private staged link after promotion, leaving exactly two links
+// to the source inode (source + dst).
 //
 // Copy mode invokes the existing copyFileCtx, which (Wave 4 / finding 24)
 // surfaces NFS-deferred write errors via an explicit Close.
@@ -1749,6 +1749,21 @@ func StagedImport(ctx context.Context, mode, src, dst string) (stagedPath string
 
 	committed := false
 	commit = func() error {
+		if mode == "hardlink-strict" {
+			// os.Rename would replace an untracked library file or symlink.
+			// Link instead: EEXIST also protects a destination created after
+			// staging, without ever unlinking the shared public path.
+			if err := osLink(staged, dst); err != nil {
+				return fmt.Errorf("commit staged file: %w", linkError(staged, dst, err))
+			}
+			committed = true
+			if err := os.Remove(staged); err != nil {
+				// The public link is already placed and tracked. Do not report
+				// failure or unlink it just because private-stage cleanup failed.
+				slog.Warn("could not remove private staged hardlink after promotion", "staged", staged, "error", err)
+			}
+			return nil
+		}
 		if err := os.Rename(staged, dst); err != nil {
 			return fmt.Errorf("commit staged file: %w", err)
 		}
