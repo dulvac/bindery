@@ -747,8 +747,12 @@ function BookDetailPageInner() {
         return
       }
       const item = res.results[String(book.id)]
-      if (item && !item.ok) {
-        throw new Error(item.error || t('bookDetail.autoSearchFailed'))
+      if (!item || !item.ok) {
+        throw new Error(item?.error || t('bookDetail.autoSearchFailed'))
+      }
+      if (!item.queued || item.searchSkipped) {
+        setError(t('bookDetail.autoSearchSkipped'))
+        return
       }
       setAutoSearchNotice(t('bookDetail.autoSearchStarted'))
     } catch (e) {

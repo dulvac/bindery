@@ -67,6 +67,31 @@ func (r *BookVariantRepo) ListByBook(ctx context.Context, bookID int64) ([]model
 		WHERE book_id = ? ORDER BY media_type, language, id`, bookID)
 }
 
+// ListByBookIDs reads variants for a bulk search in bounded batches. Missing
+// map entries mean legacy books with no variants; an unreadable batch is an
+// error, never a reason to fall back to legacy file-path eligibility.
+func (r *BookVariantRepo) ListByBookIDs(ctx context.Context, bookIDs []int64) (map[int64][]models.BookVariant, error) {
+	byBook := make(map[int64][]models.BookVariant)
+	const batchSize = 900 // remain below SQLite's older 999-parameter limit
+	for start := 0; start < len(bookIDs); start += batchSize {
+		batch := bookIDs[start:min(start+batchSize, len(bookIDs))]
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			args[i] = id
+		}
+		variants, err := r.list(ctx, `SELECT id, book_id, media_type, language, status FROM book_variants
+			WHERE book_id IN (`+strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")+`)
+			ORDER BY book_id, media_type, language, id`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for _, variant := range variants {
+			byBook[variant.BookID] = append(byBook[variant.BookID], variant)
+		}
+	}
+	return byBook, nil
+}
+
 func (r *BookVariantRepo) ListWanted(ctx context.Context) ([]models.BookVariant, error) {
 	return r.list(ctx, `SELECT id, book_id, media_type, language, status FROM book_variants
 		WHERE status = 'wanted' ORDER BY book_id, media_type, language, id`)

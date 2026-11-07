@@ -239,7 +239,7 @@ beforeEach(() => {
   vi.mocked(api.getBook).mockResolvedValue(makeBook())
   vi.mocked(api.listHistory).mockResolvedValue({ items: [], total: 0, limit: 100, offset: 0 })
   vi.mocked(api.searchBook).mockResolvedValue({ results: [], debug: null })
-  vi.mocked(api.searchBookAutomatic).mockResolvedValue({ results: { '42': { ok: true } } })
+  vi.mocked(api.searchBookAutomatic).mockResolvedValue({ results: { '42': { ok: true, queued: true } } })
   vi.mocked(api.listIndexers).mockResolvedValue([])
   vi.mocked(api.grab).mockResolvedValue(makeDownload())
   vi.mocked(api.addBook).mockImplementation(async body => makeBook({
@@ -2507,6 +2507,19 @@ describe('BookDetailPage automatic search (#2668)', () => {
     await waitFor(() => expect(api.searchBookAutomatic).toHaveBeenCalledWith(42))
     expect(api.searchBook).not.toHaveBeenCalled()
     expect(await screen.findByText(translate('bookDetail.autoSearchStarted'))).toBeInTheDocument()
+  })
+
+  it.each([false, true])('says nothing started for a searchSkipped result even when queued is %s', async queued => {
+    vi.mocked(api.searchBookAutomatic).mockResolvedValue({
+      results: { '42': { ok: true, queued, searchSkipped: 'no_format_needed' } },
+    })
+
+    renderBookDetailPage()
+    await screen.findByRole('heading', { name: 'The Final Empire' })
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(autoLabel) }))
+
+    expect(await screen.findByText(translate('bookDetail.autoSearchSkipped'))).toBeInTheDocument()
+    expect(screen.queryByText(translate('bookDetail.autoSearchStarted'))).toBeNull()
   })
 
   it('says nothing was searched when automatic grabbing is off', async () => {

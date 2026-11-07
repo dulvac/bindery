@@ -181,8 +181,8 @@ type bulkItemResult struct {
 	// already the whole story.
 	Code string `json:"code,omitempty"`
 	// Queued is true when this ID handed at least one book to the search
-	// pool AND that search will run: a searcher is wired, automatic grabbing
-	// is on, and the book still needs a format. The pool runs after the
+	// pool: a searcher is wired, automatic grabbing is on, and the book
+	// has an active wanted variant or a missing legacy format. The pool runs after the
 	// response is written, so ok:true on a search only ever meant
 	// "accepted"; queued says a search is on its way. The outcome of each
 	// search is in the "book search finished" log line, in History when
@@ -201,11 +201,11 @@ type bulkItemResult struct {
 // Reasons a bulk action that searches did not queue a search for an ID
 // (bulkItemResult.SearchSkipped).
 const (
-	// searchSkipNoFormatNeeded: every format the book wants is on disk, so
-	// SearchAndGrabBook would return before asking any indexer.
+	// searchSkipNoFormatNeeded: no active wanted variant, or every legacy
+	// format the book wants is on disk. No indexer search would run.
 	searchSkipNoFormatNeeded = "no_format_needed"
-	// searchSkipNothingWanted: an author search found no monitored wanted
-	// book that still needs a format.
+	// searchSkipNothingWanted: no monitored, non-excluded wanted book or
+	// variant remains eligible for this search.
 	searchSkipNothingWanted = "nothing_wanted"
 	// searchSkipAutoGrabDisabled: a monitor that made a book searchable while
 	// automatic grabbing is off. The monitor itself succeeded, so this is a
@@ -215,20 +215,55 @@ const (
 	searchSkipNoSearcher = "no_searcher"
 )
 
-// bookSearchSkip reports why a search of book would not run, or "" when it
-// will. It mirrors what scheduler.SearchAndGrabBook checks before asking an
-// indexer: a needed format (neededFormats) and the auto grab switch.
-// autoGrabOn is passed in because it is read once per request.
-func (h *BulkHandler) bookSearchSkip(book *models.Book, autoGrabOn bool) string {
+// bookSearchSkip mirrors the scheduler's formatsForSearch: variant books use
+// active wanted copies, not the book-level compatibility file paths. A legacy
+// book with no variants retains its existing needed-format check.
+func (h *BulkHandler) bookSearchSkip(book *models.Book, variants []models.BookVariant, autoGrabOn bool) string {
 	switch {
 	case h.searcher == nil:
 		return searchSkipNoSearcher
 	case !autoGrabOn:
 		return searchSkipAutoGrabDisabled
+	case len(variants) > 0:
+		if !book.Monitored || book.Excluded || book.Status == models.BookStatusSkipped {
+			return searchSkipNothingWanted
+		}
+		if !hasActiveWantedVariant(book, variants) {
+			return searchSkipNoFormatNeeded
+		}
+		return ""
 	case !book.NeedsEbook() && !book.NeedsAudiobook():
 		return searchSkipNoFormatNeeded
 	}
 	return ""
+}
+
+func hasActiveWantedVariant(book *models.Book, variants []models.BookVariant) bool {
+	for _, v := range variants {
+		if v.Status == models.VariantWanted &&
+			(v.MediaType == models.MediaTypeEbook && book.WantsEbook() ||
+				v.MediaType == models.MediaTypeAudiobook && book.WantsAudiobook()) {
+			return true
+		}
+	}
+	return false
+}
+
+// A repeated ID still has one result entry and must only enter the search
+// pool once. Non-search actions retain their original per-ID behavior.
+func dedupeSearchIDs(ids []int64, action string) []int64 {
+	if action != "search" {
+		return ids
+	}
+	seen := make(map[int64]bool, len(ids))
+	unique := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if !seen[id] {
+			seen[id] = true
+			unique = append(unique, id)
+		}
+	}
+	return unique
 }
 
 // bulkResponse is the envelope returned by all three bulk endpoints.
@@ -290,6 +325,7 @@ func (h *BulkHandler) AuthorsBulk(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown action: " + req.Action})
 		return
 	}
+	req.IDs = dedupeSearchIDs(req.IDs, req.Action)
 	if req.Action == "refresh" && h.refreshAuthor == nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "refresh action not available"})
 		return
@@ -339,6 +375,7 @@ func (h *BulkHandler) AuthorsBulk(w http.ResponseWriter, r *http.Request) {
 	// authors with 50 books each) at bulkSearchConcurrency in-flight searches
 	// rather than the prior unbounded `go ... per book`.
 	var searchTargets []models.Book
+	searchBooksByAuthor := make(map[int64][]models.Book)
 
 	// For the "refresh" action we load each author while the request context
 	// is alive, then dispatch the metadata fetch under the same bounded pool
@@ -407,24 +444,23 @@ func (h *BulkHandler) AuthorsBulk(w http.ResponseWriter, r *http.Request) {
 				searchesRefused++
 				continue
 			}
-			books, err := h.books.ListByAuthor(r.Context(), id)
+			books, err := h.books.ListByAuthorAndUser(r.Context(), id, auth.ListScopeUserID(r.Context()))
 			if err != nil {
 				resp.Results[key] = bulkItemResult{Error: err.Error()}
 				continue
 			}
-			// searchRefused already returned above, so the switch is on.
-			for i := range books {
-				b := books[i]
-				if b.Status == models.BookStatusWanted && b.Monitored && h.bookSearchSkip(&b, true) == "" {
-					searchTargets = append(searchTargets, b)
-					queued = true
+			// Only owned, non-excluded, monitored books. Keep them regardless
+			// of book-level status: a wanted language may remain
+			// after a same-format import marked the book imported. Evaluate
+			// them after one batched variant read across all authors.
+			for _, b := range books {
+				if b.Monitored {
+					searchBooksByAuthor[id] = append(searchBooksByAuthor[id], b)
 				}
 			}
-			if !queued {
-				skipped = searchSkipNothingWanted
-				if h.searcher == nil {
-					skipped = searchSkipNoSearcher
-				}
+			skipped = searchSkipNothingWanted
+			if h.searcher == nil {
+				skipped = searchSkipNoSearcher
 			}
 		case "refresh":
 			// Load the author now (request context alive); collect for the
@@ -453,6 +489,37 @@ func (h *BulkHandler) AuthorsBulk(w http.ResponseWriter, r *http.Request) {
 		resp.Results[key] = bulkItemResult{OK: true, Queued: queued, SearchSkipped: skipped}
 	}
 
+	if len(searchBooksByAuthor) > 0 {
+		var ids []int64
+		for _, books := range searchBooksByAuthor {
+			for _, book := range books {
+				ids = append(ids, book.ID)
+			}
+		}
+		variantsByBook, err := h.books.VariantRepo().ListByBookIDs(r.Context(), ids)
+		for authorID, books := range searchBooksByAuthor {
+			key := fmt.Sprintf("%d", authorID)
+			if err != nil {
+				resp.Results[key] = bulkItemResult{Error: err.Error()}
+				continue
+			}
+			result := resp.Results[key]
+			for _, book := range books {
+				// Legacy author bulk only searched wanted-status books. An
+				// imported book becomes eligible here only through a wanted
+				// language variant, not through an inconsistent legacy row.
+				if len(variantsByBook[book.ID]) == 0 && book.Status != models.BookStatusWanted {
+					continue
+				}
+				if h.bookSearchSkip(&book, variantsByBook[book.ID], true) == "" {
+					searchTargets = append(searchTargets, book)
+					result.Queued = true
+					result.SearchSkipped = ""
+				}
+			}
+			resp.Results[key] = result
+		}
+	}
 	if len(searchTargets) > 0 && h.searcher != nil {
 		h.fanOutSearches(searchTargets)
 	}
@@ -545,6 +612,7 @@ func (h *BulkHandler) BooksBulk(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown action: " + req.Action})
 		return
 	}
+	req.IDs = dedupeSearchIDs(req.IDs, req.Action)
 	// 'both' is accepted here for the same reason AuthorsBulk accepts it: a book
 	// owned in both formats is a first-class media type, and rejecting it left
 	// the Books bulk bar able to set either format but never the pair, so a
@@ -561,6 +629,7 @@ func (h *BulkHandler) BooksBulk(w http.ResponseWriter, r *http.Request) {
 	resp := bulkResponse{Results: make(map[string]bulkItemResult, len(req.IDs))}
 
 	var searchTargets []models.Book
+	var searchCandidates []models.Book
 
 	// Same refusal as the author and wanted bulk paths: the multi-select
 	// Search on the author page posts here (#2669).
@@ -582,9 +651,13 @@ func (h *BulkHandler) BooksBulk(w http.ResponseWriter, r *http.Request) {
 			var becameSearchable bool
 			book, becameSearchable, opErr = h.setBookMonitored(r.Context(), id, true)
 			if opErr == nil && becameSearchable && book != nil {
-				if skipped = h.bookSearchSkip(book, autoGrabEnabled(r.Context(), h.settings)); skipped == "" {
-					searchTargets = append(searchTargets, *book)
-					queued = true
+				var variants []models.BookVariant
+				variants, opErr = h.books.VariantRepo().ListByBook(r.Context(), book.ID)
+				if opErr == nil {
+					if skipped = h.bookSearchSkip(book, variants, autoGrabEnabled(r.Context(), h.settings)); skipped == "" {
+						searchTargets = append(searchTargets, *book)
+						queued = true
+					}
 				}
 			}
 		case "unmonitor":
@@ -602,11 +675,10 @@ func (h *BulkHandler) BooksBulk(w http.ResponseWriter, r *http.Request) {
 				searchesRefused++
 				continue
 			}
-			// searchRefused already returned above, so the switch is on.
-			if skipped = h.bookSearchSkip(book, true); skipped == "" {
-				searchTargets = append(searchTargets, *book)
-				queued = true
-			}
+			// Resolve eligibility after one batched variant read for the
+			// selected books, rather than one query per ID.
+			searchCandidates = append(searchCandidates, *book)
+			continue
 		case "set_media_type":
 			opErr = h.setBookMediaType(r.Context(), id, req.MediaType)
 		case "exclude":
@@ -629,6 +701,25 @@ func (h *BulkHandler) BooksBulk(w http.ResponseWriter, r *http.Request) {
 		resp.Results[key] = bulkItemResult{OK: true, Queued: queued, SearchSkipped: skipped}
 	}
 
+	if len(searchCandidates) > 0 {
+		ids := make([]int64, 0, len(searchCandidates))
+		for _, book := range searchCandidates {
+			ids = append(ids, book.ID)
+		}
+		variantsByBook, err := h.books.VariantRepo().ListByBookIDs(r.Context(), ids)
+		for _, book := range searchCandidates {
+			key := fmt.Sprintf("%d", book.ID)
+			if err != nil {
+				resp.Results[key] = bulkItemResult{Error: err.Error()}
+				continue
+			}
+			skipped := h.bookSearchSkip(&book, variantsByBook[book.ID], true)
+			resp.Results[key] = bulkItemResult{OK: true, Queued: skipped == "", SearchSkipped: skipped}
+			if skipped == "" {
+				searchTargets = append(searchTargets, book)
+			}
+		}
+	}
 	if len(searchTargets) > 0 && h.searcher != nil {
 		h.fanOutSearches(searchTargets)
 	}
@@ -662,6 +753,7 @@ func (h *BulkHandler) WantedBulk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	req.IDs = dedupeSearchIDs(req.IDs, req.Action)
 	resp := bulkResponse{Results: make(map[string]bulkItemResult, len(req.IDs))}
 
 	var searchTargets []models.Book
@@ -672,6 +764,8 @@ func (h *BulkHandler) WantedBulk(w http.ResponseWriter, r *http.Request) {
 	// 500-id bulk search was ~500 of those. A nil map (query error) makes every
 	// lookup miss, which yields the same not-owned result the per-id path did.
 	var booksByID map[int64]*models.Book
+	var variantsByBook map[int64][]models.BookVariant
+	var variantsErr error
 	searchRefused := false
 	searchesRefused := 0
 	defer func() { logSearchRefusal("wanted bulk search", searchesRefused) }()
@@ -680,6 +774,15 @@ func (h *BulkHandler) WantedBulk(w http.ResponseWriter, r *http.Request) {
 		// Refuse rather than accept work that the auto grab switch will
 		// throw away in a goroutine the user never sees (#2669).
 		searchRefused = refuseSearchWhenAutoGrabDisabled(r.Context(), h.settings)
+		if !searchRefused {
+			var ownedIDs []int64
+			for _, id := range req.IDs {
+				if book := booksByID[id]; book != nil && auth.CheckOwnership(r.Context(), book.OwnerUserID) {
+					ownedIDs = append(ownedIDs, id)
+				}
+			}
+			variantsByBook, variantsErr = h.books.VariantRepo().ListByBookIDs(r.Context(), ownedIDs)
+		}
 	}
 
 	for _, id := range req.IDs {
@@ -699,8 +802,12 @@ func (h *BulkHandler) WantedBulk(w http.ResponseWriter, r *http.Request) {
 				searchesRefused++
 				continue
 			}
+			if variantsErr != nil {
+				resp.Results[key] = bulkItemResult{Error: variantsErr.Error()}
+				continue
+			}
 			// searchRefused already returned above, so the switch is on.
-			if skipped = h.bookSearchSkip(book, true); skipped == "" {
+			if skipped = h.bookSearchSkip(book, variantsByBook[id], true); skipped == "" {
 				searchTargets = append(searchTargets, *book)
 				queued = true
 			}
@@ -827,10 +934,20 @@ func (h *BulkHandler) setBookMonitored(ctx context.Context, id int64, monitored 
 	}
 	prevStatus, prevMonitored := book.Status, book.Monitored
 	book.Monitored = monitored
+	becameSearchable := book.BecameSearchable(prevStatus, prevMonitored)
+	// Imported books can still hold a wanted language. A new monitor makes
+	// that copy eligible even though book-level status stays imported.
+	if monitored && !prevMonitored && !becameSearchable && book.Status != models.BookStatusSkipped {
+		variants, err := h.books.VariantRepo().ListByBook(ctx, book.ID)
+		if err != nil {
+			return nil, false, err
+		}
+		becameSearchable = hasActiveWantedVariant(book, variants)
+	}
 	if err := h.books.Update(ctx, book); err != nil {
 		return nil, false, err
 	}
-	return book, book.BecameSearchable(prevStatus, prevMonitored), nil
+	return book, becameSearchable, nil
 }
 
 // setBookExcluded flags a book as excluded so it is hidden from author/book
