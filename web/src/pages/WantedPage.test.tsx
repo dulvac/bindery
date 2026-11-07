@@ -83,6 +83,9 @@ vi.mock('react-i18next', () => ({
         'variants.select': 'Select a wanted copy',
         'variants.unverified': 'Unverified language',
         'variants.stale': 'This copy is no longer wanted. Refresh and search again.',
+        'bookStatus.wanted': 'Wanted',
+        'common.ebook': 'Ebook',
+        'bookLanguages.romanian': 'Romanian',
       }
       return labels[key] ?? key
     },
@@ -438,6 +441,23 @@ describe('WantedPage', () => {
     expect(manualImport).toHaveAttribute('href', '/import?view=folder')
     const scanLibrary = screen.getByRole('link', { name: 'Scan Library' })
     expect(scanLibrary).toHaveAttribute('href', '/import')
+  })
+
+  it('labels the missing Romanian ebook on an imported book before opening detail', async () => {
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([makeBook({
+      id: 1, title: 'Dune', status: 'imported', ebookFilePath: '/library/Dune-eng.epub',
+      variants: [
+        { id: 41, mediaType: 'ebook', language: 'eng', status: 'imported', verification: 'verified' },
+        { id: 42, mediaType: 'ebook', language: 'rum', status: 'wanted', verification: '' },
+      ],
+    })]))
+
+    renderWantedPage()
+
+    expect(await screen.findByRole('link', { name: 'Dune' })).toBeInTheDocument()
+    expect(screen.getByText('Ebook · Romanian · Wanted')).toBeInTheDocument()
+    expect(screen.queryByText('Ebook · English · Wanted')).not.toBeInTheDocument()
+    expect(api.getBook).not.toHaveBeenCalled()
   })
 
   it('renders a row with the book title and its author', async () => {

@@ -228,9 +228,9 @@ type BookListFilter struct {
 	// Search is a case-insensitive substring match on the book title OR its
 	// author's name. Empty disables the filter.
 	Search string
-	// Status restricts to books with that status. As a special case, "wanted"
-	// additionally requires monitored = 1 (an unmonitored book is not wanted),
-	// matching the old client-side filter. "imported" (In Library) also matches a
+	// Status restricts to books with that status. "wanted" includes monitored
+	// books with a wanted variant, or legacy wanted books without variants.
+	// "imported" (In Library) also matches a
 	// wanted book that has at least one tracked file, so a partially owned dual
 	// format book shows under both (#3132). Empty disables the filter.
 	Status string
@@ -326,6 +326,24 @@ func bookSortOrder(sort string) string {
 	}
 }
 
+// wantedMissingPredicate matches real missing copies, or a legacy wanted book
+// that has no variants yet. EXISTS keeps each book in the count and page once
+// even if several languages are wanted. When a format chip is active, only
+// missing copies of that format qualify (the book media_type check still runs
+// separately). The format value is never interpolated from caller input.
+func wantedMissingPredicate(mediaType string) string {
+	variant := "EXISTS (SELECT 1 FROM book_variants v WHERE v.book_id = books.id AND v.status = 'wanted'"
+	switch mediaType {
+	case models.MediaTypeEbook:
+		variant += " AND v.media_type = 'ebook'"
+	case models.MediaTypeAudiobook:
+		variant += " AND v.media_type = 'audiobook'"
+	}
+	variant += ")"
+	return "books.monitored = 1 AND (" + variant +
+		" OR (books.status = 'wanted' AND NOT EXISTS (SELECT 1 FROM book_variants v WHERE v.book_id = books.id)))"
+}
+
 // ListPageFiltered returns one page of non-excluded books matching f, ordered
 // per f.Sort, alongside the total row count for the same filter (count ignores
 // limit/offset so the UI can paginate). limit must be positive; offset clamped
@@ -385,8 +403,7 @@ func (r *BookRepo) ListPageFiltered(ctx context.Context, f BookListFilter, limit
 		// In Library does not list a book that only has an ebook.
 		where += " AND " + InLibraryPredicate("books", f.MediaType)
 	case models.BookStatusWanted:
-		where += " AND books.status = ? AND books.monitored = 1"
-		args = append(args, f.Status)
+		where += " AND " + wantedMissingPredicate(f.MediaType)
 	default:
 		where += " AND books.status = ?"
 		args = append(args, f.Status)
@@ -513,8 +530,14 @@ func (r *BookRepo) ListByStatus(ctx context.Context, status string) ([]models.Bo
 }
 
 func (r *BookRepo) ListByStatusAndUser(ctx context.Context, status string, userID int64) ([]models.Book, error) {
-	where, args := QueryScopeForIncludingNull("books.owner_user_id", "WHERE status = ? AND books.monitored = 1 AND excluded = 0", userID, status)
-	return r.query(ctx, bookCTE+" SELECT "+bookColumns+" FROM books "+bookJoins+" "+where+" ORDER BY books.sort_key, sort_title", args)
+	base := "WHERE books.status = ? AND books.monitored = 1 AND excluded = 0"
+	args := []any{status}
+	if status == models.BookStatusWanted {
+		base = "WHERE " + wantedMissingPredicate("") + " AND excluded = 0"
+		args = nil
+	}
+	where, scopedArgs := QueryScopeForIncludingNull("books.owner_user_id", base, userID, args...)
+	return r.query(ctx, bookCTE+" SELECT "+bookColumns+" FROM books "+bookJoins+" "+where+" ORDER BY books.sort_key, sort_title", scopedArgs)
 }
 
 // ListByStatusIncludingExcluded returns books with the given status regardless of excluded flag.
@@ -527,8 +550,14 @@ func (r *BookRepo) ListByStatusIncludingExcluded(ctx context.Context, status str
 // single-tenant deployments). The excluded-aware counterpart to
 // ListByStatusAndUser.
 func (r *BookRepo) ListByStatusIncludingExcludedAndUser(ctx context.Context, status string, userID int64) ([]models.Book, error) {
-	where, args := QueryScopeForIncludingNull("books.owner_user_id", "WHERE status = ? AND books.monitored = 1", userID, status)
-	return r.query(ctx, bookCTE+" SELECT "+bookColumns+" FROM books "+bookJoins+" "+where+" ORDER BY books.sort_key, sort_title", args)
+	base := "WHERE books.status = ? AND books.monitored = 1"
+	args := []any{status}
+	if status == models.BookStatusWanted {
+		base = "WHERE " + wantedMissingPredicate("")
+		args = nil
+	}
+	where, scopedArgs := QueryScopeForIncludingNull("books.owner_user_id", base, userID, args...)
+	return r.query(ctx, bookCTE+" SELECT "+bookColumns+" FROM books "+bookJoins+" "+where+" ORDER BY books.sort_key, sort_title", scopedArgs)
 }
 
 func (r *BookRepo) GetByID(ctx context.Context, id int64) (*models.Book, error) {

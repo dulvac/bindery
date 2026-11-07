@@ -1187,6 +1187,45 @@ func sweepMatchesFormat(name, format string) bool {
 	}
 }
 
+// wantedBookResponse adds only the real, owner-checked variant status/ID to
+// the existing book shape. The variant projection adds no file paths or a
+// pending request's synthetic negative variant IDs.
+type wantedBookResponse struct {
+	models.Book
+	Variants []variantResponse `json:"variants"`
+}
+
+type wantedListResponse struct {
+	Items  []wantedBookResponse `json:"items"`
+	Total  int                  `json:"total"`
+	Limit  int                  `json:"limit"`
+	Offset int                  `json:"offset"`
+}
+
+// projectWantedBooks checks current ownership after selecting the page, so a
+// reassignment between list and projection cannot disclose another owner's
+// variant states. Chunk the bare-array path to bound SQLite placeholders.
+func (h *BookHandler) projectWantedBooks(ctx context.Context, books []models.Book, scope int64) ([]wantedBookResponse, error) {
+	out := make([]wantedBookResponse, 0, len(books))
+	const batchSize = 250
+	for start := 0; start < len(books); start += batchSize {
+		end := min(start+batchSize, len(books))
+		accesses := make([]db.BookStatusAccess, 0, end-start)
+		for _, book := range books[start:end] {
+			accesses = append(accesses, db.BookStatusAccess{BookID: book.ID, OwnerUserID: scope})
+		}
+		projections, err := h.books.VariantRepo().ListStatusByBooks(ctx, accesses)
+		if err != nil {
+			return nil, err
+		}
+		for _, book := range books[start:end] {
+			access := db.BookStatusAccess{BookID: book.ID, OwnerUserID: scope}
+			out = append(out, wantedBookResponse{Book: book, Variants: variantResponses(projections[access].Variants)})
+		}
+	}
+	return out, nil
+}
+
 // ListWanted answers GET /wanted/missing.
 //
 // With no `limit` it returns the bare array of every wanted book, the shape
@@ -1234,7 +1273,12 @@ func (h *BookHandler) ListWanted(w http.ResponseWriter, r *http.Request) {
 		proxyBookImages(&books[i])
 	}
 	h.markUnmonitoredAuthors(r.Context(), books)
-	writeJSON(w, http.StatusOK, books)
+	rows, err := h.projectWantedBooks(r.Context(), books, scope)
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rows)
 }
 
 // listWantedPage is the paged form of ListWanted.
@@ -1264,7 +1308,12 @@ func (h *BookHandler) listWantedPage(w http.ResponseWriter, r *http.Request, sco
 		proxyBookImages(&books[i])
 	}
 	h.markUnmonitoredAuthors(r.Context(), books)
-	writeJSON(w, http.StatusOK, bookListResponse{Items: books, Total: total, Limit: limit, Offset: offset})
+	rows, err := h.projectWantedBooks(r.Context(), books, scope)
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, wantedListResponse{Items: rows, Total: total, Limit: limit, Offset: offset})
 }
 
 // markUnmonitoredAuthors flags the rows whose author is not monitored, so the

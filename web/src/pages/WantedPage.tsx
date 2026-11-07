@@ -5,7 +5,7 @@ import { api, Book, SearchResult } from '../api/client'
 import type { BookVariantStatus } from '../api/client'
 import { useIsAdmin } from '../auth/AuthContext'
 import ChooseBookVariant from '../components/ChooseBookVariant'
-import { matchesVariantFormat, wantedCopies, wrongLanguage } from '../util/bookVariant'
+import { matchesVariantFormat, variantLabel, wantedCopies, wrongLanguage } from '../util/bookVariant'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { grabWithForceConfirm } from '../util/forceGrab'
 import BulkActionBar from '../components/BulkActionBar'
@@ -479,6 +479,7 @@ export default function WantedPage() {
           {pageItems.map((book, i) => {
             const isSelected = selectedIds.has(book.id)
             const rowVariants = detailBook?.id === book.id ? wantedCopies(detailBook) : []
+            const missingCopies = wantedCopies(book)
             const year = book.releaseDate ? new Date(book.releaseDate).getFullYear() : null
             const authorName = book.author?.authorName
             return (
@@ -548,7 +549,11 @@ export default function WantedPage() {
                         <option value="audiobook">{t('books.mediaAudiobook')}</option>
                         <option value="both">{t('books.mediaBoth')}</option>
                       </select>
-                      {book.mediaType === 'both' && (
+                      {missingCopies.length > 0 ? (
+                        <div className="mt-0.5 text-[10px] text-fg-muted">
+                          {missingCopies.map(v => <div key={v.id} className="truncate">{variantLabel(v, t)} · {t('bookStatus.wanted', 'Wanted')}</div>)}
+                        </div>
+                      ) : book.mediaType === 'both' && (
                         <div className="mt-0.5 text-[10px] text-fg-muted truncate">
                           {book.ebookFilePath ? t('wanted.ebookDone') : t('wanted.ebookNeeded')}
                           {' · '}
