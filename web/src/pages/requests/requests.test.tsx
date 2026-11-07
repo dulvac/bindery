@@ -34,6 +34,7 @@ vi.mock('react-i18next', () => {
     'requests.confirm.format': 'Format',
     'requests.confirm.formatLabel': 'Format to request',
     'requests.confirm.anyFormat': 'Any format',
+    'requests.anyFormat': 'Any format',
     'requests.confirm.sending': 'Sending…',
     'bookLanguages.english': 'English',
     'bookLanguages.french': 'French',
@@ -429,9 +430,10 @@ describe('RequestsPage', () => {
     const row = async (title: string) => (await screen.findByText(title)).closest('li') as HTMLElement
 
     const mergedRow = await row('Merged')
+    const queueStatus = within(mergedRow).getByTestId('book-variant-statuses')
     expect(within(mergedRow).getAllByText('English')).toHaveLength(2)
     expect(within(mergedRow).getAllByText('Romanian')).toHaveLength(2)
-    expect(within(within(mergedRow).getByTestId('book-variant-statuses')).getAllByRole('listitem')).toHaveLength(4)
+    expect(within(queueStatus).getAllByRole('listitem')).toHaveLength(4)
 
     const romanianRow = await row('Romanian only')
     expect(within(romanianRow).queryByText('English')).not.toBeInTheDocument()
@@ -446,16 +448,32 @@ describe('RequestsPage', () => {
 
     fireEvent.click(within(mergedRow).getByRole('button', { name: 'Approve request for Merged' }))
     const form = screen.getByRole('form', { name: 'Approve Merged' })
+    const initialStatus = within(form).getByTestId('book-variant-statuses')
+    expect(within(initialStatus).getAllByRole('listitem')).toHaveLength(4)
+    expect(within(initialStatus).getAllByText('Ebook')).toHaveLength(2)
+    expect(within(initialStatus).getAllByText('Audiobook')).toHaveLength(2)
     expect(within(form).getAllByText('English')).toHaveLength(2)
     expect(within(form).getAllByText('Romanian')).toHaveLength(2)
-    expect(within(within(form).getByTestId('book-variant-statuses')).getAllByRole('listitem')).toHaveLength(4)
     expect(api.approveRequest).not.toHaveBeenCalled()
 
     fireEvent.change(within(form).getByRole('combobox', { name: 'Format' }), { target: { value: 'ebook' } })
     expect(within(form).getByRole('combobox', { name: 'Format' })).toHaveValue('ebook')
-    expect(within(within(form).getByTestId('book-variant-statuses')).getAllByRole('listitem')).toHaveLength(2)
+    const ebookStatus = within(form).getByTestId('book-variant-statuses')
+    expect(within(ebookStatus).getAllByRole('listitem')).toHaveLength(2)
+    expect(within(ebookStatus).getAllByText('Ebook')).toHaveLength(2)
+    expect(within(ebookStatus).queryByText('Audiobook')).not.toBeInTheDocument()
     expect(within(form).getByText('English')).toBeInTheDocument()
     expect(within(form).getByText('Romanian')).toBeInTheDocument()
+
+    fireEvent.change(within(form).getByRole('combobox', { name: 'Format' }), { target: { value: '' } })
+    expect(within(form).getByRole('combobox', { name: 'Format' })).toHaveValue('')
+    expect(within(form).queryByTestId('book-variant-statuses')).not.toBeInTheDocument()
+    const anyPreview = within(form).getByTestId('pending-request-any-format-preview')
+    expect(anyPreview).toHaveTextContent('Any format')
+    expect(anyPreview).toHaveTextContent('English')
+    expect(anyPreview).toHaveTextContent('Romanian')
+    expect(within(queueStatus).getAllByText('English')).toHaveLength(2)
+    expect(within(queueStatus).getAllByText('Romanian')).toHaveLength(2)
     expect(api.approveRequest).not.toHaveBeenCalled()
   })
 

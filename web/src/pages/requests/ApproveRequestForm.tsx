@@ -5,7 +5,8 @@ import type { ApproveRequestChoices, LibraryRequest } from '../../api/client'
 import { AuthorAddDefaults, loadAuthorAddDefaults } from '../../components/authorAddDefaults'
 import BookVariantStatus from '../../components/BookVariantStatus'
 import { primaryFill } from '../../components/buttons'
-import { pendingRequestVariants } from './requestLabels'
+import { languageName } from '../../util/language'
+import { pendingRequestLanguages, pendingRequestVariants } from './requestLabels'
 
 interface Props {
   request: LibraryRequest
@@ -25,7 +26,7 @@ export default function ApproveRequestForm({ request, onApproved, onCancel }: Pr
   const [profileId, setProfileId] = useState<number | null>(null)
   const [rootFolderId, setRootFolderId] = useState<number | null>(null)
   const [monitorMode, setMonitorMode] = useState('all')
-  const [mediaType, setMediaType] = useState(request.mediaType)
+  const [mediaTypeOverride, setMediaTypeOverride] = useState<string | undefined>(undefined)
   const [searchOnAdd, setSearchOnAdd] = useState(!isAuthor)
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -38,7 +39,7 @@ export default function ApproveRequestForm({ request, onApproved, onCancel }: Pr
       setProfileId(d.profiles.length > 0 ? d.profiles[0].id : null)
       setRootFolderId(d.rootFolderId)
       setMonitorMode(d.monitorMode)
-      if (!request.mediaType && isAuthor) setMediaType(d.mediaType)
+      if (!request.mediaType && isAuthor) setMediaTypeOverride(d.mediaType)
     })
     return () => { cancelled = true }
   }, [isAuthor, request.mediaType])
@@ -46,7 +47,7 @@ export default function ApproveRequestForm({ request, onApproved, onCancel }: Pr
   const submit = async () => {
     setSending(true)
     setError(null)
-    const choices: ApproveRequestChoices = { searchOnAdd, mediaType }
+    const choices: ApproveRequestChoices = { searchOnAdd, mediaType: effectiveMediaType }
     if (isAuthor) {
       choices.metadataProfileId = profileId
       choices.rootFolderId = rootFolderId
@@ -63,6 +64,17 @@ export default function ApproveRequestForm({ request, onApproved, onCancel }: Pr
 
   const selectClass = 'w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded-md px-2 py-1.5 text-sm'
   const fieldId = (name: string) => `approve-${request.id}-${name}`
+  const effectiveMediaType = mediaTypeOverride === undefined ? request.mediaType : mediaTypeOverride
+  const anyFormatSelected = mediaTypeOverride === ''
+
+  const previewLanguageLabel = (language: string) => {
+    const code = (language || '').trim().toLowerCase()
+    if (!code) return t('bookDetail.languageUnknown')
+    if (code === 'eng') return t('bookLanguages.english')
+    if (code === 'fre') return t('bookLanguages.french')
+    if (code === 'rum') return t('bookLanguages.romanian')
+    return languageName(code) ?? code
+  }
 
   return (
     <form
@@ -99,7 +111,7 @@ export default function ApproveRequestForm({ request, onApproved, onCancel }: Pr
         )}
         <div>
           <label htmlFor={fieldId('format')} className="block text-xs text-fg-muted mb-1">{t('requests.admin.format')}</label>
-          <select id={fieldId('format')} value={mediaType} onChange={e => setMediaType(e.target.value)} className={selectClass}>
+          <select id={fieldId('format')} value={effectiveMediaType} onChange={e => setMediaTypeOverride(e.target.value)} className={selectClass}>
             <option value="">{t('requests.anyFormat')}</option>
             <option value="ebook">{t('common.ebook')}</option>
             <option value="audiobook">{t('common.audiobook')}</option>
@@ -108,7 +120,15 @@ export default function ApproveRequestForm({ request, onApproved, onCancel }: Pr
         </div>
       </div>
       {!isAuthor && (
-        <BookVariantStatus variants={pendingRequestVariants(request, mediaType)} />
+        anyFormatSelected
+          ? (
+            <p data-testid="pending-request-any-format-preview" className="text-xs text-fg-muted">
+              {t('requests.anyFormat')}
+              {' · '}
+              {pendingRequestLanguages(request).map(previewLanguageLabel).join(', ')}
+            </p>
+          )
+          : <BookVariantStatus variants={pendingRequestVariants(request, mediaTypeOverride)} />
       )}
       <label className="flex items-center gap-2 text-sm">
         <input type="checkbox" checked={searchOnAdd} onChange={e => setSearchOnAdd(e.target.checked)} />
