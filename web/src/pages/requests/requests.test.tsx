@@ -15,6 +15,7 @@ vi.mock('react-i18next', () => {
     'requests.mine.addLanguageHint': 'Request another language or format for this same book.',
     'requests.mine.requestLanguage': 'Send language request',
     'requests.mine.extendFailed': 'Could not send the language request',
+    'requests.mine.statusUnknownReload': 'Request approved, but the latest copy statuses could not be loaded. Reload to confirm.',
     'requests.mine.duplicateSelection': 'That format and language selection is already requested.',
     'requests.status.pending': 'Waiting for an admin',
     'requests.status.declined': 'Declined',
@@ -151,7 +152,110 @@ describe('MyRequestsPage', () => {
     expect(api.withdrawRequest).toHaveBeenCalledWith(1)
   })
 
-  it('adds another language request for an existing book without dropping English', async () => {
+  it('refreshes the row after an immediate approval that omits variants', async () => {
+    const english = { id: 31, mediaType: 'ebook' as const, language: 'eng', status: 'imported', verification: 'verified' }
+    const initial = req({
+      id: 3,
+      title: 'Dune',
+      mediaType: 'ebook',
+      status: 'approved',
+      fulfilled: true,
+      languages: ['eng'],
+      variants: [english],
+    })
+    const refreshed = req({
+      id: 3,
+      title: 'Dune',
+      mediaType: 'ebook',
+      status: 'approved',
+      fulfilled: false,
+      languages: ['eng', 'rum'],
+      variants: [english, { id: 32, mediaType: 'ebook', language: 'rum', status: 'wanted', verification: '' }],
+    })
+    vi.mocked(api.listMyRequests)
+      .mockResolvedValueOnce({ items: [initial], total: 1, limit: 50, offset: 0 })
+      .mockResolvedValueOnce({ items: [refreshed], total: 1, limit: 50, offset: 0 })
+    vi.mocked(api.createRequest).mockResolvedValue(
+      req({
+        id: 3,
+        title: 'Dune',
+        mediaType: 'ebook',
+        status: 'approved',
+        fulfilled: false,
+        languages: ['eng', 'rum'],
+        // Immediate-approval POST can omit variants until the owner list is reloaded.
+        variants: undefined,
+      }),
+    )
+
+    render(<MemoryRouter><MyRequestsPage /></MemoryRouter>)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Add another language' }))
+    const submit = screen.getByRole('button', { name: 'Send language request' })
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Romanian' }))
+    expect(submit).toBeEnabled()
+
+    fireEvent.click(submit)
+    await waitFor(() => expect(api.createRequest).toHaveBeenCalledWith('book', 'OL1W', 'ebook', ['eng', 'rum']))
+    await waitFor(() => expect(api.listMyRequests).toHaveBeenCalledTimes(2))
+    expect(api.listMyRequests).toHaveBeenNthCalledWith(2, { limit: 50, offset: 0 })
+
+    expect(await screen.findByText('Approved, not here yet')).toBeInTheDocument()
+    expect(screen.getByTestId('book-variant-status-variant-31')).toHaveTextContent('In library')
+    expect(screen.getByTestId('book-variant-status-variant-32')).toHaveTextContent('Romanian')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add another language' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'English' }))
+    expect(screen.getByRole('button', { name: 'Send language request' })).toBeDisabled()
+    expect(api.createRequest).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows an unknown-status reload prompt when the approved refresh fails', async () => {
+    vi.mocked(api.listMyRequests)
+      .mockResolvedValueOnce({
+        items: [req({
+          id: 3,
+          title: 'Dune',
+          mediaType: 'ebook',
+          status: 'approved',
+          fulfilled: true,
+          languages: ['eng'],
+          variants: [{ id: 31, mediaType: 'ebook', language: 'eng', status: 'imported', verification: 'verified' }],
+        })],
+        total: 1,
+        limit: 50,
+        offset: 0,
+      })
+      .mockRejectedValueOnce(new Error('refresh failed'))
+    vi.mocked(api.createRequest).mockResolvedValue(
+      req({
+        id: 3,
+        title: 'Dune',
+        mediaType: 'ebook',
+        status: 'approved',
+        fulfilled: false,
+        languages: ['eng', 'rum'],
+        variants: undefined,
+      }),
+    )
+
+    render(<MemoryRouter><MyRequestsPage /></MemoryRouter>)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Add another language' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Romanian' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Send language request' }))
+
+    await waitFor(() => expect(api.createRequest).toHaveBeenCalledWith('book', 'OL1W', 'ebook', ['eng', 'rum']))
+    await waitFor(() => expect(api.listMyRequests).toHaveBeenCalledTimes(2))
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Request approved, but the latest copy statuses could not be loaded. Reload to confirm.',
+    )
+    expect(screen.queryByTestId('book-variant-status-variant-31')).not.toBeInTheDocument()
+    expect(screen.queryByText('Romanian')).not.toBeInTheDocument()
+    expect(api.createRequest).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the pending merge path unchanged when the create response omits variants', async () => {
     vi.mocked(api.listMyRequests).mockResolvedValue({
       items: [
         req({
@@ -204,6 +308,8 @@ describe('MyRequestsPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Add another language' }))
     fireEvent.click(screen.getByRole('checkbox', { name: 'English' }))
     expect(screen.getByRole('button', { name: 'Send language request' })).toBeDisabled()
+    expect(api.listMyRequests).toHaveBeenCalledTimes(1)
+    expect(api.createRequest).toHaveBeenCalledTimes(1)
   })
 
   it('shows partial approval until every requested format and language is imported, then available on reload', async () => {

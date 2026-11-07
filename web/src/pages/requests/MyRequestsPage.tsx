@@ -122,8 +122,23 @@ export default function MyRequestsPage() {
     setError(null)
     try {
       const created = await api.createRequest('book', request.foreignId, editMediaType, editLanguages)
+      const touchesRequest = (item: LibraryRequest) => item.id === request.id || (item.kind === 'book' && item.foreignId === request.foreignId)
+
+      if (created.status === 'approved' && created.variants === undefined) {
+        try {
+          const page = await api.listMyRequests({ limit: Math.max(PAGE_SIZE, items.length), offset: 0 })
+          setItems(page.items)
+          setTotal(page.total)
+        } catch {
+          setItems(prev => prev.map(item => (touchesRequest(item) ? created : item)))
+          setError(t('requests.mine.statusUnknownReload'))
+        }
+        setEditingRequestId(null)
+        return
+      }
+
       setItems(prev => prev.map(item =>
-        (item.id === request.id || (item.kind === 'book' && item.foreignId === request.foreignId))
+        touchesRequest(item)
           ? { ...created, variants: created.variants ?? item.variants, legacyFiles: created.legacyFiles ?? item.legacyFiles }
           : item,
       ))

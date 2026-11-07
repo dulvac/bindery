@@ -2811,6 +2811,7 @@
       "addLanguageHint": "Request another language or format for this same book.",
       "requestLanguage": "Send language request",
       "extendFailed": "Could not send the language request",
+      "statusUnknownReload": "Request approved, but the latest copy statuses could not be loaded. Reload to confirm.",
       "duplicateSelection": "That format and language selection is already requested."
     },
     "library": {
