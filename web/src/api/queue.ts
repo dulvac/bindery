@@ -5,10 +5,16 @@ import type { BookRef } from './common'
 export interface Download {
   id: number
   guid: string
+  // Book and variant ids are optional because legacy/manual rows can be
+  // unbound. Positive ids target copy-specific actions; synthetic negative ids
+  // are display-only on some projections.
+  bookId?: number
+  variantId?: number
   title: string
   status: string
   size: number
   protocol: string
+  torrentId?: string
   errorMessage: string
   addedAt: string
   grabbedAt?: string

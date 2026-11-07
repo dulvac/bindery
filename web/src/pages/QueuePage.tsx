@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { useSearchParams } from 'react-router'
+import { Link, useSearchParams } from 'react-router'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { api, Book, PendingRelease, QueueItem } from '../api/client'
 import { useIsAdmin } from '../auth/AuthContext'
@@ -24,6 +24,25 @@ import FilterBar from '../components/FilterBar'
 import EmptyState from '../components/EmptyState'
 import Checkbox from '../components/Checkbox'
 
+type RetryExistingTorrentTarget = {
+  downloadId: number
+  bookId: number
+  variantId: number
+  bookTitle: string
+  releaseTitle: string
+}
+
+function isExistingTorrentRetryCandidate(item: QueueItem): item is QueueItem & { variantId: number; torrentId: string; book: NonNullable<QueueItem['book']> } {
+  return (item.status === 'importFailed' || item.status === 'importBlocked')
+    && item.id > 0
+    && typeof item.variantId === 'number'
+    && item.variantId > 0
+    && typeof item.torrentId === 'string'
+    && item.torrentId.trim().length > 0
+    && !!item.book
+    && item.book.id > 0
+}
+
 export default function QueuePage() {
   const { t } = useTranslation()
   const isAdmin = useIsAdmin()
@@ -44,6 +63,9 @@ export default function QueuePage() {
   const [pendingError, setPendingError] = useState<Record<number, string>>({})
   const [retryingImportIds, setRetryingImportIds] = useState<Set<number>>(() => new Set())
   const [retryImportErrors, setRetryImportErrors] = useState<Record<number, string>>({})
+  const [reviewedRetryRows, setReviewedRetryRows] = useState<Record<number, boolean>>({})
+  const [retryExistingTorrentTarget, setRetryExistingTorrentTarget] = useState<RetryExistingTorrentTarget | null>(null)
+  const [retryExistingTorrentReason, setRetryExistingTorrentReason] = useState('')
   const [matchMessages, setMatchMessages] = useState<Record<number, string>>({})
   const [deleteTarget, setDeleteTarget] = useState<QueueItem | null>(null)
   const [deleteFiles, setDeleteFiles] = useState(false)
@@ -98,6 +120,40 @@ export default function QueuePage() {
   }, [])
 
   useEffect(() => { load() }, [load])
+
+  // The named existing-torrent retry is valid only for reviewed variants. Queue
+  // rows carry ids and torrent identity, but not variant status, so resolve the
+  // current status from each linked book.
+  useEffect(() => {
+    if (!isAdmin) {
+      setReviewedRetryRows({})
+      return
+    }
+    const candidates = queue.filter(isExistingTorrentRetryCandidate)
+    if (candidates.length === 0) {
+      setReviewedRetryRows({})
+      return
+    }
+    let cancelled = false
+    const bookIDs = [...new Set(candidates.map(item => item.book.id))]
+    Promise.all(bookIDs.map(async bookId => {
+      try {
+        return [bookId, await api.getBook(bookId)] as const
+      } catch {
+        return [bookId, null] as const
+      }
+    })).then(results => {
+      if (cancelled || !mounted.current) return
+      const byBook = new Map<number, Book | null>(results)
+      const next: Record<number, boolean> = {}
+      for (const item of candidates) {
+        const variant = byBook.get(item.book.id)?.variants?.find(v => v.id === item.variantId)
+        next[item.id] = variant?.status === 'review'
+      }
+      setReviewedRetryRows(next)
+    })
+    return () => { cancelled = true }
+  }, [queue, isAdmin])
 
   // Poll while the tab is visible. usePolling pauses on document.hidden, so a
   // queue left open in a background window stops asking (#2360).
@@ -275,6 +331,54 @@ export default function QueuePage() {
       delete next[id]
       return next
     })
+  }
+
+  const openRetryExistingTorrent = (item: QueueItem) => {
+    if (!isExistingTorrentRetryCandidate(item)) return
+    clearRetryImportError(item.id)
+    setRetryExistingTorrentReason('')
+    setRetryExistingTorrentTarget({
+      downloadId: item.id,
+      bookId: item.book.id,
+      variantId: item.variantId,
+      bookTitle: item.book.title,
+      releaseTitle: item.title,
+    })
+  }
+
+  const closeRetryExistingTorrent = () => {
+    if (retryExistingTorrentTarget && retryingImportIds.has(retryExistingTorrentTarget.downloadId)) return
+    setRetryExistingTorrentTarget(null)
+    setRetryExistingTorrentReason('')
+  }
+
+  const submitRetryExistingTorrent = async () => {
+    const target = retryExistingTorrentTarget
+    if (!target) return
+    const reason = retryExistingTorrentReason.trim()
+    if (!reason) return
+    setRetryingImportIds(prev => new Set(prev).add(target.downloadId))
+    clearRetryImportError(target.downloadId)
+    try {
+      await api.retryReviewedVariantImport(target.bookId, target.variantId, target.downloadId, reason)
+      setRetryExistingTorrentTarget(null)
+      setRetryExistingTorrentReason('')
+      load()
+    } catch (e) {
+      setRetryImportErrors(prev => ({
+        ...prev,
+        [target.downloadId]: errorText(e, t('queue.retryFailed', 'Retry failed')),
+      }))
+      setRetryExistingTorrentTarget(null)
+      setRetryExistingTorrentReason('')
+      load()
+    } finally {
+      setRetryingImportIds(prev => {
+        const next = new Set(prev)
+        next.delete(target.downloadId)
+        return next
+      })
+    }
   }
 
   const handleRetryImport = async (id: number) => {
@@ -600,7 +704,12 @@ export default function QueuePage() {
                   }
                 />
               )}
-              {queuePage.map(item => (
+              {queuePage.map(item => {
+                const reviewedTorrentRetryCandidate = isAdmin && isExistingTorrentRetryCandidate(item)
+                const reviewedTorrentRetryReady = reviewedTorrentRetryCandidate && reviewedRetryRows[item.id] === true
+                const reviewedTorrentRetryPending = reviewedTorrentRetryCandidate && reviewedRetryRows[item.id] === undefined
+                const showMatchActions = isMatchable(item.status) && !reviewedTorrentRetryReady && !reviewedTorrentRetryPending
+                return (
                 <div key={item.id} className={`flex flex-wrap sm:flex-nowrap items-center justify-between p-3 border rounded-lg bg-slate-100 dark:bg-zinc-900 ${selectedIds.has(item.id) ? 'border-emerald-500' : 'border-slate-200 dark:border-zinc-800'}`}>
                   <Checkbox
                     checked={selectedIds.has(item.id)}
@@ -673,7 +782,7 @@ export default function QueuePage() {
                         )}
                       </div>
                     )}
-                    {isMatchable(item.status) && !item.book && (
+                    {showMatchActions && !item.book && (
                       <div className="mt-1 text-xs text-fg-muted bg-slate-200/70 dark:bg-zinc-800/70 rounded px-2 py-1 break-words">
                         {t('queue.retryImportHint')}
                       </div>
@@ -681,9 +790,17 @@ export default function QueuePage() {
                     {/* Persistent match indicator: an import-failed download that
                         already has a book was matched — survives reload so the
                         user isn't left wondering whether the match took (#1589). */}
-                    {isMatchable(item.status) && item.book && (
+                    {showMatchActions && item.book && (
                       <div className="mt-1 text-xs text-accent-text bg-emerald-400/10 rounded px-2 py-1 break-words">
                         {t('queue.matchedTo', { title: item.book.title, defaultValue: `Matched to ${item.book.title} — use Retry import to import it.` })}
+                      </div>
+                    )}
+                    {reviewedTorrentRetryReady && item.book && (
+                      <div className="mt-1 text-xs text-fg-muted bg-slate-200/70 dark:bg-zinc-800/70 rounded px-2 py-1 break-words">
+                        <p>{t('queue.retryThisTorrentSearchAgain', 'Need a different release? Open this book and use Search again for a new copy.')}</p>
+                        <Link to={`/book/${item.book.id}`} className="underline text-accent-text">
+                          {t('queue.retryThisTorrentOpenBook', 'Open book')}
+                        </Link>
                       </div>
                     )}
                     {retryImportErrors[item.id] && (
@@ -713,14 +830,14 @@ export default function QueuePage() {
                       (418px at the 16px touch font) as their minimum, which
                       made a 320px page 526px wide. */}
                   <div data-testid="queue-row-actions" className="basis-full min-w-0 mt-2 flex flex-wrap justify-end items-center gap-2 sm:basis-auto sm:mt-0 sm:ml-4 sm:flex-nowrap sm:flex-shrink-0">
-                    {isMatchable(item.status) && (
+                    {showMatchActions && (
                       <MatchBookControl
                         disabled={retryingImportIds.has(item.id)}
                         alreadyMatched={!!item.book}
                         onMatch={bookId => handleMatch(item.id, bookId)}
                       />
                     )}
-                    {isMatchable(item.status) && (
+                    {showMatchActions && (
                       <button
                         // A matched item re-imports its recorded files against the
                         // assigned book (works with no download client); an
@@ -731,6 +848,16 @@ export default function QueuePage() {
                         className="px-3 py-2 text-xs bg-sky-600 hover:bg-sky-500 disabled:opacity-50 rounded font-medium touch-manipulation"
                       >
                         {retryingImportIds.has(item.id) ? t('queue.retryingImport') : t('queue.retryImport')}
+                      </button>
+                    )}
+                    {reviewedTorrentRetryReady && (
+                      <button
+                        onClick={() => openRetryExistingTorrent(item)}
+                        disabled={retryingImportIds.has(item.id)}
+                        title={t('queue.retryThisTorrentBody', 'Retry this reviewed copy against the same retained torrent. This does not run a new search, a new grab, or any torrent removal.')}
+                        className="px-3 py-2 text-xs bg-sky-600 hover:bg-sky-500 disabled:opacity-50 rounded font-medium touch-manipulation"
+                      >
+                        {retryingImportIds.has(item.id) ? t('queue.retryingImport') : t('queue.retryThisTorrent', 'Retry this torrent')}
                       </button>
                     )}
                     {isResendable(item.status) && (
@@ -751,7 +878,7 @@ export default function QueuePage() {
                     </button>
                   </div>
                 </div>
-              ))}
+              )})}
               <Pagination {...queuePaginationProps} />
             </div>
           )}
@@ -804,6 +931,59 @@ export default function QueuePage() {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {retryExistingTorrentTarget && (
+        <div
+          className="modal-overlay fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          onClick={closeRetryExistingTorrent}
+        >
+          <ModalPanel
+            onClose={closeRetryExistingTorrent}
+            canClose={!retryingImportIds.has(retryExistingTorrentTarget.downloadId)}
+            labelledBy="queue-retry-this-torrent-title"
+            className="w-full max-w-md rounded-lg border border-slate-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 shadow-xl modal-max-h overflow-y-auto"
+            onClick={e => e.stopPropagation()}
+          >
+            <h3 id="queue-retry-this-torrent-title" className="text-lg font-semibold mb-2">
+              {t('queue.retryThisTorrentTitle', 'Retry this torrent')}
+            </h3>
+            <p className="text-sm text-fg-muted break-words">
+              {retryExistingTorrentTarget.bookTitle} · {retryExistingTorrentTarget.releaseTitle}
+            </p>
+            <p className="mt-2 text-sm text-fg-muted">
+              {t('queue.retryThisTorrentBody', 'Retry this reviewed copy against the same retained torrent. This does not run a new search, a new grab, or any torrent removal.')}
+            </p>
+            <label className="mt-4 block text-sm">
+              <span className="font-medium">{t('queue.retryThisTorrentReason', 'Reason for retrying this torrent')}</span>
+              <input
+                autoFocus
+                value={retryExistingTorrentReason}
+                onChange={e => setRetryExistingTorrentReason(e.target.value)}
+                aria-label={t('queue.retryThisTorrentReason', 'Reason for retrying this torrent')}
+                className="mt-1 w-full border rounded p-2 bg-white dark:bg-zinc-900"
+              />
+            </label>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                onClick={closeRetryExistingTorrent}
+                disabled={retryingImportIds.has(retryExistingTorrentTarget.downloadId)}
+                className="px-3 py-2 text-xs rounded font-medium bg-slate-200 dark:bg-zinc-800 hover:bg-slate-300 dark:hover:bg-zinc-700 disabled:opacity-50"
+              >
+                {t('common.cancel')}
+              </button>
+              <button
+                onClick={submitRetryExistingTorrent}
+                disabled={retryingImportIds.has(retryExistingTorrentTarget.downloadId) || !retryExistingTorrentReason.trim()}
+                className="px-3 py-2 text-xs rounded font-medium bg-sky-600 hover:bg-sky-500 text-white disabled:opacity-50"
+              >
+                {retryingImportIds.has(retryExistingTorrentTarget.downloadId)
+                  ? t('queue.retryingImport')
+                  : t('queue.retryThisTorrentConfirm', 'Retry this torrent')}
+              </button>
+            </div>
+          </ModalPanel>
         </div>
       )}
 

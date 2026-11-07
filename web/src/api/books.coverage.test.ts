@@ -99,13 +99,15 @@ describe('booksApi request shapes', () => {
     expect(new URLSearchParams(seen[1].query).get('authorId')).toBe('9')
   })
 
-  it('scopes a manual book search to one requested format and language, and posts a reviewed retry reason', async () => {
+  it('scopes a manual book search to one requested format and language, and posts reviewed retry actions', async () => {
     const seen = record()
     await booksApi.searchBook(42, { mediaType: 'ebook', language: 'rum' })
     await booksApi.retryReviewedVariant(42, 17, 'Wrong-language import reviewed')
+    await booksApi.retryReviewedVariantImport(42, 17, 99, 'Retry same retained torrent')
     expect(seen.map(s => [s.method, s.path + s.query, s.body])).toEqual([
       ['POST', '/book/42/search?mediaType=ebook&language=rum', undefined],
       ['POST', '/book/42/variants/17/retry', { reason: 'Wrong-language import reviewed' }],
+      ['POST', '/book/42/variants/17/retry-import', { downloadId: 99, reason: 'Retry same retained torrent' }],
     ])
   })
 
