@@ -3,7 +3,9 @@ import { useTranslation } from 'react-i18next'
 import { api } from '../../api/client'
 import type { ApproveRequestChoices, LibraryRequest } from '../../api/client'
 import { AuthorAddDefaults, loadAuthorAddDefaults } from '../../components/authorAddDefaults'
+import BookVariantStatus from '../../components/BookVariantStatus'
 import { primaryFill } from '../../components/buttons'
+import { pendingRequestVariants } from './requestLabels'
 
 interface Props {
   request: LibraryRequest
@@ -105,6 +107,9 @@ export default function ApproveRequestForm({ request, onApproved, onCancel }: Pr
           </select>
         </div>
       </div>
+      {!isAuthor && (
+        <BookVariantStatus variants={pendingRequestVariants(request, mediaType)} />
+      )}
       <label className="flex items-center gap-2 text-sm">
         <input type="checkbox" checked={searchOnAdd} onChange={e => setSearchOnAdd(e.target.checked)} />
         {t('requests.admin.searchOnAdd')}

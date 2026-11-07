@@ -412,6 +412,53 @@ describe('RequestsPage', () => {
     window.removeEventListener('bindery:requests-changed', changed)
   })
 
+  it('shows pending request languages in queue rows and keeps them in the approval form when format is overridden', async () => {
+    vi.mocked(api.listRequestQueue).mockResolvedValue({
+      items: [
+        req({ id: 11, title: 'Merged', mediaType: 'both', languages: ['eng', 'rum'], username: 'reader' }),
+        req({ id: 12, title: 'Romanian only', mediaType: 'ebook', languages: ['rum'], username: 'reader' }),
+        req({ id: 13, title: 'Legacy unknown', mediaType: 'ebook', languages: [], username: 'reader' }),
+        req({ id: 14, title: 'Author request', kind: 'author', username: 'reader' }),
+      ],
+      total: 4,
+      limit: 50,
+      offset: 0,
+    })
+    render(<RequestsPage />)
+
+    const row = async (title: string) => (await screen.findByText(title)).closest('li') as HTMLElement
+
+    const mergedRow = await row('Merged')
+    expect(within(mergedRow).getAllByText('English')).toHaveLength(2)
+    expect(within(mergedRow).getAllByText('Romanian')).toHaveLength(2)
+    expect(within(within(mergedRow).getByTestId('book-variant-statuses')).getAllByRole('listitem')).toHaveLength(4)
+
+    const romanianRow = await row('Romanian only')
+    expect(within(romanianRow).queryByText('English')).not.toBeInTheDocument()
+    expect(within(romanianRow).getByText('Romanian')).toBeInTheDocument()
+
+    const legacyRow = await row('Legacy unknown')
+    expect(within(legacyRow).getByText('Language unknown')).toBeInTheDocument()
+    expect(within(legacyRow).queryByText('English')).not.toBeInTheDocument()
+
+    const authorRow = await row('Author request')
+    expect(within(authorRow).queryByTestId('book-variant-statuses')).not.toBeInTheDocument()
+
+    fireEvent.click(within(mergedRow).getByRole('button', { name: 'Approve request for Merged' }))
+    const form = screen.getByRole('form', { name: 'Approve Merged' })
+    expect(within(form).getAllByText('English')).toHaveLength(2)
+    expect(within(form).getAllByText('Romanian')).toHaveLength(2)
+    expect(within(within(form).getByTestId('book-variant-statuses')).getAllByRole('listitem')).toHaveLength(4)
+    expect(api.approveRequest).not.toHaveBeenCalled()
+
+    fireEvent.change(within(form).getByRole('combobox', { name: 'Format' }), { target: { value: 'ebook' } })
+    expect(within(form).getByRole('combobox', { name: 'Format' })).toHaveValue('ebook')
+    expect(within(within(form).getByTestId('book-variant-statuses')).getAllByRole('listitem')).toHaveLength(2)
+    expect(within(form).getByText('English')).toBeInTheDocument()
+    expect(within(form).getByText('Romanian')).toBeInTheDocument()
+    expect(api.approveRequest).not.toHaveBeenCalled()
+  })
+
   it('says who made a request on its owner\'s behalf', async () => {
     vi.mocked(api.listRequestQueue).mockResolvedValue({
       items: [

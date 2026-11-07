@@ -3,7 +3,8 @@ import { useTranslation } from 'react-i18next'
 import { api } from '../../api/client'
 import type { LibraryRequest, RequestStatus } from '../../api/client'
 import ApproveRequestForm from './ApproveRequestForm'
-import { mediaTypeLabel, REQUESTS_CHANGED_EVENT, requestStatusClass, requestStatusLabel } from './requestLabels'
+import { mediaTypeLabel, pendingRequestVariants, REQUESTS_CHANGED_EVENT, requestStatusClass, requestStatusLabel } from './requestLabels'
+import BookVariantStatus from '../../components/BookVariantStatus'
 import { primaryFill } from '../../components/buttons'
 
 type Filter = RequestStatus | 'all'
@@ -116,6 +117,9 @@ export default function RequestsPage() {
                   </div>
                   {r.status === 'declined' && r.declineReason && (
                     <p className="text-xs mt-1">{t('requests.mine.reason', { reason: r.declineReason })}</p>
+                  )}
+                  {r.kind === 'book' && r.status === 'pending' && (
+                    <BookVariantStatus variants={pendingRequestVariants(r)} className="mt-2" />
                   )}
                 </div>
                 <div className="flex items-center gap-2 flex-shrink-0">
