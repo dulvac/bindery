@@ -2420,12 +2420,82 @@ describe('BookDetailPage — Previous/Next navigation (#2548, book side)', () =>
 describe('BookDetailPage automatic search (#2668)', () => {
   const autoLabel = translate('bookDetail.autoSearch')
 
-  it('offers an automatic search alongside the interactive one', async () => {
+  it('offers an automatic search alongside the interactive one for legacy wanted books', async () => {
     renderBookDetailPage()
     await screen.findByRole('heading', { name: 'The Final Empire' })
 
     expect(screen.getByRole('button', { name: new RegExp(translate('bookDetail.searchEbookIndexers')) })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: new RegExp(autoLabel) })).toBeInTheDocument()
+  })
+
+  it('shows automatic search for a missing sibling language even when another ebook is already imported', async () => {
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({
+      title: 'Dune',
+      ebookFilePath: '/books/Herbert/Dune [ENG].epub',
+      variants: [
+        { id: 17, mediaType: 'ebook', language: 'eng', status: 'imported', verification: 'verified' },
+        { id: 18, mediaType: 'ebook', language: 'rum', status: 'wanted', verification: 'unverified' },
+      ],
+    }))
+
+    renderBookDetailPage()
+    await screen.findByRole('heading', { name: 'Dune' })
+
+    const button = screen.getByRole('button', { name: new RegExp(autoLabel) })
+    expect(button).toHaveTextContent('Romanian')
+    expect(api.searchBookAutomatic).not.toHaveBeenCalled()
+
+    fireEvent.click(button)
+
+    await waitFor(() => expect(api.searchBookAutomatic).toHaveBeenCalledWith(42))
+    expect(api.searchBook).not.toHaveBeenCalled()
+  })
+
+  it('hides automatic search when all active variants are already imported', async () => {
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({
+      ebookFilePath: '',
+      variants: [
+        { id: 17, mediaType: 'ebook', language: 'eng', status: 'imported', verification: 'verified' },
+        { id: 18, mediaType: 'ebook', language: 'rum', status: 'imported', verification: 'verified' },
+      ],
+    }))
+
+    renderBookDetailPage()
+    await screen.findByRole('heading', { name: 'The Final Empire' })
+
+    expect(screen.queryByRole('button', { name: new RegExp(autoLabel) })).toBeNull()
+  })
+
+  it('hides automatic search when active variants are only downloading or review', async () => {
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({
+      mediaType: 'both',
+      ebookFilePath: '',
+      audiobookFilePath: '',
+      variants: [
+        { id: 17, mediaType: 'ebook', language: 'eng', status: 'review', verification: 'unverified' },
+        { id: 18, mediaType: 'audiobook', language: 'eng', status: 'downloading', verification: 'unverified' },
+      ],
+    }))
+
+    renderBookDetailPage()
+    await screen.findByRole('heading', { name: 'The Final Empire' })
+
+    expect(screen.queryByRole('button', { name: new RegExp(autoLabel) })).toBeNull()
+  })
+
+  it('does not infer a needed copy from a wanted variant outside the selected media type', async () => {
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({
+      mediaType: 'ebook',
+      ebookFilePath: '',
+      variants: [
+        { id: 18, mediaType: 'audiobook', language: 'rum', status: 'wanted', verification: 'unverified' },
+      ],
+    }))
+
+    renderBookDetailPage()
+    await screen.findByRole('heading', { name: 'The Final Empire' })
+
+    expect(screen.queryByRole('button', { name: new RegExp(autoLabel) })).toBeNull()
   })
 
   it('runs the automatic path for this book and not the interactive one', async () => {
@@ -2505,6 +2575,19 @@ describe('BookDetailPage automatic search (#2668)', () => {
     vi.mocked(api.getBook).mockResolvedValue(makeBook({
       mediaType: 'both',
       ebookFilePath: '/books/Sanderson/The Final Empire.epub',
+    }))
+
+    renderBookDetailPage()
+    await screen.findByRole('heading', { name: 'The Final Empire' })
+
+    expect(screen.getByRole('button', { name: new RegExp(autoLabel) })).toBeInTheDocument()
+  })
+
+  it('keeps legacy path-based behavior when no variants are present, even if the author is unmonitored', async () => {
+    vi.mocked(api.getBook).mockResolvedValue(makeBook({
+      variants: [],
+      ebookFilePath: '',
+      author: { ...author, monitored: false },
     }))
 
     renderBookDetailPage()

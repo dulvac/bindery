@@ -1082,15 +1082,15 @@ function BookDetailPageInner() {
     ? new Date(book.releaseDate).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
     : null
 
-  // Mirrors models.Book.NeedsEbook/NeedsAudiobook, which is what
-  // scheduler.SearchAndGrabBook feeds into neededFormats(): with no needed
-  // format it returns before searching anything, so an automatic search button
-  // here could only ever appear to do nothing. The interactive Search stays,
-  // because picking a different release for a file you already own is a real
-  // thing to want.
+  // Legacy books (no variant rows) still infer missing formats from the
+  // compatibility file-path columns, matching models.Book.NeedsEbook/
+  // NeedsAudiobook. Variant books use active wanted copies instead: an
+  // imported English EPUB must not hide automatic search for a still-wanted
+  // Romanian EPUB sibling.
   const needsEbook = (mt === 'ebook' || mt === 'both') && !book.ebookFilePath
   const needsAudiobook = (mt === 'audiobook' || mt === 'both') && !book.audiobookFilePath
-  const canAutoSearch = needsEbook || needsAudiobook
+  const legacyCanAutoSearch = needsEbook || needsAudiobook
+  const canAutoSearch = variantBook ? availableVariants.length > 0 : legacyCanAutoSearch
 
   const searchLabel = searching
     ? t('bookDetail.searching')
@@ -1099,6 +1099,17 @@ function BookDetailPageInner() {
       : mt === 'both'
         ? t('bookDetail.searchBothIndexers')
         : t('bookDetail.searchEbookIndexers')
+
+  const autoSearchLabel = (() => {
+    if (!variantBook || availableVariants.length === 0) return t('bookDetail.autoSearch')
+    const primary = variantLabel(availableVariants[0], t)
+    const extra = availableVariants.length > 1 ? ` (+${availableVariants.length - 1})` : ''
+    return t('bookDetail.autoSearchMissingVariant', {
+      variant: primary,
+      extra,
+      defaultValue: 'Automatic search missing {{variant}}{{extra}}',
+    })
+  })()
 
   const groupIsUntyped = (g: { rows: FileRow[] }) => g.rows.some(r => r.legacyUntyped)
   // Format groups that hold at least one file, for the per-format deletes.
@@ -1352,7 +1363,7 @@ function BookDetailPageInner() {
                 className={`${btn.secondary} ${btnSize.md}`}
               >
                 <span aria-hidden>⚡</span>{' '}
-                {autoSearching ? t('bookDetail.autoSearchStarting') : t('bookDetail.autoSearch')}
+                {autoSearching ? t('bookDetail.autoSearchStarting') : autoSearchLabel}
               </button>
             )}
           </div>
