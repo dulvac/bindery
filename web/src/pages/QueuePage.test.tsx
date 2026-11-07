@@ -676,6 +676,65 @@ describe('QueuePage', () => {
     await waitFor(() => expect(api.deleteFromQueue).toHaveBeenCalledWith(7, true))
   })
 
+  it('renders a twelve-second queue response without starting overlapping polls', async () => {
+    vi.useFakeTimers()
+    const queueLoad = deferred<QueueListResponse>()
+    const pendingLoad = deferred<PendingRelease[]>()
+    vi.mocked(api.listQueue).mockReturnValueOnce(queueLoad.promise)
+    vi.mocked(api.listPending).mockReturnValueOnce(pendingLoad.promise)
+
+    renderQueuePage()
+    expect(screen.getByText('Loading...')).toBeInTheDocument()
+
+    await act(async () => { vi.advanceTimersByTime(12000); await Promise.resolve() })
+    expect(api.listQueue).toHaveBeenCalledTimes(1)
+    expect(api.listPending).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      queueLoad.resolve({ items: [makeQueueItem({ title: 'Slow but valid queue' })] })
+      pendingLoad.resolve([])
+      await Promise.resolve()
+    })
+    expect(screen.getByText('Slow but valid queue')).toBeInTheDocument()
+    expect(screen.queryByText('Loading...')).not.toBeInTheDocument()
+
+    await act(async () => { vi.advanceTimersByTime(3000); await Promise.resolve() })
+    expect(api.listQueue).toHaveBeenCalledTimes(2)
+    expect(api.listPending).toHaveBeenCalledTimes(2)
+  })
+
+  it('clears loading after a twelve-second poll failure and retries at the next tick', async () => {
+    vi.useFakeTimers()
+    const queueLoad = deferred<QueueListResponse>()
+    const pendingLoad = deferred<PendingRelease[]>()
+    vi.mocked(api.listQueue).mockReturnValueOnce(queueLoad.promise)
+      .mockResolvedValue({ items: [makeQueueItem({ title: 'Recovered queue' })] })
+    vi.mocked(api.listPending).mockReturnValueOnce(pendingLoad.promise)
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    try {
+      renderQueuePage()
+      await act(async () => { vi.advanceTimersByTime(12000); await Promise.resolve() })
+      expect(api.listQueue).toHaveBeenCalledTimes(1)
+      expect(api.listPending).toHaveBeenCalledTimes(1)
+
+      await act(async () => {
+        queueLoad.reject(new Error('queue timed out'))
+        pendingLoad.resolve([])
+        await Promise.resolve()
+      })
+      expect(screen.queryByText('Loading...')).not.toBeInTheDocument()
+      expect(screen.getByText('Queue is empty')).toBeInTheDocument()
+
+      await act(async () => { vi.advanceTimersByTime(3000); await Promise.resolve() })
+      expect(screen.getByText('Recovered queue')).toBeInTheDocument()
+      expect(api.listQueue).toHaveBeenCalledTimes(2)
+      expect(api.listPending).toHaveBeenCalledTimes(2)
+    } finally {
+      errorSpy.mockRestore()
+    }
+  })
+
   it('polls the queue every five seconds and clears the interval on unmount', async () => {
     vi.useFakeTimers()
 
@@ -684,6 +743,7 @@ describe('QueuePage', () => {
     vi.mocked(api.listPending).mockResolvedValue([])
 
     const { unmount } = renderQueuePage()
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
 
     expect(api.listQueue).toHaveBeenCalledTimes(1)
     expect(api.listPending).toHaveBeenCalledTimes(1)
@@ -1095,7 +1155,7 @@ describe('QueuePage reviewed torrent retry (R13)', () => {
     ['requester with review projection', false, 'importBlocked', 3, true, false],
     ['admin with failed projection lookup', true, 'importBlocked', 3, undefined, false],
     ['admin with retryable importFailed', true, 'importFailed', 1, false, false],
-    ['admin with exhausted importFailed', true, 'importFailed', 3, true, true],
+    ['admin with exhausted importFailed', true, 'importFailed', 5, true, true],
     ['admin with blocked import', true, 'importBlocked', 3, true, true],
   ])('keeps %s off generic Match and Retry and gives copy-specific guidance', async (_label, admin, status, retryCount, eligible, named) => {
     authState.isAdmin = admin
@@ -1166,12 +1226,14 @@ describe('QueuePage reviewed torrent retry (R13)', () => {
     vi.mocked(api.listQueue).mockResolvedValue({ items })
     renderQueuePage()
     await act(async () => { await Promise.resolve(); await Promise.resolve() })
-    await act(async () => { vi.advanceTimersByTime(15000); await Promise.resolve() })
+    for (let tick = 0; tick < 3; tick++) {
+      await act(async () => { vi.advanceTimersByTime(5000); await Promise.resolve() })
+    }
     expect(api.listQueue).toHaveBeenCalledTimes(4)
     expect(api.getBook).not.toHaveBeenCalled()
   })
 
-  it('only polls the queue, not each book, and ignores a late older poll for the same download id', async () => {
+  it('lets an explicit refresh supersede a slow poll without restoring the older reviewed torrent', async () => {
     vi.useFakeTimers()
     const older = deferred<QueueListResponse>()
     const newer = deferred<QueueListResponse>()
@@ -1179,11 +1241,14 @@ describe('QueuePage reviewed torrent retry (R13)', () => {
       .mockResolvedValueOnce({ items: [reviewedQueueRow] })
       .mockReturnValueOnce(older.promise)
       .mockReturnValueOnce(newer.promise)
+    vi.mocked(api.listPending).mockResolvedValue([makePendingRelease()])
     renderQueuePage()
     await act(async () => { await Promise.resolve(); await Promise.resolve() })
     expect(screen.getByRole('button', { name: 'Retry this torrent' })).toBeInTheDocument()
     await act(async () => { vi.advanceTimersByTime(5000); await Promise.resolve() })
-    await act(async () => { vi.advanceTimersByTime(5000); await Promise.resolve() })
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    expect(api.listQueue).toHaveBeenCalledTimes(3)
     await act(async () => {
       newer.resolve({ items: [{ ...reviewedQueueRow, title: 'Changed torrent', torrentId: 'new-hash', reviewedRetryEligible: false }] })
       await Promise.resolve()

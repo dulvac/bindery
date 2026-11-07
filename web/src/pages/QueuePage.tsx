@@ -103,18 +103,19 @@ export default function QueuePage() {
   }, [viewParam, statusView, setSearchParams])
   const [bulkResult, setBulkResult] = useState<string | null>(null)
 
-  // Guard against stale responses and set-state-after-unmount: `mounted` is
-  // checked before every setState and flipped on unmount, so a poll that
-  // resolves after a newer tick or after unmount is ignored. Mirrors
-  // AuthorsPage's poll guard.
+  // A poll skips an in-flight load; explicit action refreshes can supersede it.
+  // The generation guard ignores an older response after such a refresh, and
+  // mounted prevents updates after unmount.
   const mounted = useRef(true)
   const loadGeneration = useRef(0)
+  const loadInFlight = useRef(false)
   useEffect(() => {
     mounted.current = true
     return () => { mounted.current = false }
   }, [])
 
   const load = useCallback(() => {
+    loadInFlight.current = true
     const generation = ++loadGeneration.current
     Promise.all([
       api.listQueue(),
@@ -127,15 +128,17 @@ export default function QueuePage() {
       setStaleClients((q.staleClients ?? []).map(c => c.name).filter((n): n is string => !!n))
       setPending(p)
     }).catch(console.error).finally(() => {
-      if (mounted.current && generation === loadGeneration.current) setLoading(false)
+      if (generation !== loadGeneration.current) return
+      loadInFlight.current = false
+      if (mounted.current) setLoading(false)
     })
   }, [])
 
   useEffect(() => { load() }, [load])
 
-  // Poll while the tab is visible. usePolling pauses on document.hidden, so a
-  // queue left open in a background window stops asking (#2360).
-  usePolling(load, 5000)
+  // Poll while the tab is visible. A slow response must be allowed to settle
+  // before the next request; explicit action refreshes still call load directly.
+  usePolling(() => { if (!loadInFlight.current) load() }, 5000)
 
   useEffect(() => {
     document.title = `${t('nav.queue', 'Queue')} · Bindery`
