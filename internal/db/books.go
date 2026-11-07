@@ -326,13 +326,15 @@ func bookSortOrder(sort string) string {
 	}
 }
 
-// wantedMissingPredicate matches real missing copies, or a legacy wanted book
-// that has no variants yet. EXISTS keeps each book in the count and page once
-// even if several languages are wanted. When a format chip is active, only
-// missing copies of that format qualify (the book media_type check still runs
-// separately). The format value is never interpolated from caller input.
+// wantedMissingPredicate matches wanted copies in the book's currently
+// requested formats, or a legacy wanted book with no variants. An inactive
+// variant stays stored for re-enabling its format, but must not keep the book
+// on Wanted. EXISTS keeps each book in the count and page once even with
+// several wanted languages. A format chip further narrows the wanted copy.
+// The format value is never interpolated from caller input.
 func wantedMissingPredicate(mediaType string) string {
-	variant := "EXISTS (SELECT 1 FROM book_variants v WHERE v.book_id = books.id AND v.status = 'wanted'"
+	variant := "EXISTS (SELECT 1 FROM book_variants v WHERE v.book_id = books.id AND v.status = 'wanted'" +
+		" AND (books.media_type = 'both' OR v.media_type = COALESCE(NULLIF(books.media_type, ''), 'ebook'))"
 	switch mediaType {
 	case models.MediaTypeEbook:
 		variant += " AND v.media_type = 'ebook'"

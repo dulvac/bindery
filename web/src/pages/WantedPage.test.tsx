@@ -585,6 +585,43 @@ describe('WantedPage', () => {
     await waitFor(() => expect(api.updateBook).toHaveBeenCalledWith(1, { mediaType: 'audiobook' }))
   })
 
+  it('refreshes real wanted copy labels after both to ebook to both changes', async () => {
+    const variants = [
+      { id: 41, mediaType: 'ebook' as const, language: 'rum', status: 'wanted' as const, verification: '' },
+      { id: 42, mediaType: 'audiobook' as const, language: 'rum', status: 'wanted' as const, verification: '' },
+    ]
+    const both = makeBook({ id: 1, title: 'Dune', mediaType: 'both', variants })
+    const ebook = makeBook({ ...both, mediaType: 'ebook' })
+    vi.mocked(api.listWantedPage)
+      .mockResolvedValueOnce(pageOf([both]))
+      .mockResolvedValueOnce(pageOf([ebook]))
+      .mockResolvedValueOnce(pageOf([both]))
+    // PUT /book/{id} returns a plain Book, not the Wanted list projection.
+    vi.mocked(api.updateBook).mockImplementation(async (_, patch) => makeBook({ id: 1, title: 'Dune', mediaType: patch.mediaType }))
+
+    renderWantedPage()
+
+    const formatSelect = await screen.findByRole('combobox', { name: 'Change format for Dune' })
+    expect(screen.getByText('Ebook · Romanian · Wanted')).toBeInTheDocument()
+    expect(screen.getByText('common.audiobook · Romanian · Wanted')).toBeInTheDocument()
+
+    fireEvent.change(formatSelect, { target: { value: 'ebook' } })
+    await waitFor(() => {
+      expect(api.listWantedPage).toHaveBeenCalledTimes(2)
+      expect(formatSelect).toHaveValue('ebook')
+      expect(screen.getByText('Ebook · Romanian · Wanted')).toBeInTheDocument()
+      expect(screen.queryByText('common.audiobook · Romanian · Wanted')).not.toBeInTheDocument()
+    })
+
+    fireEvent.change(formatSelect, { target: { value: 'both' } })
+    await waitFor(() => {
+      expect(api.listWantedPage).toHaveBeenCalledTimes(3)
+      expect(formatSelect).toHaveValue('both')
+      expect(screen.getByText('Ebook · Romanian · Wanted')).toBeInTheDocument()
+      expect(screen.getByText('common.audiobook · Romanian · Wanted')).toBeInTheDocument()
+    })
+  })
+
   it('selecting a row drives the bulk action bar and select-all toggles every row', async () => {
     vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([
       makeBook({ id: 1, title: 'Dune' }),

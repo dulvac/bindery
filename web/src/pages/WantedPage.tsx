@@ -207,8 +207,10 @@ export default function WantedPage() {
 
   const changeMediaType = async (book: Book, mediaType: 'ebook' | 'audiobook' | 'both') => {
     try {
-      const updated = await api.updateBook(book.id, { mediaType })
-      setBooks(books.map(b => b.id === book.id ? updated : b))
+      await api.updateBook(book.id, { mediaType })
+      // PUT returns a plain Book without variants; reload Wanted so its row,
+      // count and copy labels reflect the currently requested formats.
+      fetchPage().catch(console.error)
     } catch (err) {
       alert(errorText(err, t('wanted.updateFailed', 'Failed to update')))
     }
