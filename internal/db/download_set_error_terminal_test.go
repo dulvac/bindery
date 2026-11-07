@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/vavallee/bindery/internal/models"
@@ -39,9 +40,18 @@ func TestSetErrorStaleImportSnapshotCannotOverwriteParkedTorrent(t *testing.T) {
 	if err != nil || parked == nil || parked.Status != models.StateImportBlocked || parked.DeadAt == nil || parked.ErrorMessage == "" {
 		t.Fatalf("parked download = %+v, %v", parked, err)
 	}
+	// A stale poll must not even attempt the variant write: a trigger would
+	// reject it if the guarded download transition incorrectly continued.
+	if _, err := repo.db.ExecContext(ctx, `CREATE TRIGGER reject_stale_variant_release BEFORE UPDATE OF status ON book_variants
+		BEGIN SELECT RAISE(ABORT, 'unexpected variant release'); END`); err != nil {
+		t.Fatal(err)
+	}
 	var invalid models.ErrInvalidTransition
 	if err := repo.SetError(ctx, rows[0].ID, "stale qBittorrent client error"); !errors.As(err, &invalid) {
 		t.Fatalf("stale client error was accepted: %v", err)
+	}
+	if _, err := repo.db.ExecContext(ctx, `DROP TRIGGER reject_stale_variant_release`); err != nil {
+		t.Fatal(err)
 	}
 	after, err := repo.GetByID(ctx, dl.ID)
 	if err != nil || after == nil || after.Status != models.StateImportBlocked || after.ErrorMessage != parked.ErrorMessage ||
@@ -59,6 +69,58 @@ func TestSetErrorStaleImportSnapshotCannotOverwriteParkedTorrent(t *testing.T) {
 	}
 	if ok, err := repo.RetryReviewedImport(ctx, book.ID, variant.ID, dl.ID, 42, "retry retained torrent"); err != nil || !ok {
 		t.Fatalf("stale error broke named existing-torrent retry: %t %v", ok, err)
+	}
+}
+
+// A failed variant release must roll back the already-guarded download
+// transition, including its error reason and re-grab cooldown timestamp.
+func TestSetErrorVariantReconcileFailureRollsBackActiveDownload(t *testing.T) {
+	database, _, book := openTestDB(t)
+	ctx := context.Background()
+	variants := NewBookVariantRepo(database)
+	copies, err := variants.EnsureWanted(ctx, book.ID, models.MediaTypeEbook, []string{"eng"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := NewDownloadRepo(database)
+	dl := &models.Download{GUID: "atomic-failure", BookID: &book.ID, VariantID: &copies[0].ID,
+		Title: "Sample Book [ENG / EPUB]", Protocol: "usenet", Status: models.StateGrabbed,
+		ErrorMessage: "previous note"}
+	if err := repo.Create(ctx, dl); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpdateStatus(ctx, dl.ID, models.StateDownloading); err != nil {
+		t.Fatal(err)
+	}
+	if marked, err := variants.MarkDownloading(ctx, copies[0].ID); err != nil || !marked {
+		t.Fatalf("mark variant downloading: %t %v", marked, err)
+	}
+	if _, err := database.ExecContext(ctx, `CREATE TRIGGER reject_failed_release BEFORE UPDATE OF status ON book_variants
+		WHEN NEW.status = 'wanted' BEGIN SELECT RAISE(ABORT, 'reconcile rejected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetError(ctx, dl.ID, "client gave up"); err == nil || !strings.Contains(err.Error(), "reconcile rejected") {
+		t.Fatalf("failed variant reconciliation = %v, want trigger error", err)
+	}
+	row, err := repo.GetByID(ctx, dl.ID)
+	if err != nil || row == nil || row.Status != models.StateDownloading || row.ErrorMessage != "previous note" || row.DeadAt != nil {
+		t.Fatalf("failed reconciliation partially committed download: %+v %v", row, err)
+	}
+	if got := terminalVariantStatus(t, variants, book.ID); got != models.VariantDownloading {
+		t.Fatalf("failed reconciliation changed variant: %q", got)
+	}
+	if _, err := database.ExecContext(ctx, `DROP TRIGGER reject_failed_release`); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetError(ctx, dl.ID, "client gave up"); err != nil {
+		t.Fatalf("retry after database repair: %v", err)
+	}
+	row, err = repo.GetByID(ctx, dl.ID)
+	if err != nil || row == nil || row.Status != models.StateFailed || row.ErrorMessage != "client gave up" || row.DeadAt == nil {
+		t.Fatalf("accepted failure did not persist download: %+v %v", row, err)
+	}
+	if got := terminalVariantStatus(t, variants, book.ID); got != models.VariantWanted {
+		t.Fatalf("accepted failure did not release variant: %q", got)
 	}
 }
 

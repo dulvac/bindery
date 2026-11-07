@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/downloader"
+	"github.com/vavallee/bindery/internal/indexer/newznab"
 	"github.com/vavallee/bindery/internal/models"
 )
 
@@ -116,6 +118,90 @@ func TestStallPollStaleSnapshotDoesNotActOnReviewedTorrent(t *testing.T) {
 	spy.mu.Unlock()
 	if searches != 0 || *sends != 0 || unexpected.Load() != 0 || webhooks != 0 {
 		t.Fatalf("stale stall triggered search/send/webhook or changed client: searches=%d sends=%d webhooks=%d unexpected=%d", searches, *sends, webhooks, unexpected.Load())
+	}
+}
+
+// A variant UPDATE failure must roll back a stalled download before the
+// non-qBittorrent client removal, blocklist, history or new search can run.
+func TestStallHandlerReconcileFailureSkipsAllEffects(t *testing.T) {
+	f := newWantedQueueFixture(t)
+	ctx := f.ctx
+	book := f.book("Dune", models.MediaTypeEbook)
+	variants := f.books.VariantRepo()
+	copies, err := variants.EnsureWanted(ctx, book.ID, models.MediaTypeEbook, []string{"eng"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	t.Cleanup(server.Close)
+	host, port := stallServerHostPort(t, server.URL)
+	clients := db.NewDownloadClientRepo(f.database)
+	client := &models.DownloadClient{Name: "transmission", Type: "transmission", Host: host, Port: port, Enabled: true}
+	if err := clients.Create(ctx, client); err != nil {
+		t.Fatal(err)
+	}
+	indexers := db.NewIndexerRepo(f.database)
+	idx := &models.Indexer{Name: "test", Type: "newznab", URL: server.URL, Enabled: true}
+	if err := indexers.Create(ctx, idx); err != nil {
+		t.Fatal(err)
+	}
+	hash := "unremoved-job"
+	dl := &models.Download{GUID: "atomic-stall", Title: "Dune [ENG / EPUB]", BookID: &book.ID,
+		VariantID: &copies[0].ID, IndexerID: &idx.ID, DownloadClientID: &client.ID,
+		TorrentID: &hash, Status: models.StateGrabbed, Protocol: "torrent"}
+	if err := f.downloads.Create(ctx, dl); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.downloads.UpdateStatus(ctx, dl.ID, models.StateDownloading); err != nil {
+		t.Fatal(err)
+	}
+	if marked, err := variants.MarkDownloading(ctx, copies[0].ID); err != nil || !marked {
+		t.Fatalf("mark variant downloading: %t %v", marked, err)
+	}
+	snapshot, err := f.downloads.GetByID(ctx, dl.ID)
+	if err != nil || snapshot == nil {
+		t.Fatalf("snapshot download: %+v %v", snapshot, err)
+	}
+	if _, err := f.database.ExecContext(ctx, `CREATE TRIGGER reject_stall_release BEFORE UPDATE OF status ON book_variants
+		WHEN NEW.status = 'wanted' BEGIN SELECT RAISE(ABORT, 'reconcile rejected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	search := &variantResultsSearcher{results: map[string][]newznab.SearchResult{}}
+	spy := &spyNotifier{}
+	s := &Scheduler{books: f.books, downloads: f.downloads, clients: clients, indexers: indexers,
+		authors: db.NewAuthorRepo(f.database), settings: db.NewSettingsRepo(f.database),
+		blocklist: db.NewBlocklistRepo(f.database), history: db.NewHistoryRepo(f.database), searcher: search}
+	s.WithNotifier(spy)
+	s.handleStalledDownload(ctx, snapshot, client, downloader.StallClientReported)
+	s.bgWg.Wait()
+	row, err := f.downloads.GetByID(ctx, dl.ID)
+	if err != nil || row == nil || row.Status != models.StateDownloading || row.ErrorMessage != "" || row.DeadAt != nil {
+		t.Errorf("failed release partially committed download: %+v %v", row, err)
+	}
+	current, err := variants.ListByBook(ctx, book.ID)
+	if err != nil || len(current) != 1 || current[0].Status != models.VariantDownloading {
+		t.Errorf("failed release changed variant: %+v %v", current, err)
+	}
+	if blocked, err := s.blocklist.IsBlocked(ctx, dl.GUID); err != nil || blocked {
+		t.Errorf("failed release blocklisted GUID: %t %v", blocked, err)
+	}
+	for _, kind := range []string{models.HistoryEventDownloadStalled, models.HistoryEventDownloadRequeued} {
+		if events, err := s.history.ListByType(ctx, kind); err != nil || len(events) != 0 {
+			t.Errorf("failed release wrote %s history: %+v %v", kind, events, err)
+		}
+	}
+	search.mu.Lock()
+	searches := len(search.calls)
+	search.mu.Unlock()
+	spy.mu.Lock()
+	webhooks := len(spy.calls)
+	spy.mu.Unlock()
+	if got := requests.Load(); got != 0 || searches != 0 || webhooks != 0 {
+		t.Errorf("failed release attempted client removal/search/webhook: requests=%d searches=%d webhooks=%d", got, searches, webhooks)
 	}
 }
 

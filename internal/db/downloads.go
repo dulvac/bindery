@@ -777,7 +777,7 @@ func (r *DownloadRepo) UpdateStatus(ctx context.Context, id int64, next models.D
 		return models.ErrInvalidTransition{From: current, To: next}
 	}
 	if next == models.StateFailed {
-		return r.releaseFailedVariant(ctx, id)
+		return releaseFailedVariant(ctx, r.db, id)
 	}
 	return nil
 }
@@ -853,10 +853,15 @@ func (r *DownloadRepo) SetImportPath(ctx context.Context, id int64, path string)
 // cooldown (#2710). The status predicate is the write-time guard: a poll with
 // an old snapshot must not turn a parked importBlocked torrent into failed,
 // erase its import reason, or undo a named review decision. Exhausted
-// importFailed rows are also no longer active. Only release the variant when
-// the guarded download update actually succeeds.
+// importFailed rows are also no longer active. The guarded write and variant
+// release commit together; a failed reconciliation rolls back both rows.
 func (r *DownloadRepo) SetError(ctx context.Context, id int64, errMsg string) error {
-	result, err := r.db.ExecContext(ctx,
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin download failure transition: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.ExecContext(ctx,
 		"UPDATE downloads SET status=?, error_message=?, dead_at=? WHERE id=? AND "+variantActiveSQL,
 		models.StateFailed, errMsg, time.Now().UTC(), id)
 	if err != nil {
@@ -868,19 +873,27 @@ func (r *DownloadRepo) SetError(ctx context.Context, id int64, errMsg string) er
 	}
 	if affected == 0 {
 		var current models.DownloadState
-		if err := r.db.QueryRowContext(ctx, "SELECT status FROM downloads WHERE id=?", id).Scan(&current); err != nil {
+		if err := tx.QueryRowContext(ctx, "SELECT status FROM downloads WHERE id=?", id).Scan(&current); err != nil {
 			return fmt.Errorf("lookup download after rejected error: %w", err)
 		}
 		return models.ErrInvalidTransition{From: current, To: models.StateFailed}
 	}
-	return r.releaseFailedVariant(ctx, id)
+	if err := releaseFailedVariant(ctx, tx, id); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit download failure transition: %w", err)
+	}
+	return nil
 }
 
-func (r *DownloadRepo) releaseFailedVariant(ctx context.Context, downloadID int64) error {
+// releaseFailedVariant runs through its caller's executor. SetError passes
+// its transaction so the failure and variant release cannot commit apart.
+func releaseFailedVariant(ctx context.Context, exec dbExecutor, downloadID int64) error {
 	// The last live claim may die after a sibling import already exhausted its
 	// budget. Keep that old failed torrent in review rather than silently
 	// releasing the variant to another scheduled grab.
-	_, err := r.db.ExecContext(ctx, `UPDATE book_variants SET status = CASE
+	_, err := exec.ExecContext(ctx, `UPDATE book_variants SET status = CASE
 		WHEN EXISTS (SELECT 1 FROM book_files f WHERE f.variant_id = book_variants.id
 			AND f.book_id = book_variants.book_id AND f.format = book_variants.media_type
 			AND (f.verification = 'verified' AND f.language = book_variants.language

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -15,6 +16,90 @@ import (
 	"github.com/vavallee/bindery/internal/models"
 	"github.com/vavallee/bindery/internal/notifier"
 )
+
+// A client send error cannot report a failed grab when the variant release
+// fails in SQLite: the download must stay active and no event may be emitted.
+func TestQueueGrabSendFailureReconcileErrorLeavesBothRowsAndNoEvents(t *testing.T) {
+	t.Cleanup(httpsec.AllowLoopbackForTests())
+	ctx := context.Background()
+	var database *sql.DB
+	var variantID int64
+	var sends atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, ".nzb"):
+			w.Header().Set("Content-Type", "application/x-nzb")
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><nzb></nzb>`))
+		case r.URL.Path == "/api" && r.URL.Query().Get("mode") == "addfile":
+			sends.Add(1)
+			if marked, err := db.NewBookVariantRepo(database).MarkDownloading(ctx, variantID); err != nil || !marked {
+				t.Errorf("mark variant downloading during client send: %t %v", marked, err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if _, err := database.ExecContext(ctx, `CREATE TRIGGER reject_send_release BEFORE UPDATE OF status ON book_variants
+				WHEN NEW.status = 'wanted' BEGIN SELECT RAISE(ABORT, 'reconcile rejected'); END`); err != nil {
+				t.Errorf("install variant failure: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": false})
+		default:
+			t.Errorf("unexpected client request: %s?%s", r.URL.Path, r.URL.RawQuery)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(server.Close)
+	h, store, book, _ := categoryFixture(t, server.URL)
+	database = store
+	variants := h.books.VariantRepo()
+	copies, err := variants.EnsureWanted(ctx, book.ID, models.MediaTypeEbook, []string{"eng"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	variantID = copies[0].ID
+
+	var webhooks atomic.Int32
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload["eventType"] != notifier.EventDownloadFailed {
+			t.Errorf("unexpected webhook: %+v %v", payload, err)
+		}
+		webhooks.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(webhook.Close)
+	if err := db.NewNotificationRepo(database).Create(ctx, &models.Notification{
+		Name: "failure hook", Type: "webhook", URL: webhook.URL, Method: http.MethodPost, OnFailure: true, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	n := notifier.New(db.NewNotificationRepo(database))
+	n.SetValidator(nil)
+	h.WithNotifier(n)
+
+	_, err = h.grab(ctx, grabRequest{GUID: "atomic-send", Title: "Zogarth - The Primal Hunter 9 [ENG / EPUB]",
+		NZBURL: server.URL + "/file.nzb", BookID: &book.ID, VariantID: &variantID,
+		Protocol: "usenet", MediaType: models.MediaTypeEbook})
+	if !errors.Is(err, errSendFailed) {
+		t.Fatalf("send result = %v, want send failure", err)
+	}
+	if got := sends.Load(); got != 1 {
+		t.Errorf("client received %d sends, want one", got)
+	}
+	row, err := h.downloads.GetByGUID(ctx, "atomic-send")
+	if err != nil || row == nil || row.Status != models.StateGrabbed || row.ErrorMessage != "" || row.DeadAt != nil {
+		t.Errorf("failed release partially committed download: %+v %v", row, err)
+	}
+	current, err := variants.ListByBook(ctx, book.ID)
+	if err != nil || len(current) != 1 || current[0].Status != models.VariantDownloading {
+		t.Errorf("failed release changed variant: %+v %v", current, err)
+	}
+	events, err := db.NewHistoryRepo(database).ListByType(ctx, models.HistoryEventDownloadFailed)
+	if err != nil || len(events) != 0 || webhooks.Load() != 0 {
+		t.Errorf("failed release published failure: events=%+v err=%v webhooks=%d", events, err, webhooks.Load())
+	}
+}
 
 // A client error is still returned to the caller, but failure history and
 // webhooks describe only a failure that actually changed the download row.
