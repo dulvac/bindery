@@ -133,6 +133,68 @@ func TestVariantStaleQbitErrorAfterParkKeepsNamedRetryAndNoFalseEvent(t *testing
 	}
 }
 
+// The importer can retain an importFailed snapshot across a named new-release
+// decision. Its late failure must not announce an error or restart the old
+// torrent; the next read-only qBittorrent poll must still leave it parked.
+func TestVariantStaleImportFailureAfterParkDoesNotPublishOrRepollOldTorrent(t *testing.T) {
+	f := newVariantReviewFixture(t, "English catalogue label", "Sample Author", models.MediaTypeEbook, "eng")
+	source := variantEPUBSource(t, f.sources, "English catalogue label.epub", "english.epub")
+	before, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dl, mutators := terminalQbitDownload(t, f, "English catalogue label [ENG / EPUB]", source, source, nil)
+	for _, next := range []models.DownloadState{models.StateCompleted, models.StateImportPending, models.StateImporting} {
+		if err := f.downloads.UpdateStatus(f.ctx, dl.ID, next); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < db.ImportRetryLimit; i++ {
+		if err := f.downloads.IncrementImportRetryCount(f.ctx, dl.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.downloads.RecoverInterruptedImports(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	old, err := f.downloads.GetByID(f.ctx, dl.ID) // old importer snapshot
+	if err != nil || old == nil || old.Status != models.StateImportFailed || old.ErrorMessage == "" {
+		t.Fatalf("old import snapshot: %+v %v", old, err)
+	}
+	if ok, err := f.books.VariantRepo().RetryReviewed(f.ctx, f.book.ID, f.variant.ID, 42, "seek another release"); err != nil || !ok {
+		t.Fatalf("park old torrent: %t %v", ok, err)
+	}
+	spy := &spyNotifier{}
+	f.scanner.notif = spy
+	f.scanner.failImport(f.ctx, old, models.StateImportFailed, "stale importer failed after review")
+	client, err := db.NewDownloadClientRepo(f.database).GetByID(f.ctx, *dl.DownloadClientID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.scanner.checkQbittorrentDownloads(f.ctx, client)
+	row, err := f.downloads.GetByID(f.ctx, dl.ID)
+	if err != nil || row == nil || row.Status != models.StateImportBlocked || row.ErrorMessage != old.ErrorMessage ||
+		row.TorrentID == nil || old.TorrentID == nil || *row.TorrentID != *old.TorrentID || row.ImportRetryCount != db.ImportRetryLimit || !row.BlocksAutoRegrab() {
+		t.Fatalf("late import failure or fake poll rewrote parked torrent: %+v %v", row, err)
+	}
+	wanted, err := f.books.VariantRepo().ListWanted(f.ctx)
+	if err != nil || len(wanted) != 1 || wanted[0].ID != f.variant.ID {
+		t.Fatalf("late import failure reversed named new-release decision: %+v %v", wanted, err)
+	}
+	events, err := f.history.ListByBook(f.ctx, f.book.ID)
+	if err != nil || len(events) != 1 || events[0].EventType != "variantReviewRetried" || spy.lookup(notifierEventDownloadFailed) != nil {
+		t.Fatalf("false history or webhook for refused stale transition: %+v %v, webhook=%+v", events, err, spy.calls)
+	}
+	f.assertLibraryFiles(t, 0)
+	assertTerminalSourceUnchanged(t, source, before, mutators)
+	if err := f.books.VariantRepo().SetStatus(f.ctx, f.variant.ID, models.VariantReview); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := f.downloads.RetryReviewedImport(f.ctx, f.book.ID, f.variant.ID, dl.ID, 42, "retry retained torrent"); err != nil || !ok {
+		t.Fatalf("named existing-torrent retry no longer available: %t %v", ok, err)
+	}
+}
+
 // SAB shares SetError with qBittorrent. The guard must still accept a real
 // active usenet failure, release its claim, and announce the successful write.
 func TestVariantActiveSABErrorStillFailsAndEmitsEvent(t *testing.T) {

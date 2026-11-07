@@ -470,7 +470,9 @@ func TestVariantImport_WrongLanguageRejectsOnlyExactFileAndRequestedVariant(t *t
 			if next == "Romanian source" {
 				f.assertVariantPlaced(t, nextDownload)
 			} else {
-				variantBlocked(t, f, nextDownload, "in review")
+				// The blocked English download cannot re-enter via a generic
+				// import. Keep its original rejection reason until a named retry.
+				variantBlocked(t, f, nextDownload, "ebook text language rum differs from requested eng")
 				f.assertLibraryFiles(t, 0)
 			}
 			if _, err := os.Lstat(source); err != nil {

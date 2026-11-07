@@ -1569,7 +1569,14 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 		s.testImportHook(dl, downloadPath, cleanupClientType, explicitFiles)
 		return
 	}
-	s.updateDownloadStatus(ctx, dl.ID, models.StateImportPending)
+	// Synthetic manual imports have no download row to claim. Persisted
+	// downloads must make the transition before any file can be placed.
+	if dl.ID > 0 {
+		if err := s.downloads.UpdateStatus(ctx, dl.ID, models.StateImportPending); err != nil {
+			slog.Warn("failed to update download status", "download_id", dl.ID, "status", models.StateImportPending, "error", err)
+			return // do not place a file when a stale snapshot cannot claim this import
+		}
+	}
 	if s.libraryDir == "" {
 		slog.Warn("no library directory configured, skipping import")
 		// Walk through importing before blocking: completed/importPending

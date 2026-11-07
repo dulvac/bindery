@@ -759,8 +759,15 @@ func (r *DownloadRepo) UpdateStatus(ctx context.Context, id int64, next models.D
 		// This is also the branch a row dies on (grabbed/downloading ->
 		// failed, importing -> importBlocked) and the one a blocked row is
 		// re-armed on, so dead_at is stamped or cleared here (#2710).
+		where := "id=? AND status=?"
+		if current == models.StateImportBlocked && next == models.StateImportPending {
+			// Only the named RetryReviewedImport transaction may rearm a blocked
+			// variant. Keep this condition in the write itself, alongside the
+			// status CAS, so a stale importer cannot claim a parked torrent.
+			where += " AND variant_id IS NULL"
+		}
 		result, err = r.db.ExecContext(ctx,
-			"UPDATE downloads SET status=?, dead_at=? WHERE id=? AND status=?",
+			"UPDATE downloads SET status=?, dead_at=? WHERE "+where,
 			next, deadStamp(next, now), id, current)
 	}
 	if err != nil {
@@ -922,13 +929,16 @@ func (r *DownloadRepo) SetErrorWithStatus(ctx context.Context, id int64, status 
 	defer func() { _ = tx.Rollback() }()
 	var current models.DownloadState
 	var retries int
-	if err := tx.QueryRowContext(ctx, "SELECT status, import_retry_count FROM downloads WHERE id=?", id).Scan(&current, &retries); err != nil {
+	var variantID sql.NullInt64
+	if err := tx.QueryRowContext(ctx, "SELECT status, import_retry_count, variant_id FROM downloads WHERE id=?", id).Scan(&current, &retries, &variantID); err != nil {
 		return fmt.Errorf("lookup current state: %w", err)
 	}
-	if current == models.StateImportBlocked && status == current {
-		// A poll may have read importFailed before RetryReviewed parked it in
-		// importBlocked. Its stale terminal write must not reconcile the newly
-		// wanted copy back to review or publish another failure event.
+	if current == models.StateImportBlocked && (status == current || status == models.StateImportFailed && variantID.Valid) {
+		// A stale importer may have read importFailed before RetryReviewed
+		// parked the variant's old torrent. Neither another block nor the
+		// generic blocked -> importFailed edge may undo that named decision.
+		// Legacy downloads without a variant retain their manual retry path;
+		// the named RetryReviewedImport re-arms variant torrents separately.
 		return models.ErrInvalidTransition{From: current, To: status}
 	}
 	if current != status && !current.CanTransitionTo(status) {

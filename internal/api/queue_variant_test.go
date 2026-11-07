@@ -166,6 +166,11 @@ func TestQueueVariantGrab_ExactTitleWrongAuthorCannotImportFromFakeClient(t *tes
 	if err := os.WriteFile(source, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// The fake client has finished writing the file. The real poller marks
+	// the download completed before handing it to the importer.
+	if err := h.downloads.UpdateStatus(ctx, dl.ID, models.StateCompleted); err != nil {
+		t.Fatalf("complete fake download before import: %v", err)
+	}
 	scanner := importer.NewScanner(h.downloads, db.NewDownloadClientRepo(database), h.books,
 		db.NewAuthorRepo(database), db.NewHistoryRepo(database), library, library, "", "", "")
 	scanner.ImportFilesFromPath(ctx, dl, folder, []string{source}, "")
