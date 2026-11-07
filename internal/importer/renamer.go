@@ -1619,6 +1619,18 @@ var (
 // fallback without a second real filesystem. Production always uses os.Link.
 var osLink = os.Link
 
+// verifyStrictHardlink refuses symlink leaves and confirms that the public
+// entry still names the source inode. Check both before promotion (source vs
+// private stage) and after it (source vs public entry) before a DB claim.
+func verifyStrictHardlink(src, linked string) error {
+	source, srcErr := os.Lstat(src)
+	entry, linkErr := os.Lstat(linked)
+	if srcErr != nil || linkErr != nil || !source.Mode().IsRegular() || !sameAssessedSource(source, entry) {
+		return fmt.Errorf("strict hardlink changed or unsafe: source %q, linked %q: %w", src, linked, errors.Join(srcErr, linkErr, errors.New("inode or file type mismatch")))
+	}
+	return nil
+}
+
 // MoveFileCtx is like MoveFile but returns ctx.Err() if the context is
 // cancelled during the cross-filesystem copy phase.
 func MoveFileCtx(ctx context.Context, src, dst string) error {
@@ -1659,22 +1671,19 @@ func CopyFileCtx(ctx context.Context, src, dst string) error {
 	return copyFileCtx(ctx, src, dst)
 }
 
-// StagedImport places src at a sibling of dst (the "staging" path) so the
-// caller can write a book_files row pointing at dst before any user-visible
-// file appears at dst, then atomically promote it via the returned commit
-// function. This is the importer-atomicity primitive used by Wave 4 finding
-// 23 to close the move-then-DB-update gap: previously the importer landed
-// the file at its final destination first and wrote the DB row second, which
-// meant a transient SQLite error left the file orphaned on disk with no
-// book_files row — the user saw "not imported" in the queue and re-grabbed,
-// silently duplicating the file under " (2)".
+// StagedImport places src at a sibling of dst (the "staging" path). Non-strict
+// callers write a book_files row before commit atomically promotes the file;
+// strict hardlink callers must publish and verify the link BEFORE claiming
+// the path in book_files, because failed promotion cannot safely roll back a
+// claim on a public path. The DB-first mode closes the move-then-DB-update
+// gap (Wave 4 finding 23); strict mode instead leaves a verified, untracked
+// public link for audit if its later DB write fails.
 //
 // The contract:
 //
 //   - On success Stage produces a file at a path inside filepath.Dir(dst)
-//     whose name is dst's basename plus a per-call random suffix. The caller
-//     can now perform any DB work that should be reversible without leaving
-//     a half-imported file in the library.
+//     whose name is dst's basename plus a per-call random suffix. Non-strict
+//     callers can now perform reversible DB work before making it public.
 //   - commit atomically promotes the staged file: os.Rename for non-strict
 //     modes, or a no-replace hardlink for hardlink-strict. The stage and dst
 //     normally share a directory; a final link failure, including EXDEV,
@@ -1750,6 +1759,9 @@ func StagedImport(ctx context.Context, mode, src, dst string) (stagedPath string
 	committed := false
 	commit = func() error {
 		if mode == "hardlink-strict" {
+			if err := verifyStrictHardlink(src, staged); err != nil {
+				return fmt.Errorf("strict staging verification: %w", err)
+			}
 			// os.Rename would replace an untracked library file or symlink.
 			// Link instead: EEXIST also protects a destination created after
 			// staging, without ever unlinking the shared public path.
@@ -1758,8 +1770,8 @@ func StagedImport(ctx context.Context, mode, src, dst string) (stagedPath string
 			}
 			committed = true
 			if err := os.Remove(staged); err != nil {
-				// The public link is already placed and tracked. Do not report
-				// failure or unlink it just because private-stage cleanup failed.
+				// The public link is already placed, but tracking comes next.
+				// Do not report failure or unlink it over private cleanup.
 				slog.Warn("could not remove private staged hardlink after promotion", "staged", staged, "error", err)
 			}
 			return nil
@@ -1795,11 +1807,15 @@ func StagedImport(ctx context.Context, mode, src, dst string) (stagedPath string
 			// importer keep tripping over.
 			if err := os.Rename(staged, src); err == nil {
 				return
+			} else {
+				slog.Warn("could not restore source from private staged file", "src", src, "staged", staged, "error", err)
 			}
 		}
 		// Cross-fs path: src is still in place; just delete the staged
 		// copy. The src survives untouched and a retry can re-import it.
-		_ = os.Remove(staged)
+		if err := os.Remove(staged); err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("could not remove private staged file after failed import", "staged", staged, "error", err)
+		}
 	}
 	return staged, commit, rollback, nil
 }

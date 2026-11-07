@@ -354,18 +354,11 @@ func TestCheckQbittorrentDownloads_MissingContentPathDoesNotFallBackToSaveRoot(t
 	}
 }
 
-// TestCheckQbittorrentDownloads_ContentPathGoneAlreadyImported is the
-// regression test for #769 (part 1 — content_path missing path).
-//
-// Scenario: a book was previously downloaded, imported with move mode (files
-// now live in the library), then re-grabbed. qBittorrent already holds the
-// torrent (409) so the hash is recovered and a new Download record is created
-// in StateGrabbed. By the next poll cycle the torrent is seeding but
-// content_path is absent AND Join(SavePath, Name) doesn't exist on disk (files
-// were moved to the library). The scanner must detect that the book is already
-// in the library and mark the Download StateImported rather than looping
-// forever in StateGrabbed.
-func TestCheckQbittorrentDownloads_ContentPathGoneAlreadyImported(t *testing.T) {
+// A tracked ebook does not prove a missing qBittorrent seed was imported:
+// the public name could have been replaced. Keep the download retryable until
+// its source can be checked against the public inode (unlike the older #769
+// shortcut, which accepted any tracked book-level file).
+func TestCheckQbittorrentDownloads_ContentPathGoneNotAssumedImported(t *testing.T) {
 	saveRoot := t.TempDir()
 	libraryDir := t.TempDir()
 
@@ -455,9 +448,12 @@ func TestCheckQbittorrentDownloads_ContentPathGoneAlreadyImported(t *testing.T) 
 	if err != nil {
 		t.Fatalf("get download: %v", err)
 	}
-	if got.Status != models.StateImported {
-		t.Errorf("#769 regression: expected status %q (book already in library), got %q",
-			models.StateImported, got.Status)
+	if got.Status != models.StateImportFailed {
+		t.Errorf("missing qBittorrent seed must remain unverified: status %q, want %q",
+			got.Status, models.StateImportFailed)
+	}
+	if b, err := os.ReadFile(libEpub); err != nil || string(b) != "epub-in-library" {
+		t.Fatalf("existing public file changed: %q, %v", b, err)
 	}
 }
 
@@ -530,15 +526,9 @@ func TestTryImportInternal_EmptyPathAlreadyImported(t *testing.T) {
 	}
 }
 
-// TestCheckQbittorrentDownloads_ImportFailedContentPathGoneAlreadyImported
-// covers the StateImportFailed retry branch of checkQbittorrentDownloads when
-// content_path is absent and the book is already in the library (#769).
-//
-// Scenario: a prior import attempt left the download in StateImportFailed
-// (e.g. the path was temporarily missing). The book is now confirmed on disk.
-// On the next retry cycle the scanner must mark it StateImported rather than
-// incrementing the retry counter and looping again.
-func TestCheckQbittorrentDownloads_ImportFailedContentPathGoneAlreadyImported(t *testing.T) {
+// A failed qBittorrent ebook import stays failed when its source is still
+// missing: a book-level tracked file cannot prove that download's inode.
+func TestCheckQbittorrentDownloads_ImportFailedContentPathGoneNotAssumedImported(t *testing.T) {
 	saveRoot := t.TempDir()
 	libraryDir := t.TempDir()
 
@@ -625,12 +615,15 @@ func TestCheckQbittorrentDownloads_ImportFailedContentPathGoneAlreadyImported(t 
 	if err != nil {
 		t.Fatalf("get download: %v", err)
 	}
-	if got.Status != models.StateImported {
-		t.Errorf("#769 regression (StateImportFailed branch): expected status %q (book already in library), got %q",
-			models.StateImported, got.Status)
+	if got.Status != models.StateImportFailed {
+		t.Errorf("missing qBittorrent seed must remain unverified: status %q, want %q",
+			got.Status, models.StateImportFailed)
 	}
 	if got.ImportRetryCount != 0 {
-		t.Errorf("expected ImportRetryCount=0 (no retry when already imported), got %d", got.ImportRetryCount)
+		t.Errorf("no source was imported; unexpected retry increment %d", got.ImportRetryCount)
+	}
+	if b, err := os.ReadFile(libEpub); err != nil || string(b) != "epub-in-library" {
+		t.Fatalf("existing public file changed: %q, %v", b, err)
 	}
 }
 
@@ -638,7 +631,7 @@ func TestCheckQbittorrentDownloads_ImportFailedContentPathGoneAlreadyImported(t 
 func TestIsBookAlreadyImported_NilBookID(t *testing.T) {
 	s, _, _, ctx := scannerFixture(t, t.TempDir())
 	dl := &models.Download{GUID: "no-book", Status: models.StateGrabbed} // BookID is nil
-	if s.isBookAlreadyImported(ctx, dl, "") {
+	if s.isBookAlreadyImported(ctx, dl, "", false) {
 		t.Error("expected false for download with no BookID, got true")
 	}
 }
@@ -655,7 +648,7 @@ func TestIsBookAlreadyImported_BookNotFound(t *testing.T) {
 		Status: models.StateGrabbed,
 		BookID: &missingID,
 	}
-	if s.isBookAlreadyImported(ctx, dl, "") {
+	if s.isBookAlreadyImported(ctx, dl, "", false) {
 		t.Error("expected false for download whose book does not exist, got true")
 	}
 }
@@ -718,7 +711,7 @@ func TestIsBookAlreadyImported_MediaTypeBoth(t *testing.T) {
 				BookID:  &book.ID,
 				Quality: c.quality,
 			}
-			if got := s.isBookAlreadyImported(ctx, dl, c.formatHint); got != c.want {
+			if got := s.isBookAlreadyImported(ctx, dl, c.formatHint, false); got != c.want {
 				t.Errorf("isBookAlreadyImported(hint=%q, quality=%q) = %v, want %v",
 					c.formatHint, c.quality, got, c.want)
 			}

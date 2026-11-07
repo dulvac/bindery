@@ -59,8 +59,8 @@ func TestCheckQbittorrentDownloads_RemoveOnImportKeepsSharedTorrent(t *testing.T
 
 					fx.s.checkQbittorrentDownloads(fx.ctx, client)
 
-					if got := fx.status(t, dl.GUID); got.Status != models.StateImported {
-						t.Fatalf("download status = %q (%s), want imported", got.Status, got.ErrorMessage)
+					if got := fx.status(t, dl.GUID); got.Status != qbitExpectedState(sc) {
+						t.Fatalf("download status = %q (%s), want %q", got.Status, got.ErrorMessage, qbitExpectedState(sc))
 					}
 					if got := fx.status(t, other.GUID); got.Status != sib.status {
 						t.Fatalf("sibling status changed to %q", got.Status)

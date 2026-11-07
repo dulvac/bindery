@@ -558,11 +558,10 @@ func TestLanguageEnforcement_UndeclaredFileBesideDisallowedBlocks(t *testing.T) 
 	}
 }
 
-// TestLanguageEnforcement_UndeclaredFileBesideAllowedImports: once a file in
-// the release declares an allowed language the release is the right one, and
-// an undeclared EPUB in it is imported rather than skipped; the Swedish one is
-// still skipped. A release places one EPUB per book (one destination path), so
-// the undeclared file is named first here to show it is the one taken.
+// An allowed-language EPUB lets the undeclared one pass the language gate;
+// the Swedish file is skipped. The undeclared file is placed first. The next
+// source cannot replace it at the same strict qBittorrent destination, so the
+// download stays partial instead of reporting both as imported.
 func TestLanguageEnforcement_UndeclaredFileBesideAllowedImports(t *testing.T) {
 	for _, declared := range [][]string{nil, {"und"}} {
 		t.Run("declared="+strings.Join(declared, ","), func(t *testing.T) {
@@ -570,8 +569,33 @@ func TestLanguageEnforcement_UndeclaredFileBesideAllowedImports(t *testing.T) {
 			f.writeEpubDeclaring(t, "A.epub", declared...)
 			f.writeEpubDeclaring(t, "B.epub", "en")
 			f.writeEpubDeclaring(t, "C.epub", "sv")
+			first, err := os.Lstat(filepath.Join(f.dir, "A.epub"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			second, err := os.Lstat(filepath.Join(f.dir, "B.epub"))
+			if err != nil {
+				t.Fatal(err)
+			}
 			f.importDownload(t)
-			f.assertImported(t)
+			dl, _ := f.reload(t)
+			if dl.Status != models.StateImportFailed || !strings.Contains(dl.ErrorMessage, "partial import") {
+				t.Fatalf("download status = %q (%s), want partial after same-path collision", dl.Status, dl.ErrorMessage)
+			}
+			rows := f.bookFiles(t)
+			if len(rows) != 1 {
+				t.Fatalf("tracked %d files, want the first undeclared EPUB only", len(rows))
+			}
+			public, err := os.Lstat(rows[0].Path)
+			if err != nil || !os.SameFile(first, public) {
+				t.Fatalf("second EPUB replaced the first: %v", err)
+			}
+			if after, err := os.Lstat(filepath.Join(f.dir, "B.epub")); err != nil || !os.SameFile(second, after) {
+				t.Fatalf("allowed source changed: %v", err)
+			}
+			if f.blocked(t) {
+				t.Fatal("allowed release was blocklisted by the language gate")
+			}
 			placed := f.placedLanguages(t)
 			if len(placed) != 1 || len(definiteLanguages(placed[0])) != 0 {
 				t.Fatalf("placed files declare %v, want the one undeclared file", placed)

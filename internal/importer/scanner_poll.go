@@ -657,13 +657,12 @@ func (s *Scanner) checkQbittorrentDownloads(ctx context.Context, client *models.
 			rawPath, ok := resolveQbitContentPath(torrent)
 			if !ok {
 				// content_path is absent or points to a path that no longer exists.
-				// This can happen when files were moved to the library by a prior
-				// Bindery import (move mode) and the torrent is re-grabbed via a
-				// 409 duplicate-add (#769). If the book is already in the library,
-				// close out this download immediately rather than looping forever.
-				// Scoped to this torrent's format (#1885) so an imported audiobook
-				// never closes out the ebook grab of the same title.
-				if s.isBookAlreadyImported(ctx, &dl, downloader.FormatForCategory(client, torrent.Category)) {
+				// This can happen when an older move import emptied the torrent
+				// (#769). Other formats can still use the book-level tracked-file
+				// shortcut, scoped to this torrent's format (#1885). A legacy
+				// qBittorrent ebook cannot: without its source there is no inode
+				// proof that the tracked public file belongs to this torrent.
+				if s.isBookAlreadyImported(ctx, &dl, downloader.FormatForCategory(client, torrent.Category), true) {
 					slog.Info("qbittorrent: content path gone but book already in library — marking as imported",
 						"title", dl.Title)
 					// Walk the state machine from wherever we are to imported,
@@ -726,10 +725,9 @@ func (s *Scanner) checkQbittorrentDownloads(ctx context.Context, client *models.
 			// files — retry the import rather than leaving it stuck permanently.
 			rawPath, ok := resolveQbitContentPath(torrent)
 			if !ok {
-				// Same guard as the StateGrabbed branch: if the book is already in
-				// the library (files moved by a prior import), close out cleanly —
-				// for THIS torrent's format only (#1885).
-				if s.isBookAlreadyImported(ctx, &dl, downloader.FormatForCategory(client, torrent.Category)) {
+				// Same format-scoped guard as StateGrabbed. No-source legacy
+				// qBittorrent ebooks cannot use it without an inode comparison.
+				if s.isBookAlreadyImported(ctx, &dl, downloader.FormatForCategory(client, torrent.Category), true) {
 					slog.Info("qbittorrent: content path gone but book already in library — marking as imported",
 						"title", dl.Title)
 					s.updateDownloadStatus(ctx, dl.ID, models.StateImportPending)

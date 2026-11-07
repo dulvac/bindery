@@ -248,8 +248,8 @@ type qbitScenario struct {
 	// setup returns the torrent the fake lists, the files it reports and the
 	// status the download row starts in.
 	setup func(t *testing.T, fx *removeOnImportFixture) (torrent map[string]any, files []map[string]any, status models.DownloadState)
-	// wantLibraryCopy is true when the import itself places a file (the
-	// normal path); the shortcuts only close the row out.
+	// wantLibraryCopy is true when a real seed is available for import.
+	// The no-source cases stay failed, even with an existing book file.
 	wantLibraryCopy bool
 }
 
@@ -268,9 +268,8 @@ var qbitRemoveOnImportScenarios = []qbitScenario{
 		wantLibraryCopy: true,
 	},
 	{
-		// content_path gone, book already in library, row still in flight
-		// (scanner_poll.go, first "already in library" shortcut).
-		name: "already in library shortcut from downloading",
+		// A tracked ebook is no substitute for the missing seed.
+		name: "missing seed from downloading",
 		setup: func(t *testing.T, fx *removeOnImportFixture) (map[string]any, []map[string]any, models.DownloadState) {
 			fx.markAlreadyInLibrary(t)
 			return map[string]any{
@@ -280,8 +279,8 @@ var qbitRemoveOnImportScenarios = []qbitScenario{
 		},
 	},
 	{
-		// Same, reached from the importFailed retry branch (second shortcut).
-		name: "already in library shortcut from importFailed",
+		// Same, reached from the importFailed retry branch.
+		name: "missing seed from importFailed",
 		setup: func(t *testing.T, fx *removeOnImportFixture) (map[string]any, []map[string]any, models.DownloadState) {
 			fx.markAlreadyInLibrary(t)
 			return map[string]any{
@@ -290,6 +289,13 @@ var qbitRemoveOnImportScenarios = []qbitScenario{
 			}, nil, models.StateImportFailed
 		},
 	},
+}
+
+func qbitExpectedState(sc qbitScenario) models.DownloadState {
+	if sc.wantLibraryCopy {
+		return models.StateImported
+	}
+	return models.StateImportFailed
 }
 
 var qbitCategoryMatrix = []struct {
@@ -303,8 +309,8 @@ var qbitCategoryMatrix = []struct {
 }
 
 // TestCheckQbittorrentDownloads_RemoveOnImport keeps the source torrent in
-// qBittorrent on every imported path, even with RemoveOnImport enabled and
-// category drift or a category match.
+// qBittorrent whether the source is imported or cannot be verified, even with
+// RemoveOnImport enabled and category drift or a category match.
 func TestCheckQbittorrentDownloads_RemoveOnImport(t *testing.T) {
 	for _, sc := range qbitRemoveOnImportScenarios {
 		for _, cats := range qbitCategoryMatrix {
@@ -322,8 +328,8 @@ func TestCheckQbittorrentDownloads_RemoveOnImport(t *testing.T) {
 
 				fx.s.checkQbittorrentDownloads(fx.ctx, client)
 
-				if got := fx.status(t, dl.GUID); got.Status != models.StateImported {
-					t.Fatalf("download status = %q (%s), want imported", got.Status, got.ErrorMessage)
+				if got := fx.status(t, dl.GUID); got.Status != qbitExpectedState(sc) {
+					t.Fatalf("download status = %q (%s), want %q", got.Status, got.ErrorMessage, qbitExpectedState(sc))
 				}
 				if reqs := fake.deleteRequests(); len(reqs) != 0 {
 					t.Fatalf("qBittorrent interlock violated: got %d delete request(s): %v", len(reqs), reqs)
@@ -360,8 +366,8 @@ func TestCheckQbittorrentDownloads_RemoveOnImportOff(t *testing.T) {
 
 			fx.s.checkQbittorrentDownloads(fx.ctx, client)
 
-			if got := fx.status(t, dl.GUID); got.Status != models.StateImported {
-				t.Fatalf("download status = %q (%s), want imported", got.Status, got.ErrorMessage)
+			if got := fx.status(t, dl.GUID); got.Status != qbitExpectedState(sc) {
+				t.Fatalf("download status = %q (%s), want %q", got.Status, got.ErrorMessage, qbitExpectedState(sc))
 			}
 			if reqs := fake.deleteRequests(); len(reqs) != 0 {
 				t.Errorf("toggle off but the client got %d delete request(s): %v", len(reqs), reqs)
@@ -392,11 +398,11 @@ func TestCheckQbittorrentDownloads_RemoveOnImportFailureKeepsImport(t *testing.T
 				fx.s.checkQbittorrentDownloads(fx.ctx, client)
 
 				got := fx.status(t, dl.GUID)
-				if got.Status != models.StateImported {
-					t.Fatalf("interlock must not unwind import: status = %q (%s), want imported", got.Status, got.ErrorMessage)
+				if got.Status != qbitExpectedState(sc) {
+					t.Fatalf("interlock changed import status: status = %q (%s), want %q", got.Status, got.ErrorMessage, qbitExpectedState(sc))
 				}
-				if got.ErrorMessage != "" {
-					t.Errorf("unexpected error on download: %q", got.ErrorMessage)
+				if sc.wantLibraryCopy && got.ErrorMessage != "" {
+					t.Errorf("unexpected error on imported download: %q", got.ErrorMessage)
 				}
 				if reqs := fake.deleteRequests(); len(reqs) != 0 {
 					t.Errorf("qBittorrent interlock violated: got %d delete request(s): %v", len(reqs), reqs)

@@ -14,11 +14,10 @@ import (
 	"github.com/vavallee/bindery/internal/models"
 )
 
-// qbitReconcileFixture wires up an in-memory DB, a book already present in the
-// library (so the content-path-gone shortcut deterministically marks the
-// download imported once the torrent is found), and a download client. The
-// caller supplies the HTTP handler so each test controls the qBittorrent API
-// shape (category filtering, torrent state, etc.).
+// qbitReconcileFixture wires up an in-memory DB, an existing book file, and
+// a download client. Tests that expect import success provide a real torrent
+// source; a missing seed is not proof of import. The caller supplies the HTTP
+// handler to control category filtering, torrent state, and other API details.
 type qbitReconcileFixture struct {
 	scanner *Scanner
 	client  *models.DownloadClient
@@ -82,6 +81,15 @@ func newQbitReconcileFixture(t *testing.T, handler http.HandlerFunc, category, a
 	return &qbitReconcileFixture{scanner: s, client: client, dlRepo: dlRepo, book: book}
 }
 
+func reconcileQbitSeed(t *testing.T, dir string) string {
+	t.Helper()
+	source := filepath.Join(dir, "Recon Book.epub")
+	if err := os.WriteFile(source, bookSized("qbit reconcile seed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return source
+}
+
 // TestCheckQbittorrentDownloads_CompleteAtGrab_CategoryMiss is the core #969
 // regression test.
 //
@@ -98,6 +106,7 @@ func newQbitReconcileFixture(t *testing.T, handler http.HandlerFunc, category, a
 func TestCheckQbittorrentDownloads_CompleteAtGrab_CategoryMiss(t *testing.T) {
 	const torrentHash = "cr0ssseed1234567890cr0ssseed1234567890ab"
 	saveRoot := t.TempDir()
+	source := reconcileQbitSeed(t, saveRoot)
 
 	fx := newQbitReconcileFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -116,7 +125,7 @@ func TestCheckQbittorrentDownloads_CompleteAtGrab_CategoryMiss(t *testing.T) {
 					"amount_left":  0,
 					"category":     "crossseed",
 					"save_path":    saveRoot,
-					"content_path": "", // files live at the cross-seed location → "already imported" shortcut
+					"content_path": source, // a real seed at the cross-seed location
 				}})
 				return
 			}
@@ -166,6 +175,7 @@ func TestCheckQbittorrentDownloads_CompleteAtGrab_CategoryMiss(t *testing.T) {
 func TestCheckQbittorrentDownloads_NilHash_Backfill(t *testing.T) {
 	const torrentHash = "nilhash01234567890nilhash01234567890abcd"
 	saveRoot := t.TempDir()
+	source := reconcileQbitSeed(t, saveRoot)
 
 	fx := newQbitReconcileFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -180,7 +190,7 @@ func TestCheckQbittorrentDownloads_NilHash_Backfill(t *testing.T) {
 				"amount_left":  0,
 				"category":     "ebook",
 				"save_path":    saveRoot,
-				"content_path": "",
+				"content_path": source,
 			}})
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -222,6 +232,7 @@ func TestCheckQbittorrentDownloads_NilHash_Backfill(t *testing.T) {
 func TestCheckQbittorrentDownloads_NormalDownloadingToComplete(t *testing.T) {
 	const torrentHash = "normalpath1234567890normalpath1234567890"
 	saveRoot := t.TempDir()
+	source := reconcileQbitSeed(t, saveRoot)
 
 	fx := newQbitReconcileFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -242,7 +253,7 @@ func TestCheckQbittorrentDownloads_NormalDownloadingToComplete(t *testing.T) {
 				"amount_left":  0,
 				"category":     "ebook",
 				"save_path":    saveRoot,
-				"content_path": "",
+				"content_path": source,
 			}})
 		default:
 			w.WriteHeader(http.StatusNotFound)

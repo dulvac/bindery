@@ -5,8 +5,10 @@ package importer
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +23,7 @@ type legacyQbitEbookFixture struct {
 	scanner   *Scanner
 	books     *db.BookRepo
 	downloads *db.DownloadRepo
+	database  *sql.DB
 	book      *models.Book
 	download  *models.Download
 	ctx       context.Context
@@ -73,7 +76,7 @@ func newLegacyQbitEbookFixture(t *testing.T) *legacyQbitEbookFixture {
 		t.Fatal("precondition: download must be legacy/unbound")
 	}
 	return &legacyQbitEbookFixture{
-		scanner: s, books: books, downloads: downloads, book: book, download: dl,
+		scanner: s, books: books, downloads: downloads, database: database, book: book, download: dl,
 		ctx: ctx, source: source, dest: dest, original: original, seed: seed,
 	}
 }
@@ -263,6 +266,340 @@ func TestLegacyQbitEbook_EXDEVAtFinalPromotionBlocksWithoutCopy(t *testing.T) {
 	}
 	if links := seed.Sys().(*syscall.Stat_t).Nlink; links != 1 {
 		t.Fatalf("EXDEV left a hardlink behind: %d", links)
+	}
+}
+
+// Deleting a book_files claim is impossible here. If SQLite refuses the old
+// best-effort rollback, the foreign public entry must still have no DB claim.
+func TestLegacyQbitEbook_CollisionWithFailedDBRollbackCannotClaimForeignFile(t *testing.T) {
+	f := newLegacyQbitEbookFixture(t)
+	if _, err := f.database.ExecContext(f.ctx, `CREATE TRIGGER refuse_rollback BEFORE DELETE ON book_files
+		BEGIN SELECT RAISE(FAIL, 'rollback denied'); END`); err != nil {
+		t.Fatal(err)
+	}
+	originalLink := osLink
+	osLink = func(src, dst string) error {
+		if dst == f.dest {
+			if err := os.WriteFile(dst, []byte("foreign public EPUB"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return originalLink(src, dst)
+	}
+	t.Cleanup(func() { osLink = originalLink })
+
+	f.importEbook()
+	f.assertBlockedWithoutBookFile(t, "file exists")
+	if got, err := os.ReadFile(f.dest); err != nil || string(got) != "foreign public EPUB" {
+		t.Fatalf("foreign public file changed: %q, %v", got, err)
+	}
+}
+
+// Even with no public entry, another book's live DB claim must block this
+// strict import before publication, not gain an untracked link by accident.
+func TestLegacyQbitEbook_OtherBookStaleClaimBlocksBeforePublication(t *testing.T) {
+	f := newLegacyQbitEbookFixture(t)
+	other := &models.Book{ForeignID: "r15-stale-owner", AuthorID: f.book.AuthorID,
+		Title: "Other owner", Status: models.BookStatusWanted, MediaType: models.MediaTypeEbook}
+	if err := f.books.Create(f.ctx, other); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.books.AddBookFile(f.ctx, other.ID, models.MediaTypeEbook, f.dest); err != nil {
+		t.Fatal(err)
+	}
+
+	f.importEbook()
+	got, err := f.downloads.GetByID(f.ctx, f.download.ID)
+	if err != nil || got.Status != models.StateImportBlocked || !strings.Contains(got.ErrorMessage, other.Title) {
+		t.Fatalf("stale foreign owner did not block with owner name: %+v, %v", got, err)
+	}
+	row, err := f.books.FileByPath(f.ctx, f.dest)
+	if err != nil || row == nil || row.BookID != other.ID {
+		t.Fatalf("foreign claim changed: %+v, %v", row, err)
+	}
+	if _, err := os.Lstat(f.dest); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("foreign stale row caused a public link: %v", err)
+	}
+	f.assertSeedAndStage(t)
+}
+
+// A stale, already-owned row is not a row this attempt may delete on failure.
+func TestLegacyQbitEbook_FailedPromotionKeepsPreexistingBookFileRow(t *testing.T) {
+	f := newLegacyQbitEbookFixture(t)
+	if err := f.books.AddBookFile(f.ctx, f.book.ID, models.MediaTypeEbook, f.dest); err != nil {
+		t.Fatal(err)
+	}
+	before, err := f.books.FileByPath(f.ctx, f.dest)
+	if err != nil || before == nil {
+		t.Fatalf("preexisting row: %+v, %v", before, err)
+	}
+	originalLink := osLink
+	osLink = func(src, dst string) error {
+		if dst == f.dest {
+			return &os.LinkError{Op: "link", Old: src, New: dst, Err: syscall.EXDEV}
+		}
+		return originalLink(src, dst)
+	}
+	t.Cleanup(func() { osLink = originalLink })
+
+	f.importEbook()
+	got, err := f.downloads.GetByID(f.ctx, f.download.ID)
+	if err != nil || got.Status != models.StateImportBlocked {
+		t.Fatalf("failed promotion not blocked: %+v, %v", got, err)
+	}
+	after, err := f.books.FileByPath(f.ctx, f.dest)
+	if err != nil || after == nil || after.ID != before.ID || after.BookID != f.book.ID {
+		t.Fatalf("preexisting book_file deleted or reassigned: %+v, %v", after, err)
+	}
+	if _, err := os.Lstat(f.dest); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("failed promotion created a public file: %v", err)
+	}
+	f.assertSeedAndStage(t)
+}
+
+// A row can change owner while an import is in flight. Failed promotion must
+// not delete a row by path that another book now owns.
+func TestLegacyQbitEbook_FailedPromotionKeepsReassignedBookFileRow(t *testing.T) {
+	f := newLegacyQbitEbookFixture(t)
+	if err := f.books.AddBookFile(f.ctx, f.book.ID, models.MediaTypeEbook, f.dest); err != nil {
+		t.Fatal(err)
+	}
+	other := &models.Book{ForeignID: "r15-other-book", AuthorID: f.book.AuthorID,
+		Title: "Other owner", Status: models.BookStatusWanted, MediaType: models.MediaTypeEbook}
+	if err := f.books.Create(f.ctx, other); err != nil {
+		t.Fatal(err)
+	}
+	originalLink := osLink
+	osLink = func(src, dst string) error {
+		if dst == f.dest {
+			if _, err := f.database.ExecContext(f.ctx, `UPDATE book_files SET book_id=? WHERE path=?`, other.ID, dst); err != nil {
+				t.Fatal(err)
+			}
+			return &os.LinkError{Op: "link", Old: src, New: dst, Err: syscall.EXDEV}
+		}
+		return originalLink(src, dst)
+	}
+	t.Cleanup(func() { osLink = originalLink })
+
+	f.importEbook()
+	got, err := f.downloads.GetByID(f.ctx, f.download.ID)
+	if err != nil || got.Status != models.StateImportBlocked {
+		t.Fatalf("failed promotion not blocked: %+v, %v", got, err)
+	}
+	row, err := f.books.FileByPath(f.ctx, f.dest)
+	if err != nil || row == nil || row.BookID != other.ID {
+		t.Fatalf("reassigned book_file deleted or stolen: %+v, %v", row, err)
+	}
+	f.assertSeedAndStage(t)
+}
+
+// A DB failure after a safe publication leaves the public link for R5 audit.
+// A retry must collide with that untracked link, not delete or adopt it.
+func TestLegacyQbitEbook_DBFailureLeavesVerifiedPublicLinkForAudit(t *testing.T) {
+	f := newLegacyQbitEbookFixture(t)
+	if _, err := f.database.ExecContext(f.ctx, `CREATE TRIGGER refuse_claim BEFORE INSERT ON book_files
+		BEGIN SELECT RAISE(FAIL, 'claim denied'); END`); err != nil {
+		t.Fatal(err)
+	}
+	f.importEbook()
+	f.assertBlockedWithoutBookFile(t, "claim denied")
+	linked, err := os.Lstat(f.dest)
+	if err != nil || !linked.Mode().IsRegular() || !os.SameFile(f.seed, linked) {
+		t.Fatalf("DB failure discarded or replaced verified public link: %v", err)
+	}
+	if _, err := f.database.ExecContext(f.ctx, `DROP TRIGGER refuse_claim`); err != nil {
+		t.Fatal(err)
+	}
+	f.importEbook()
+	f.assertBlockedWithoutBookFile(t, "file exists")
+	if again, err := os.Lstat(f.dest); err != nil || !os.SameFile(linked, again) {
+		t.Fatalf("retry replaced stranded public link: %v", err)
+	}
+}
+
+// A tracked name alone does not prove a retry is safe: the public inode may
+// have been replaced, or the name may now be a symlink to the seeded source.
+func TestLegacyQbitEbook_SameBookRetryRejectsReplacedOrSymlinkedPath(t *testing.T) {
+	for _, kind := range []string{"foreign inode", "source symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newLegacyQbitEbookFixture(t)
+			if err := os.Link(f.source, f.dest); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.books.AddBookFile(f.ctx, f.book.ID, models.MediaTypeEbook, f.dest); err != nil {
+				t.Fatal(err)
+			}
+			row, err := f.books.FileByPath(f.ctx, f.dest)
+			if err != nil || row == nil {
+				t.Fatalf("tracked row: %+v, %v", row, err)
+			}
+			if err := os.Remove(f.dest); err != nil {
+				t.Fatal(err)
+			}
+			if kind == "source symlink" {
+				if err := os.Symlink(f.source, f.dest); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(f.dest, []byte("substituted public EPUB"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.Lstat(f.dest)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			f.importEbook()
+			got, err := f.downloads.GetByID(f.ctx, f.download.ID)
+			if err != nil || got.Status != models.StateImportBlocked {
+				t.Fatalf("replaced path incorrectly marked imported: %+v, %v", got, err)
+			}
+			after, err := os.Lstat(f.dest)
+			if err != nil || !os.SameFile(before, after) {
+				t.Fatalf("foreign public entry replaced: %v", err)
+			}
+			stored, err := f.books.FileByPath(f.ctx, f.dest)
+			if err != nil || stored == nil || stored.ID != row.ID || stored.BookID != f.book.ID {
+				t.Fatalf("preexisting claim changed: %+v, %v", stored, err)
+			}
+			f.assertSeedAndStage(t)
+		})
+	}
+}
+
+// If the same book's row still points to this exact public hardlink, a retry
+// remains idempotent and must not create another link or touch the source.
+func TestLegacyQbitEbook_SameBookRetryWithOriginalHardlinkIsIdempotent(t *testing.T) {
+	f := newLegacyQbitEbookFixture(t)
+	if err := os.Link(f.source, f.dest); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.books.AddBookFile(f.ctx, f.book.ID, models.MediaTypeEbook, f.dest); err != nil {
+		t.Fatal(err)
+	}
+	f.importEbook()
+	got, err := f.downloads.GetByID(f.ctx, f.download.ID)
+	if err != nil || got.Status != models.StateImported {
+		t.Fatalf("valid same-book retry failed: %+v, %v", got, err)
+	}
+	linked, err := os.Lstat(f.dest)
+	if err != nil || !os.SameFile(f.seed, linked) || linked.Sys().(*syscall.Stat_t).Nlink != 2 {
+		t.Fatalf("valid retry changed public hardlink: %v", err)
+	}
+	f.assertSeedAndStage(t)
+}
+
+// A final-link syscall returning success is not sufficient if another writer
+// swaps the public entry before the scanner can record its DB claim.
+func TestLegacyQbitEbook_ReplacedAfterPublicationIsNotClaimed(t *testing.T) {
+	f := newLegacyQbitEbookFixture(t)
+	originalLink := osLink
+	osLink = func(src, dst string) error {
+		err := originalLink(src, dst)
+		if err == nil && dst == f.dest {
+			if err := os.Remove(dst); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(dst, []byte("racing public EPUB"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return err
+	}
+	t.Cleanup(func() { osLink = originalLink })
+
+	f.importEbook()
+	f.assertBlockedWithoutBookFile(t, "changed")
+	if got, err := os.ReadFile(f.dest); err != nil || string(got) != "racing public EPUB" {
+		t.Fatalf("racing public entry changed: %q, %v", got, err)
+	}
+}
+
+// When the source is gone, a book-level DB path is not proof of this seeded
+// qBittorrent ebook. In particular it might have been replaced by a stranger.
+func TestLegacyQbitEbook_SourceMissingCannotProveBookLevelRetry(t *testing.T) {
+	for _, identity := range []string{"persisted client", "caller label only", "caller label conflicts persisted client"} {
+		t.Run(identity, func(t *testing.T) {
+			f := newLegacyQbitEbookFixture(t)
+			switch identity {
+			case "caller label only":
+				if _, err := f.database.ExecContext(f.ctx, `UPDATE downloads SET download_client_id=NULL WHERE id=?`, f.download.ID); err != nil {
+					t.Fatal(err)
+				}
+				f.download.DownloadClientID = nil
+			case "caller label conflicts persisted client":
+				if _, err := f.database.ExecContext(f.ctx, `UPDATE download_clients SET type='transmission' WHERE id=?`, *f.download.DownloadClientID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.book.MediaType = models.MediaTypeEbook
+			if err := f.books.Update(f.ctx, f.book); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(f.dest, []byte("foreign book at a tracked name"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.books.AddBookFile(f.ctx, f.book.ID, models.MediaTypeEbook, f.dest); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.Lstat(f.dest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(f.source); err != nil {
+				t.Fatal(err)
+			}
+
+			f.importEbook()
+			got, err := f.downloads.GetByID(f.ctx, f.download.ID)
+			if err != nil || got.Status != models.StateImportFailed {
+				t.Fatalf("no-source ebook retry was accepted without inode proof: %+v, %v", got, err)
+			}
+			after, err := os.Lstat(f.dest)
+			if err != nil || !os.SameFile(before, after) {
+				t.Fatalf("foreign library entry changed: %v", err)
+			}
+			if f.cleanups != 0 {
+				t.Fatalf("no-source retry removed qBittorrent torrent: %d calls", f.cleanups)
+			}
+		})
+	}
+}
+
+// The stage is private, but a failed cleanup cannot disappear silently.
+func TestLegacyQbitEbook_FailedPrivateStageCleanupIsLogged(t *testing.T) {
+	f := newLegacyQbitEbookFixture(t)
+	var logs bytes.Buffer
+	oldLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(oldLogger) })
+	originalLink := osLink
+	osLink = func(src, dst string) error {
+		if dst == f.dest {
+			if err := os.Remove(src); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(src, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(src, "keep"), []byte("fault fixture"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return &os.LinkError{Op: "link", Old: src, New: dst, Err: syscall.EXDEV}
+		}
+		return originalLink(src, dst)
+	}
+	t.Cleanup(func() { osLink = originalLink })
+
+	f.importEbook()
+	if !strings.Contains(logs.String(), "could not remove private staged") || !strings.Contains(logs.String(), "directory not empty") {
+		t.Fatalf("failed private-stage cleanup was hidden: %s", logs.String())
+	}
+	got, err := f.downloads.GetByID(f.ctx, f.download.ID)
+	if err != nil || got.Status != models.StateImportBlocked {
+		t.Fatalf("failed promotion not blocked: %+v, %v", got, err)
+	}
+	if rows, err := f.books.ListFiles(f.ctx, f.book.ID); err != nil || len(rows) != 0 {
+		t.Fatalf("cleanup failure claimed a book_file: %+v, %v", rows, err)
 	}
 }
 

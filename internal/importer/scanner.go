@@ -1476,8 +1476,10 @@ func downloadFormat(dl *models.Download, book *models.Book, formatHint string) s
 // client-listed files that are not on this host, an emptied file list is the
 // ordinary way in. A dual-format book therefore leans on the release tokens
 // alone — which is why formatForRelease reads the whole title rather than the
-// single token the parser kept.
-func (s *Scanner) isBookAlreadyImported(ctx context.Context, dl *models.Download, formatHint string) bool {
+// single token the parser kept. A legacy qBittorrent ebook is stricter: if
+// its source is absent, no inode comparison can prove a tracked book_file is
+// its own seeded link, so this shortcut must not mark it imported.
+func (s *Scanner) isBookAlreadyImported(ctx context.Context, dl *models.Download, formatHint string, qbitTorrent bool) bool {
 	// A book-level file does not prove that THIS variant's download was
 	// checked, even if the source path disappeared between poll cycles.
 	if dl.VariantID != nil {
@@ -1495,6 +1497,9 @@ func (s *Scanner) isBookAlreadyImported(ctx context.Context, dl *models.Download
 		slog.Debug("already-in-library check skipped: cannot tell which format this download targets",
 			"title", dl.Title, "bookID", book.ID, "mediaType", book.MediaType, "quality", dl.Quality)
 		return false
+	}
+	if qbitTorrent && format == models.MediaTypeEbook {
+		return false // no source to compare to the public ebook inode
 	}
 	return s.alreadyImportedFormat(ctx, book, format)
 }
@@ -1744,7 +1749,7 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 		// spurious failure noise and retry churn (#769). The check is scoped to
 		// THIS download's format (#1885) — a freshly imported audiobook must not
 		// close out the still-downloading ebook of the same title.
-		if s.isBookAlreadyImported(ctx, dl, formatHint) {
+		if s.isBookAlreadyImported(ctx, dl, formatHint, qbitTorrent) {
 			slog.Info("no book files at download path but book already in library — marking as imported",
 				"title", dl.Title, "path", downloadPath)
 			// Currently at StateImportPending (set at the top of this function).
@@ -2702,7 +2707,8 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 		// imported — count it as imported and move on. Per-file (not
 		// per-download) so a retry of a genuine partial failure still imports
 		// the files that never landed.
-		if s.alreadyImportedPath(ctx, book, destPath) {
+		if s.alreadyImportedPath(ctx, book, destPath) &&
+			(ebookMode != "hardlink-strict" || verifyStrictHardlink(srcFile, destPath) == nil) {
 			slog.Info("book file already imported — skipping re-import (idempotency guard)",
 				"src", srcFile, "dst", destPath)
 			imported++
@@ -2713,14 +2719,29 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 		mode := ebookMode
 		slog.Info("importing book", "src", srcFile, "dst", destPath, "mode", mode)
 
-		// Wave 4 / finding 23: stage the file under a sibling temp name,
-		// write the book_files row pointing at destPath, then atomically
-		// promote staged -> destPath. Doing the DB write first means a
-		// transient SQLite error rolls back to "nothing on disk, nothing
-		// in DB" rather than "file at destPath, no book_files row, user
-		// sees not-imported and re-grabs". The os.Rename leans on POSIX
-		// atomic-rename for the durability invariant: either the user
-		// sees the final file with its DB row, or neither.
+		if mode == "hardlink-strict" {
+			// A row owned by another live book may outlive its on-disk file.
+			// Do not publish a strict link that would make that row point at
+			// this torrent's seed, even when the public name is still absent.
+			owner, err := s.books.GetByTrackedPath(ctx, destPath)
+			if err != nil {
+				lastFileErr = fmt.Errorf("check strict destination owner: %w", err)
+				failed++
+				continue
+			}
+			fm := fixMatchFrom(ctx)
+			if owner != nil && owner.ID != book.ID && (fm == nil || !fm.covers(destPath)) {
+				owned := &db.PathOwnedError{Path: destPath, OwnerBookID: owner.ID, OwnerTitle: owner.Title}
+				lastFileErr = fmt.Errorf("%w; if the file is really %q, use Fix match on that book to move it here", owned, book.Title)
+				ownedFailed++
+				failed++
+				continue
+			}
+		}
+
+		// Non-strict modes retain the DB-first staging contract. Strict
+		// qBittorrent mode must instead publish a no-replace link before any
+		// DB claim; if the DB write fails, leave that public link for audit.
 		stagedPath, commit, rollback, stageErr := StagedImport(importCtx, mode, srcFile, destPath)
 		if stageErr != nil {
 			slog.Error("failed to stage import", "src", srcFile, "mode", mode, "error", stageErr)
@@ -2728,42 +2749,54 @@ func (s *Scanner) tryImportInternal(ctx context.Context, dl *models.Download, do
 			lastFileErr = stageErr
 			continue
 		}
-		// Record each imported file individually in book_files so multi-file
-		// downloads (epub + mobi + pdf) are all tracked rather than overwriting.
-		// The path is the final destPath, not the staging path — the row
-		// reflects where the file WILL live, and commit makes that true
-		// atomically immediately below.
-		//
-		// A destPath another book already tracks fails here (#2937), before
-		// commit, so the staged file is discarded and the file that book
-		// tracks at destPath is never replaced.
+		if mode == "hardlink-strict" {
+			if err := commit(); err != nil {
+				slog.Error("failed to publish strict hardlink", "bookID", book.ID, "staged", stagedPath, "dst", destPath, "error", err)
+				rollback() // only this attempt's private stage; never a public path
+				failed++
+				lastFileErr = err
+				continue
+			}
+			if err := verifyStrictHardlink(srcFile, destPath); err != nil {
+				lastFileErr = fmt.Errorf("stranded public path %s changed before tracking; reconcile manually: %w", destPath, err)
+				slog.Error("strict published link failed inode verification — no DB claim", "dst", destPath, "error", lastFileErr)
+				failed++
+				continue // a public path may now belong to someone else
+			}
+		}
+		// Record each file in book_files. Non-strict modes still claim the
+		// destination before rename; strict mode only reaches this point
+		// after a verified no-replace publication.
 		if err := s.recordImportedFile(ctx, book, models.MediaTypeEbook, destPath); err != nil {
-			slog.Error("failed to record book file — rolling back staged file", "bookID", book.ID, "staged", stagedPath, "error", err)
-			rollback()
+			if mode == "hardlink-strict" {
+				// A published link can be shared or reassigned. Never unlink
+				// it, even when tracking fails: R5 must audit the stranded path.
+				lastFileErr = fmt.Errorf("stranded verified public link at %s; reconcile manually: record book file: %w", destPath, err)
+				slog.Error("failed to claim published strict hardlink", "bookID", book.ID, "dst", destPath, "error", lastFileErr)
+			} else {
+				lastFileErr = fmt.Errorf("record book file: %w", err)
+				slog.Error("failed to record book file — rolling back staged file", "bookID", book.ID, "staged", stagedPath, "error", err)
+				rollback()
+			}
 			failed++
-			lastFileErr = fmt.Errorf("record book file: %w", err)
 			var owned *db.PathOwnedError
 			if errors.As(err, &owned) {
 				ownedFailed++
 			}
 			continue
 		}
-		commitErr := commit()
-		if err := commitErr; err != nil {
-			// The DB row exists but the rename failed (e.g. a concurrent
-			// reader holds destPath, or the FS went read-only between
-			// AddBookFile and Rename). Best-effort delete the book_files
-			// row so it does not point at a non-existent path. If the
-			// delete itself fails the next ScanLibrary will reconcile the
-			// dangling row away.
-			slog.Error("failed to commit staged file — rolling back book_files row", "bookID", book.ID, "staged", stagedPath, "dst", destPath, "error", err)
-			if _, removeErr := s.books.RemoveBookFile(ctx, destPath); removeErr != nil {
-				slog.Warn("failed to roll back book_files row after staged-commit failure — ScanLibrary will reconcile", "bookID", book.ID, "path", destPath, "error", removeErr)
+		if mode != "hardlink-strict" {
+			if err := commit(); err != nil {
+				// Preserve the existing DB-first cleanup for non-strict modes.
+				slog.Error("failed to commit staged file — rolling back book_files row", "bookID", book.ID, "staged", stagedPath, "dst", destPath, "error", err)
+				if _, removeErr := s.books.RemoveBookFile(ctx, destPath); removeErr != nil {
+					slog.Warn("failed to roll back book_files row after staged-commit failure — ScanLibrary will reconcile", "bookID", book.ID, "path", destPath, "error", removeErr)
+				}
+				rollback()
+				failed++
+				lastFileErr = err
+				continue
 			}
-			rollback()
-			failed++
-			lastFileErr = err
-			continue
 		}
 		imported++
 		importedSrcFiles = append(importedSrcFiles, srcFile)

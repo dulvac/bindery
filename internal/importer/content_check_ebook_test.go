@@ -475,17 +475,39 @@ func TestEbookContentCheck_OnlyEpubIsChecked(t *testing.T) {
 	f.assertImportedSilently(t)
 }
 
-// A release that holds one good EPUB and one stray mismatched one is not
-// refused: only a release whose every readable EPUB disagrees is.
+// An agreeing EPUB passes the content gate, but a second source cannot
+// replace its strict qBittorrent link at the same deterministic destination.
 func TestEbookContentCheck_OneAgreeingEpubSavesTheRelease(t *testing.T) {
 	f := newContentFixture(t, "The Racketeer", "John Grisham")
 	f.setMode(t, ebookCheckKey, "block")
 	f.writeEpubTitled(t, "a.epub", "Recursion", "Blake Crouch")
 	f.writeEpubTitled(t, "b.epub", "The Racketeer", "John Grisham")
+	good, err := os.Lstat(filepath.Join(f.dir, "b.epub"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad, err := os.Lstat(filepath.Join(f.dir, "a.epub"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	f.importDownload(t)
 	dl, _ := f.reload(t)
-	if dl.Status != models.StateImported {
-		t.Fatalf("status = %q (%s), want imported", dl.Status, dl.ErrorMessage)
+	if dl.Status != models.StateImportFailed || !strings.Contains(dl.ErrorMessage, "partial import") {
+		t.Fatalf("status = %q (%s), want partial import after destination collision", dl.Status, dl.ErrorMessage)
+	}
+	rows, err := f.books.ListFiles(context.Background(), f.book.ID)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("expected the agreeing EPUB alone to be tracked: %+v, %v", rows, err)
+	}
+	public, err := os.Lstat(rows[0].Path)
+	if err != nil || !os.SameFile(good, public) {
+		t.Fatalf("stray EPUB replaced the agreeing file: %v", err)
+	}
+	if after, err := os.Lstat(filepath.Join(f.dir, "a.epub")); err != nil || !os.SameFile(bad, after) {
+		t.Fatalf("stray source changed: %v", err)
+	}
+	if f.blocklisted(t) {
+		t.Fatal("an agreeing EPUB was incorrectly blocklisted by the content gate")
 	}
 }
 
