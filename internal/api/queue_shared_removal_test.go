@@ -413,6 +413,84 @@ func TestQueueBulkDeleteMamRequiresExplicitForget(t *testing.T) {
 	}
 }
 
+func TestQueueRejectedMamDownloadCanOnlyBeForgottenInBindery(t *testing.T) {
+	const hash = "0123456789abcdef0123456789abcdef01234567"
+	const source = "/downloads/mam/rejected.epub"
+	for _, tc := range []struct {
+		name string
+		bulk bool
+	}{
+		{"single", false},
+		{"bulk", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, downloads, variants, stub, id, bookID, variantID := mamRemovalFixture(t, "mam", "")
+			ctx := context.Background()
+			rejections := h.books.RejectionRepo()
+			if err := rejections.Record(ctx, bookID, variantID, id, source, "wrong language"); err != nil {
+				t.Fatal(err)
+			}
+			request := func(forget bool) *httptest.ResponseRecorder {
+				t.Helper()
+				rec := httptest.NewRecorder()
+				if tc.bulk {
+					body := `{"ids":[` + strconv.FormatInt(id, 10) + `]`
+					if forget {
+						body += `,"removeFromClient":false`
+					}
+					body += `}`
+					h.BulkDelete(rec, httptest.NewRequest(http.MethodPost, "/api/v1/queue/bulk-delete", strings.NewReader(body)))
+				} else {
+					path := "/api/v1/queue/" + strconv.FormatInt(id, 10)
+					if forget {
+						path += "?removeFromClient=false"
+					}
+					h.Delete(rec, withURLParam(httptest.NewRequest(http.MethodDelete, path, nil), "id", strconv.FormatInt(id, 10)))
+				}
+				return rec
+			}
+			refused := request(false)
+			if tc.bulk {
+				var response bulkResponse
+				if refused.Code != http.StatusOK || json.Unmarshal(refused.Body.Bytes(), &response) != nil ||
+					response.Results[strconv.FormatInt(id, 10)].OK || !strings.Contains(response.Results[strconv.FormatInt(id, 10)].Error, "removeFromClient=false") {
+					t.Fatalf("default bulk removal was not refused: %d %s", refused.Code, refused.Body.String())
+				}
+			} else if refused.Code != http.StatusBadRequest {
+				t.Fatalf("default single removal was not refused: %d %s", refused.Code, refused.Body.String())
+			}
+			if row, err := downloads.GetByID(ctx, id); err != nil || row == nil {
+				t.Fatalf("refusal lost queue row: %+v, %v", row, err)
+			}
+			forgotten := request(true)
+			if tc.bulk {
+				var response bulkResponse
+				if forgotten.Code != http.StatusOK || json.Unmarshal(forgotten.Body.Bytes(), &response) != nil || !response.Results[strconv.FormatInt(id, 10)].OK {
+					t.Fatalf("bulk Bindery-only forget: %d %s", forgotten.Code, forgotten.Body.String())
+				}
+			} else if forgotten.Code != http.StatusNoContent {
+				t.Fatalf("single Bindery-only forget: %d %s", forgotten.Code, forgotten.Body.String())
+			}
+			if row, err := downloads.GetByID(ctx, id); err != nil || row != nil {
+				t.Fatalf("forgotten row remains: %+v, %v", row, err)
+			}
+			if blocked, err := rejections.IsRejected(ctx, bookID, variantID, source); err != nil || !blocked {
+				t.Fatalf("forgotten rejection lost: %t, %v", blocked, err)
+			}
+			rows, err := variants.ListByBook(ctx, bookID)
+			if err != nil || len(rows) != 1 || rows[0].Status != models.VariantWanted {
+				t.Fatalf("variant not reconciled after forget: %+v, %v", rows, err)
+			}
+			if req, removed := stub.counts(); req != 0 || removed != 0 {
+				t.Fatalf("qbit contacted on refusal or forget: requests=%d removals=%d", req, removed)
+			}
+			if category := stub.torrentCategory(hash); category != "mam" {
+				t.Fatalf("fake MAM torrent changed: category=%q", category)
+			}
+		})
+	}
+}
+
 // TestQueueDelete_KeepsDownloadAnotherQueueItemUses: under tenancy two users'
 // rows can name one torrent (or job). Removing one user's queue item, even
 // with deleteFiles, must not touch the client while the other row still uses

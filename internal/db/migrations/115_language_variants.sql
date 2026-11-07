@@ -20,7 +20,7 @@ CREATE TABLE variant_rejections (
     id          INTEGER PRIMARY KEY,
     book_id     INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
     variant_id  INTEGER NOT NULL REFERENCES book_variants(id),
-    download_id INTEGER REFERENCES downloads(id),
+    download_id INTEGER REFERENCES downloads(id) ON DELETE SET NULL,
     source_path TEXT NOT NULL,
     reason      TEXT NOT NULL,
     created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,

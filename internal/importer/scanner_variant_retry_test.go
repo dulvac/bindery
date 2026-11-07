@@ -435,6 +435,58 @@ func TestVariantRetry_TrackedAudioFolderBeforeDownloadStatusIsIdempotent(t *test
 	}
 }
 
+func TestVariantRejectionAfterDownloadForgetBlocksRescanAndNewImport(t *testing.T) {
+	f := newVariantReviewFixture(t, "English catalogue label", "Sample Author", models.MediaTypeEbook, "eng")
+	source := variantEPUBSource(t, f.sources, "English catalogue label.epub", "english.epub")
+	old := f.addDownload(t, "English catalogue label [ENG / EPUB]")
+	if err := f.books.VariantRepo().SetStatus(f.ctx, f.variant.ID, models.VariantDownloading); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.rejections.Record(f.ctx, f.book.ID, f.variant.ID, old.ID, source, "wrong edition"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.downloads.Delete(f.ctx, old.ID); err != nil {
+		t.Fatalf("forget old download: %v", err)
+	}
+	statuses, err := f.books.VariantRepo().ListByBook(f.ctx, f.book.ID)
+	if err != nil || len(statuses) != 1 || statuses[0].Status != models.VariantWanted {
+		t.Fatalf("variant after forget: %+v, %v; want wanted", statuses, err)
+	}
+	libraryFolder := filepath.Join(f.library, "Sample Author")
+	if err := os.MkdirAll(libraryFolder, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(source, filepath.Join(libraryFolder, "English catalogue label.epub")); err != nil {
+		t.Fatal(err)
+	}
+	f.scanner.ScanLibrary(f.ctx)
+	files, err := f.books.ListFiles(f.ctx, f.book.ID)
+	if err != nil || len(files) != 0 {
+		t.Fatalf("rescan reattached forgotten rejection: %+v, %v", files, err)
+	}
+
+	next := f.addDownload(t, "English catalogue label [ENG / EPUB] second attempt")
+	author, err := db.NewAuthorRepo(f.database).GetByID(f.ctx, f.book.AuthorID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected, reviewed, reason, err := f.scanner.reviewVariantImport(f.ctx, next, f.book, author, models.MediaTypeEbook, source, []string{source})
+	if err != nil || !reviewed || len(selected) != 0 || reason != "source previously rejected for this book" {
+		t.Fatalf("new download retried forgotten rejection: selected=%+v reviewed=%t reason=%q err=%v", selected, reviewed, reason, err)
+	}
+	f.scanner.tryImportInternal(f.ctx, next, source, "qbittorrent", "test-hash", "", nil, []string{source})
+	files, err = f.books.ListFiles(f.ctx, f.book.ID)
+	if err != nil || len(files) != 0 {
+		t.Fatalf("retry reattached forgotten rejection: %+v, %v", files, err)
+	}
+	if rejected, err := f.rejections.IsRejected(f.ctx, f.book.ID, f.variant.ID, source); err != nil || !rejected {
+		t.Fatalf("rejection disappeared after rescan/import retry: %t, %v", rejected, err)
+	}
+	if _, err := os.Stat(source); err != nil {
+		t.Fatalf("source file changed during rescan/import retry: %v", err)
+	}
+}
+
 func TestVariantScan_RejectsInodeMatchButReconcilesUnrelatedBook(t *testing.T) {
 	for _, audio := range []bool{false, true} {
 		name := "ebook"

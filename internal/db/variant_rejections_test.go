@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -123,6 +124,99 @@ func TestVariantRejectionsRefuseWrongAssociations(t *testing.T) {
 	}
 	if rejected, err := repo.IsRejected(ctx, book.ID, variantID, "/downloads/mam/wrong.epub"); err != nil || rejected {
 		t.Errorf("invalid association wrote a row: %t, %v", rejected, err)
+	}
+	otherVariant, err := NewBookVariantRepo(repo.db).EnsureWanted(ctx, book.ID, models.MediaTypeEbook, []string{"rum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.db.ExecContext(ctx, `UPDATE downloads SET variant_id = ? WHERE id = ?`, variantID, downloadID); err != nil {
+		t.Fatal(err)
+	}
+	const otherPath = "/downloads/mam/other-variant.epub"
+	if err := repo.Record(ctx, book.ID, otherVariant[0].ID, downloadID, otherPath, "wrong variant"); !errors.Is(err, ErrVariantRejectionAssociation) {
+		t.Fatalf("download bound to a different variant was accepted: %v", err)
+	}
+	if rejected, err := repo.IsRejected(ctx, book.ID, otherVariant[0].ID, otherPath); err != nil || rejected {
+		t.Fatalf("wrong variant wrote a rejection: %t, %v", rejected, err)
+	}
+}
+
+func TestVariantRejectionsKeepVerdictsWhenDownloadForgotten(t *testing.T) {
+	repo, book, variantID, downloadID := rejectionFixture(t)
+	ctx := context.Background()
+	var foreignKeys int
+	if err := repo.db.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil || foreignKeys != 1 {
+		t.Fatalf("test requires SQLite FK enforcement: foreign_keys=%d, err=%v", foreignKeys, err)
+	}
+	const rejected = "/downloads/mam/rejected.epub"
+	const unrelated = "/downloads/mam/unrelated.epub"
+	const independent = "/downloads/mam/independent.epub"
+	for _, source := range []string{rejected, unrelated} {
+		if err := repo.Record(ctx, book.ID, variantID, downloadID, source, "wrong language"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	other := &models.Download{GUID: "independent-rejection", BookID: &book.ID, Status: models.StateImported, Title: book.Title}
+	if err := NewDownloadRepo(repo.db).Create(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Record(ctx, book.ID, variantID, other.ID, independent, "different verdict"); err != nil {
+		t.Fatal(err)
+	}
+	created := make(map[string]string, 3)
+	for _, source := range []string{rejected, unrelated, independent} {
+		var stamp string
+		if err := repo.db.QueryRowContext(ctx, `SELECT CAST(created_at AS TEXT) FROM variant_rejections WHERE source_path = ?`, source).Scan(&stamp); err != nil {
+			t.Fatal(err)
+		}
+		created[source] = stamp
+	}
+	if err := NewDownloadRepo(repo.db).Delete(ctx, downloadID); err != nil {
+		t.Fatalf("forget rejected download: %v", err)
+	}
+	if row, err := NewDownloadRepo(repo.db).GetByID(ctx, downloadID); err != nil || row != nil {
+		t.Fatalf("forgotten download still exists: %+v, %v", row, err)
+	}
+	for _, source := range []string{rejected, unrelated} {
+		var bookAfter, variantAfter int64
+		var downloadAfter sql.NullInt64
+		var pathAfter, reasonAfter, createdAfter string
+		if err := repo.db.QueryRowContext(ctx, `SELECT book_id, variant_id, download_id, source_path, reason, CAST(created_at AS TEXT)
+			FROM variant_rejections WHERE source_path = ?`, source).Scan(&bookAfter, &variantAfter, &downloadAfter, &pathAfter, &reasonAfter, &createdAfter); err != nil {
+			t.Fatal(err)
+		}
+		if bookAfter != book.ID || variantAfter != variantID || downloadAfter.Valid || pathAfter != source || reasonAfter != "wrong language" || createdAfter != created[source] {
+			t.Fatalf("forget changed verdict %q: book=%d variant=%d download=%v path=%q reason=%q created=%q", source, bookAfter, variantAfter, downloadAfter, pathAfter, reasonAfter, createdAfter)
+		}
+		if blocked, err := repo.IsRejected(ctx, book.ID, variantID, source); err != nil || !blocked {
+			t.Fatalf("forgotten source %q is eligible again: blocked=%t err=%v", source, blocked, err)
+		}
+	}
+	var keptDownload int64
+	var keptReason, keptCreated string
+	if err := repo.db.QueryRowContext(ctx, `SELECT download_id, reason, CAST(created_at AS TEXT) FROM variant_rejections WHERE source_path = ?`, independent).
+		Scan(&keptDownload, &keptReason, &keptCreated); err != nil {
+		t.Fatal(err)
+	}
+	if keptDownload != other.ID || keptReason != "different verdict" || keptCreated != created[independent] {
+		t.Fatalf("unrelated rejection changed: download=%d reason=%q created=%q", keptDownload, keptReason, keptCreated)
+	}
+	if blocked, err := repo.IsRejected(ctx, book.ID, variantID, independent); err != nil || !blocked {
+		t.Fatalf("unrelated rejection lost: %t, %v", blocked, err)
+	}
+	if err := repo.Record(ctx, book.ID, variantID, downloadID, "/downloads/mam/new.epub", "new verdict"); !errors.Is(err, ErrVariantRejectionAssociation) {
+		t.Fatalf("forgotten download created a new rejection: %v", err)
+	}
+	rows, err := repo.db.QueryContext(ctx, `PRAGMA foreign_key_check`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		t.Fatal("foreign_key_check found an orphan after forgetting the download")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
 }
 
