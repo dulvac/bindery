@@ -446,7 +446,7 @@ func TestPendingGrab_UsesPin(t *testing.T) {
 	id := strconv.FormatInt(all[0].ID, 10)
 	ph := NewPendingHandler(pending, f.h, f.h.downloads, f.h.books)
 	w := httptest.NewRecorder()
-	ph.Grab(w, withURLParam(httptest.NewRequest(http.MethodPost, "/api/v1/pending/"+id+"/grab", nil), "id", id))
+	ph.Grab(w, withURLParam(httptest.NewRequest(http.MethodPost, "/api/v1/pending/"+id+"/grab", strings.NewReader(`{"acknowledgeRatioCost":true}`)), "id", id))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("pending grab: status %d: %s", w.Code, w.Body.String())
 	}

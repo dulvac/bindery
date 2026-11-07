@@ -9,16 +9,26 @@ it('posts a real pending variant and an optional audited language override reaso
     bodies.push(await request.json())
     return HttpResponse.json({ id: 8 })
   }))
-  await queueApi.grabPending(10, { variantId: 17, languageOverrideReason: 'Reviewed release tag' })
-  expect(bodies).toEqual([{ variantId: 17, languageOverrideReason: 'Reviewed release tag' }])
+  await queueApi.grabPending(10, { acknowledgeRatioCost: true, variantId: 17, languageOverrideReason: 'Reviewed release tag' })
+  expect(bodies).toEqual([{ acknowledgeRatioCost: true, variantId: 17, languageOverrideReason: 'Reviewed release tag' }])
 })
 
-it('leaves the legacy pending grab body absent', async () => {
-  let body = 'not called'
+it('posts explicit ratio acknowledgement for legacy pending grabs without a variant', async () => {
+  const bodies: unknown[] = []
   server.use(http.post(apiUrl('/pending/10/grab'), async ({ request }) => {
-    body = await request.text()
+    bodies.push(await request.json())
     return HttpResponse.json({ id: 8 })
   }))
-  await queueApi.grabPending(10)
-  expect(body).toBe('')
+  await queueApi.grabPending(10, { acknowledgeRatioCost: true })
+  expect(bodies).toEqual([{ acknowledgeRatioCost: true }])
+})
+
+it('posts acknowledgement and the chosen variant without an override when none was given', async () => {
+  const bodies: unknown[] = []
+  server.use(http.post(apiUrl('/pending/10/grab'), async ({ request }) => {
+    bodies.push(await request.json())
+    return HttpResponse.json({ id: 8 })
+  }))
+  await queueApi.grabPending(10, { acknowledgeRatioCost: true, variantId: 17 })
+  expect(bodies).toEqual([{ acknowledgeRatioCost: true, variantId: 17 }])
 })

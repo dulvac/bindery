@@ -192,6 +192,29 @@ func (h *PendingHandler) Grab(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Every Pending grab may cost ratio, including older rows without variants.
+	// An omitted, false or null acknowledgement must fail before any client
+	// send. grab() still validates the chosen variant and admin override.
+	var selection struct {
+		AcknowledgeRatioCost   *bool  `json:"acknowledgeRatioCost"`
+		VariantID              *int64 `json:"variantId"`
+		LanguageOverrideReason string `json:"languageOverrideReason"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&selection); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if selection.AcknowledgeRatioCost == nil || !*selection.AcknowledgeRatioCost {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ratio cost acknowledgement required"})
+		return
+	}
+
 	// Deserialize the stored release JSON to get the full grab details.
 	var stored grabRequest
 	if err := json.Unmarshal([]byte(pr.ReleaseJSON), &stored); err != nil {
@@ -204,16 +227,6 @@ func (h *PendingHandler) Grab(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Old clients post no body. A variant book needs a selection, which grab()
-	// validates against this pending row's book, format and release language.
-	var selection struct {
-		VariantID              *int64 `json:"variantId"`
-		LanguageOverrideReason string `json:"languageOverrideReason"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&selection); err != nil && !errors.Is(err, io.EOF) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
-		return
-	}
 	// Never let an indexer's stored release blob choose a variant or supply an
 	// override: only the authenticated caller's selection can do that.
 	stored.VariantID = selection.VariantID

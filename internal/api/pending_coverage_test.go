@@ -73,7 +73,7 @@ func (f *covQPendingGrab) grab(t *testing.T, r *http.Request) *httptest.Response
 
 func covQPendingReq(id int64) *http.Request {
 	s := strconv.FormatInt(id, 10)
-	return covQIDRequest(http.MethodPost, "/api/v1/pending/"+s+"/grab", s, "")
+	return covQIDRequest(http.MethodPost, "/api/v1/pending/"+s+"/grab", s, `{"acknowledgeRatioCost":true}`)
 }
 
 // TestPendingGrabSendsStoredReleaseAndClearsRow: a force grab sends the
@@ -148,19 +148,19 @@ func TestPendingVariantGrabSelectsOwnedMatchingLanguage(t *testing.T) {
 		r := withURLParam(httptest.NewRequest(http.MethodPost, "/api/v1/pending/"+id+"/grab", strings.NewReader(body)), "id", id)
 		return f.grab(t, covQAsUser(r, bob))
 	}
-	if rec := grab(``); rec.Code != http.StatusBadRequest {
+	if rec := grab(`{"acknowledgeRatioCost":true}`); rec.Code != http.StatusBadRequest {
 		t.Fatalf("variant book with no selection = %d: %s; want 400", rec.Code, rec.Body.String())
 	}
-	if rec := grab(`{"variantId":` + strconv.FormatInt(foreign[0].ID, 10) + `}`); rec.Code != http.StatusNotFound {
+	if rec := grab(`{"variantId":` + strconv.FormatInt(foreign[0].ID, 10) + `,"acknowledgeRatioCost":true}`); rec.Code != http.StatusNotFound {
 		t.Fatalf("foreign selected variant = %d: %s; want opaque 404", rec.Code, rec.Body.String())
 	}
-	if rec := grab(`{"variantId":` + strconv.FormatInt(copies[0].ID, 10) + `}`); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "release language") {
+	if rec := grab(`{"variantId":` + strconv.FormatInt(copies[0].ID, 10) + `,"acknowledgeRatioCost":true}`); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "release language") {
 		t.Fatalf("ROM tagged release for English = %d: %s; want language refusal", rec.Code, rec.Body.String())
 	}
 	if f.adds.calls != 0 {
 		t.Fatalf("refused pending grabs reached client %d times", f.adds.calls)
 	}
-	if rec := grab(`{"variantId":` + strconv.FormatInt(copies[1].ID, 10) + `}`); rec.Code != http.StatusCreated {
+	if rec := grab(`{"variantId":` + strconv.FormatInt(copies[1].ID, 10) + `,"acknowledgeRatioCost":true}`); rec.Code != http.StatusCreated {
 		t.Fatalf("Romanian pending variant grab = %d: %s; want 201", rec.Code, rec.Body.String())
 	}
 	rows, err := f.downloads.List(ctx)

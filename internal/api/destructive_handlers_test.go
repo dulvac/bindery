@@ -448,7 +448,7 @@ func TestPendingGrab_DispatchesDownloadAndClearsPending(t *testing.T) {
 	h := NewPendingHandler(pending, queue, downloads, books)
 
 	rec := httptest.NewRecorder()
-	req := withURLParam(httptest.NewRequest(http.MethodPost, "/api/v1/pending/"+strconv.FormatInt(pendingID, 10)+"/grab", nil), "id", strconv.FormatInt(pendingID, 10))
+	req := withURLParam(httptest.NewRequest(http.MethodPost, "/api/v1/pending/"+strconv.FormatInt(pendingID, 10)+"/grab", strings.NewReader(`{"acknowledgeRatioCost":true}`)), "id", strconv.FormatInt(pendingID, 10))
 	h.Grab(rec, req)
 
 	if rec.Code != http.StatusCreated {

@@ -221,7 +221,23 @@ describe('QueuePage — pending variant safety', () => {
     expect(within(dialog).getByRole('button', { name: 'Confirm grab' })).toBeDisabled()
     fireEvent.click(within(dialog).getByRole('checkbox', { name: /cost ratio/ }))
     fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm grab' }))
-    await waitFor(() => expect(api.grabPending).toHaveBeenCalledWith(10, { variantId: 27 }))
+    await waitFor(() => expect(api.grabPending).toHaveBeenCalledWith(10, { acknowledgeRatioCost: true, variantId: 27 }))
+  })
+
+  it.each([
+    ['variant', book],
+    ['legacy', { ...book, mediaType: 'ebook', variants: [] } as Book],
+  ])('does not send a %s Pending grab when confirmation is cancelled', async (_label, targetBook) => {
+    vi.mocked(api.listPending).mockResolvedValue([pending])
+    vi.mocked(api.getBook).mockResolvedValue(targetBook)
+    renderQueuePage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Grab Now' }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: /cost ratio/ }))
+    fireEvent.click(within(dialog).getByRole('button', { name: 'common.cancel' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    expect(api.grabPending).not.toHaveBeenCalled()
+    expect(api.getBook).toHaveBeenCalledTimes(1)
   })
 
   it('treats an unknown format-qualified code as unverified, not wrong-language', async () => {
@@ -233,7 +249,7 @@ describe('QueuePage — pending variant safety', () => {
     expect(dialog).toHaveTextContent('Unverified language')
     fireEvent.click(within(dialog).getByRole('checkbox', { name: /cost ratio/ }))
     fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm grab' }))
-    await waitFor(() => expect(api.grabPending).toHaveBeenCalledWith(10, { variantId: 27 }))
+    await waitFor(() => expect(api.grabPending).toHaveBeenCalledWith(10, { acknowledgeRatioCost: true, variantId: 27 }))
   })
 
   it('requires an admin reason and ratio acknowledgement for server-known French without a bracket marker', async () => {
@@ -256,6 +272,7 @@ describe('QueuePage — pending variant safety', () => {
     fireEvent.click(within(retryDialog).getByRole('checkbox', { name: /cost ratio/ }))
     fireEvent.click(within(retryDialog).getByRole('button', { name: 'Confirm grab' }))
     await waitFor(() => expect(api.grabPending).toHaveBeenCalledWith(10, {
+      acknowledgeRatioCost: true,
       variantId: 27,
       languageOverrideReason: 'I verified this release is a bilingual Romanian edition',
     }))
@@ -298,7 +315,7 @@ describe('QueuePage — pending variant safety', () => {
     expect(dialog).toHaveTextContent('Romanian')
     fireEvent.click(within(dialog).getByRole('checkbox', { name: /cost ratio/ }))
     fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm grab' }))
-    await waitFor(() => expect(api.grabPending).toHaveBeenCalledWith(10, { variantId: 27 }))
+    await waitFor(() => expect(api.grabPending).toHaveBeenCalledWith(10, { acknowledgeRatioCost: true, variantId: 27 }))
   })
 
   it('refuses synthetic pending status IDs and reports a stale wanted copy', async () => {
@@ -578,7 +595,7 @@ describe('QueuePage', () => {
     expect(dialog).toHaveTextContent('Dune')
     fireEvent.click(within(dialog).getByRole('checkbox', { name: /cost ratio/ }))
     fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm grab' }))
-    await waitFor(() => expect(api.grabPending).toHaveBeenCalledWith(10, undefined))
+    await waitFor(() => expect(api.grabPending).toHaveBeenCalledWith(10, { acknowledgeRatioCost: true }))
 
     await act(async () => {
       resolveGrab(makeDownload())

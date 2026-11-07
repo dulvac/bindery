@@ -169,7 +169,7 @@ func TestPendingGrab_AudiobookOfDualFormatBookUsesAudiobookCategory(t *testing.T
 
 	h := NewPendingHandler(pending, queue, queue.downloads, queue.books)
 	w := httptest.NewRecorder()
-	h.Grab(w, withURLParam(httptest.NewRequest(http.MethodPost, "/api/v1/pending/"+id+"/grab", nil), "id", id))
+	h.Grab(w, withURLParam(httptest.NewRequest(http.MethodPost, "/api/v1/pending/"+id+"/grab", strings.NewReader(`{"acknowledgeRatioCost":true}`)), "id", id))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("pending grab: status %d: %s", w.Code, w.Body.String())
 	}

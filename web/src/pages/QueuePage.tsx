@@ -244,7 +244,10 @@ export default function QueuePage() {
         load()
         return
       }
-      await api.grabPending(item.id, selected ? { variantId: selected.id, ...(reason.trim() ? { languageOverrideReason: reason.trim() } : {}) } : undefined)
+      await api.grabPending(item.id, {
+        acknowledgeRatioCost: true,
+        ...(selected ? { variantId: selected.id, ...(reason.trim() ? { languageOverrideReason: reason.trim() } : {}) } : {}),
+      })
       setPendingBook(null)
       setPendingBookForId(null)
       load()

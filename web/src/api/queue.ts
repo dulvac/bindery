@@ -190,6 +190,6 @@ export const queueApi = {
   // Pending releases
   listPending: () => request<PendingRelease[]>('/pending'),
   dismissPending: (id: number) => request<void>(`/pending/${id}`, { method: 'DELETE' }),
-  grabPending: (id: number, selection?: { variantId: number; languageOverrideReason?: string }) =>
-    request<Download>(`/pending/${id}/grab`, { method: 'POST', ...(selection ? { body: JSON.stringify(selection) } : {}) }),
+  grabPending: (id: number, selection: { acknowledgeRatioCost: true; variantId?: number; languageOverrideReason?: string }) =>
+    request<Download>(`/pending/${id}/grab`, { method: 'POST', body: JSON.stringify(selection) }),
 }
