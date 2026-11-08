@@ -328,6 +328,7 @@ func (r *RequestRepo) fillBookProgress(ctx context.Context, page []models.Librar
 	if err != nil {
 		return fmt.Errorf("load request variants: %w", err)
 	}
+	defer rows.Close() // Explicitly closed after iteration before using the results.
 	byBook := make(map[BookStatusAccess]map[string]string, len(accesses))
 	for rows.Next() {
 		var access BookStatusAccess
@@ -588,8 +589,11 @@ func (r *RequestRepo) MergePending(ctx context.Context, id, ownerID int64, media
 		}
 		langJSON, _ := json.Marshal(merged)
 		var payload map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(current.PayloadJSON), &payload); err != nil || payload == nil {
-			return nil, fmt.Errorf("decode pending request payload: %v", err)
+		if err := json.Unmarshal([]byte(current.PayloadJSON), &payload); err != nil {
+			return nil, fmt.Errorf("decode pending request payload: %w", err)
+		}
+		if payload == nil {
+			return nil, errors.New("decode pending request payload: null object")
 		}
 		payload["languages"] = langJSON
 		payload["mediaType"], _ = json.Marshal(mergedMedia)

@@ -24,8 +24,7 @@ func TestVariantImport_RejectedSourcesStayRejectedAcrossQbitPollsAndRefusedRetri
 		}
 		t.Run(name, func(t *testing.T) {
 			f := newVariantReviewFixture(t, "English catalogue label", "Sample Author", format, "eng")
-			content := f.sources
-			var file string
+			var content, file string
 			if audio {
 				content = filepath.Join(f.sources, "recording")
 				if err := os.Mkdir(content, 0o755); err != nil {

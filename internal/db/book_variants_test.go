@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -443,7 +444,7 @@ func TestDownloadBookReassignmentKeepsVariant(t *testing.T) {
 	if err != nil || unchanged == nil || unchanged.VariantID == nil || *unchanged.VariantID != variants[0].ID {
 		t.Fatalf("same-book reassignment lost the variant: %#v, %v", unchanged, err)
 	}
-	if err := repo.SetBookID(ctx, d.ID, other.ID); err != ErrVariantBookReassignment {
+	if err := repo.SetBookID(ctx, d.ID, other.ID); !errors.Is(err, ErrVariantBookReassignment) {
 		t.Fatalf("cross-book reassignment error = %v", err)
 	}
 	got, err := repo.GetByID(ctx, d.ID)
@@ -802,7 +803,7 @@ func TestDownloadBookReassignmentPreservesVariantStatus(t *testing.T) {
 			if err := variants.SetStatus(ctx, id, tc.variant); err != nil {
 				t.Fatal(err)
 			}
-			if err := downloads.SetBookID(ctx, d.ID, other.ID); err != ErrVariantBookReassignment {
+			if err := downloads.SetBookID(ctx, d.ID, other.ID); !errors.Is(err, ErrVariantBookReassignment) {
 				t.Fatalf("cross-book reassignment error = %v", err)
 			}
 			row, err := downloads.GetByID(ctx, d.ID)
@@ -873,7 +874,7 @@ func TestDownloadBookReassignmentKeepsOtherVariantClaims(t *testing.T) {
 			if err := variants.SetStatus(ctx, id, models.VariantDownloading); err != nil {
 				t.Fatal(err)
 			}
-			if err := downloads.SetBookID(ctx, d.ID, other.ID); err != ErrVariantBookReassignment {
+			if err := downloads.SetBookID(ctx, d.ID, other.ID); !errors.Is(err, ErrVariantBookReassignment) {
 				t.Fatalf("cross-book reassignment error = %v", err)
 			}
 			got, err := variants.ListByBook(ctx, book.ID)

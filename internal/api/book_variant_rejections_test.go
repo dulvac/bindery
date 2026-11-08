@@ -454,7 +454,7 @@ func TestRejectSourceMapsGlobalRemapWhenClientHasNone(t *testing.T) {
 
 // A successful historical import did not persist ImportPath. The stored
 // torrent hash and client id must suffice when the live torrent lists the
-// exact hardlinked file. This fails on the old ImportPath-only proof.
+// exact hard-linked file. This fails on the old ImportPath-only proof.
 func TestRejectSourceLegacyEbookWithoutImportPath(t *testing.T) {
 	f := newRejectSourceFixture(t)
 	if err := db.NewDownloadRepo(f.conn).SetImportPath(f.ctx, f.download.ID, ""); err != nil {
@@ -647,7 +647,7 @@ func TestRejectSourceAudiobookRequiresEveryMediaMember(t *testing.T) {
 	}
 }
 
-// A foreign release may be hardlinked into the library and sit beside the
+// A foreign release may be hard-linked into the library and sit beside the
 // recorded release. A directory walk would reject the foreign file, even
 // though the identified torrent lists only dune.epub.
 func TestRejectSourceForeignFileInSameSaveDirectory(t *testing.T) {

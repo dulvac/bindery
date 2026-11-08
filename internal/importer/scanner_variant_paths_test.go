@@ -255,7 +255,7 @@ func TestVariantHardlink_AudioLanguagesPromoteSeparateWholeFolders(t *testing.T)
 		for _, source := range files {
 			linked, err := os.Lstat(filepath.Join(dest, filepath.Base(source)))
 			if err != nil || !sameFilePath(t, source, linked) {
-				t.Fatalf("audio not hardlinked: %s: %v", source, err)
+				t.Fatalf("audio not hard-linked: %s: %v", source, err)
 			}
 		}
 	}

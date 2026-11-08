@@ -319,11 +319,12 @@ func carryRootSidecars(ctx context.Context, mode, srcRoot, destDir string, reser
 			continue
 		}
 		var cerr error
-		if mode == "hardlink-strict" {
+		switch mode {
+		case "hardlink-strict":
 			cerr = HardlinkFileStrict(src, dst)
-		} else if mode == "hardlink" {
+		case "hardlink":
 			cerr = HardlinkFile(src, dst)
-		} else {
+		default:
 			cerr = CopyFileCtx(ctx, src, dst)
 		}
 		if cerr != nil && (isArchivePart(name) || mode == "hardlink-strict") {

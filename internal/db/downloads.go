@@ -594,6 +594,7 @@ func (r *DownloadRepo) retryReviewedImport(ctx context.Context, bookID, variantI
 		return false, fmt.Errorf("begin reviewed import retry: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	// #nosec G202 -- variantActiveSQL contains only fixed status literals and ImportRetryLimit; all inputs are bound.
 	res, err := tx.ExecContext(ctx, `UPDATE book_variants SET status='downloading'
 		WHERE id=? AND book_id=? AND status='review'
 		AND NOT EXISTS (SELECT 1 FROM book_files f WHERE f.variant_id=book_variants.id)
@@ -891,6 +892,7 @@ func (r *DownloadRepo) SetError(ctx context.Context, id int64, errMsg string) er
 		return fmt.Errorf("begin download failure transition: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	// #nosec G202 -- variantActiveSQL contains only fixed status literals and ImportRetryLimit; all inputs are bound.
 	result, err := tx.ExecContext(ctx,
 		"UPDATE downloads SET status=?, error_message=?, dead_at=? WHERE id=? AND "+variantActiveSQL,
 		models.StateFailed, errMsg, time.Now().UTC(), id)
@@ -1003,6 +1005,7 @@ func (r *DownloadRepo) SetErrorWithStatus(ctx context.Context, id int64, status 
 // download's terminal transition. A failed reconciliation leaves the old
 // download state intact so recovery can retry after the database is repaired.
 func reconcileTerminalImportVariant(ctx context.Context, tx *sql.Tx, id int64) error {
+	// #nosec G202 -- variantActiveSQL contains only fixed status literals and ImportRetryLimit; all inputs are bound.
 	_, err := tx.ExecContext(ctx, `UPDATE book_variants SET status = CASE
 		WHEN EXISTS (SELECT 1 FROM book_files f WHERE f.variant_id = book_variants.id
 			AND f.book_id = book_variants.book_id AND f.format = book_variants.media_type

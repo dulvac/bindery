@@ -319,8 +319,12 @@ func (r *BookFileRepo) TrackVariantFilesChecked(ctx context.Context, bookID int6
 		if err != nil {
 			return fmt.Errorf("book_files mark variant imported: %w", err)
 		}
-		if count, err := updated.RowsAffected(); err != nil || count != 1 {
-			return fmt.Errorf("book_files variant status changed before import: %v", err)
+		count, err := updated.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("book_files variant status changed before import: %w", err)
+		}
+		if count != 1 {
+			return errors.New("book_files variant status changed before import")
 		}
 	}
 	// Refresh the compatibility columns only after all file claims are present.
@@ -353,15 +357,20 @@ func validateVariantReviewApproval(ctx context.Context, tx *sql.Tx, bookID, vari
 		DownloadID  int64  `json:"downloadId"`
 		Reason      string `json:"reason"`
 	}
-	if err := json.Unmarshal([]byte(data), &event); err != nil || event.ActorUserID <= 0 ||
-		event.VariantID != variantID || event.DownloadID != approval.DownloadID || strings.TrimSpace(event.Reason) == "" {
-		return fmt.Errorf("review audit does not approve this variant and download: %v", err)
+	if err := json.Unmarshal([]byte(data), &event); err != nil {
+		return fmt.Errorf("review audit does not approve this variant and download: %w", err)
+	}
+	if event.ActorUserID <= 0 || event.VariantID != variantID ||
+		event.DownloadID != approval.DownloadID || strings.TrimSpace(event.Reason) == "" {
+		return errors.New("review audit does not approve this variant and download")
 	}
 	var linkedBook, linkedVariant sql.NullInt64
 	if err := tx.QueryRowContext(ctx, `SELECT book_id, variant_id FROM downloads WHERE id = ?`, approval.DownloadID).
-		Scan(&linkedBook, &linkedVariant); err != nil || !linkedBook.Valid || linkedBook.Int64 != bookID ||
-		!linkedVariant.Valid || linkedVariant.Int64 != variantID {
-		return fmt.Errorf("review audit download association changed: %v", err)
+		Scan(&linkedBook, &linkedVariant); err != nil {
+		return fmt.Errorf("review audit download association changed: %w", err)
+	}
+	if !linkedBook.Valid || linkedBook.Int64 != bookID || !linkedVariant.Valid || linkedVariant.Int64 != variantID {
+		return errors.New("review audit download association changed")
 	}
 	return nil
 }
@@ -615,6 +624,7 @@ func (r *BookFileRepo) DeleteByBook(ctx context.Context, bookID int64) error {
 	if err != nil {
 		return fmt.Errorf("book_files delete by book variants: %w", err)
 	}
+	defer rows.Close() // Explicitly closed before writing through this transaction.
 	var affected []sql.NullInt64
 	for rows.Next() {
 		var id sql.NullInt64

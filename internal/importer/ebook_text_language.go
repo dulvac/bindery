@@ -50,7 +50,7 @@ func DetectEbookTextLanguage(filename string) (language string, confident bool, 
 	if err != nil {
 		return "", false, fmt.Errorf("ebook language: open zip: %w", err)
 	}
-	defer zr.Close()
+	defer func() { _ = zr.Close() }()
 	if len(zr.File) > maxTextZIPEntries {
 		return "", false, fmt.Errorf("ebook language: zip exceeds %d entries", maxTextZIPEntries)
 	}
@@ -276,7 +276,7 @@ func xhtmlPlainText(data []byte) (string, error) {
 	var skipped int
 	for {
 		tok, err := dec.Token()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {

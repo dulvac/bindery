@@ -113,6 +113,7 @@ func (r *BookVariantRepo) ListStatusByBooks(ctx context.Context, books []BookSta
 	if err != nil {
 		return nil, fmt.Errorf("load book variant statuses: %w", err)
 	}
+	defer rows.Close() // Explicitly closed before the legacy-file query below.
 	for rows.Next() {
 		var book BookStatusAccess
 		var v BookVariantStatus

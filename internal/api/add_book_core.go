@@ -721,7 +721,7 @@ func (h *AuthorHandler) extendOwnedBook(ctx context.Context, req addBookParams, 
 	}
 	author, err := h.authors.GetByID(ctx, book.AuthorID)
 	if err != nil || author == nil {
-		return addBookResult{}, fmt.Errorf("get author for book %d: %v", book.ID, err)
+		return addBookResult{}, fmt.Errorf("get author for book %d: %w", book.ID, err)
 	}
 	if req.SearchOnAdd && h.searcher != nil {
 		go h.searcher.SearchAndGrabBook(indexer.WithSearchOrigin(h.bgCtx(), indexer.OriginAdd), *book) // #nosec G118 -- intentional: search must outlive the request

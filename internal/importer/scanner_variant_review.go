@@ -287,7 +287,7 @@ func (s *Scanner) safeVariantPath(root, source string, allowFolder bool) error {
 			return fmt.Errorf("variant source crosses symlink: %s", path)
 		}
 		if path == source {
-			if !info.Mode().IsRegular() && !(allowFolder && info.IsDir()) {
+			if !info.Mode().IsRegular() && (!allowFolder || !info.IsDir()) {
 				return fmt.Errorf("variant source is not a regular file or content folder: %s", source)
 			}
 			return nil
