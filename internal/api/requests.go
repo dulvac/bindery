@@ -32,6 +32,8 @@ const SettingRequestsMaxPendingPerUser = "requests.max_pending_per_user"
 // defaultRequestsMaxPendingPerUser applies when the setting is unset.
 const defaultRequestsMaxPendingPerUser = 25
 
+const pendingMergePairsMessage = "This pending request cannot add the chosen copy without adding unrequested formats or languages. Wait for approval, then ask for the other copy."
+
 // Body caps. A create carries three short fields (four on behalf of another
 // user); an approval a handful of ids and flags.
 const (
@@ -574,6 +576,10 @@ func (h *RequestHandler) Create(w http.ResponseWriter, r *http.Request) {
 					h.writeCreated(ctx, w, *merged, owner)
 					return
 				}
+				if errors.Is(err, db.ErrRequestPairsExpand) {
+					writeErr(w, http.StatusConflict, pendingMergePairsMessage)
+					return
+				}
 				if !errors.Is(err, db.ErrRequestExists) && !errors.Is(err, db.ErrRequestNotPending) {
 					writeServerError(w, r, err)
 					return
@@ -634,6 +640,10 @@ func (h *RequestHandler) Create(w http.ResponseWriter, r *http.Request) {
 					merged, mergeErr := h.requests.MergePending(ctx, latest.ID, owner, body.MediaType, languages, originalMedia)
 					if mergeErr == nil {
 						h.writeCreated(ctx, w, *merged, owner)
+						return
+					}
+					if errors.Is(mergeErr, db.ErrRequestPairsExpand) {
+						writeErr(w, http.StatusConflict, pendingMergePairsMessage)
 						return
 					}
 					if !errors.Is(mergeErr, db.ErrRequestExists) && !errors.Is(mergeErr, db.ErrRequestNotPending) {
@@ -712,6 +722,10 @@ func (h *RequestHandler) Create(w http.ResponseWriter, r *http.Request) {
 						merged, mergeErr = h.requests.MergePending(ctx, merged.ID, owner, req.MediaType, req.Languages, originalMedia)
 						if mergeErr == nil {
 							h.writeCreated(ctx, w, *merged, owner)
+							return
+						}
+						if errors.Is(mergeErr, db.ErrRequestPairsExpand) {
+							writeErr(w, http.StatusConflict, pendingMergePairsMessage)
 							return
 						}
 						if !errors.Is(mergeErr, db.ErrRequestExists) && !errors.Is(mergeErr, db.ErrRequestNotPending) {

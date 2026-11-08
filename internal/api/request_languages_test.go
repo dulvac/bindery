@@ -136,6 +136,59 @@ func TestRequestLanguagesPendingMergeAndForUserAtCap(t *testing.T) {
 	}
 }
 
+func TestRequestLanguagesPendingMergeRefusesUnrequestedPairs(t *testing.T) {
+	for _, tc := range []struct{ firstFormat, firstLanguage, nextFormat, nextLanguage string }{
+		{"ebook", "en", "audiobook", "ro"},
+		{"both", "en", "ebook", "ro"},
+	} {
+		t.Run(tc.firstFormat+"/"+tc.firstLanguage+" to "+tc.nextFormat+"/"+tc.nextLanguage, func(t *testing.T) {
+			f := newRequestsFixture(t, wellsRequestStub(), nil)
+			firstBody := `{"kind":"book","foreignId":"OL27482W","mediaType":"` + tc.firstFormat + `","languages":["` + tc.firstLanguage + `"]}`
+			first := assertRequestLanguages(t, f, f.create(t, f.requester, firstBody), []string{"eng"})
+			before, err := f.requests.GetByID(context.Background(), first)
+			if err != nil {
+				t.Fatal(err)
+			}
+			nextBody := `{"kind":"book","foreignId":"OL27482W","mediaType":"` + tc.nextFormat + `","languages":["` + tc.nextLanguage + `"]}`
+			rec := f.create(t, f.requester, nextBody)
+			if rec.Code != http.StatusConflict || !strings.Contains(strings.ToLower(rec.Body.String()), "wait for approval") {
+				t.Fatalf("second request = %d %s, want clear 409", rec.Code, rec.Body.String())
+			}
+			after, err := f.requests.GetByID(context.Background(), first)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.MediaType != before.MediaType || after.LanguagesJSON != before.LanguagesJSON || after.PayloadJSON != before.PayloadJSON {
+				t.Fatalf("rejected request changed pending row: before=%+v after=%+v", before, after)
+			}
+			approved := f.approve(f.admin, first, `{}`)
+			if approved.Code != http.StatusOK {
+				t.Fatalf("approval = %d %s", approved.Code, approved.Body.String())
+			}
+			bookID := *decodeRequest(t, approved).ResultBookID
+			variants, err := db.NewBookVariantRepo(f.database).ListByBook(context.Background(), bookID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantFormats := models.RequestedMediaTypes(tc.firstFormat)
+			if len(variants) != len(wantFormats) {
+				t.Fatalf("approved %d variants, want only %v", len(variants), wantFormats)
+			}
+			for _, format := range wantFormats {
+				found := false
+				for _, variant := range variants {
+					if variant.MediaType == format && variant.Language == "eng" {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatalf("approved variants = %+v, missing %s/eng", variants, format)
+				}
+			}
+		})
+	}
+}
+
 // An omitted format still requests the provider's format (or the configured
 // default). A later explicit format must not narrow that first selection.
 func TestRequestLanguagesPendingMergePreservesOmittedFormat(t *testing.T) {
@@ -164,7 +217,7 @@ func TestRequestLanguagesPendingMergePreservesOmittedFormat(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			second := assertRequestLanguages(t, f, f.create(t, f.requester, requestBookBody(`,"languages":["ro"]`)), []string{"eng", "rum"})
+			second := assertRequestLanguages(t, f, f.create(t, f.requester, `{"kind":"book","foreignId":"OL27482W","mediaType":"both","languages":["ro"]}`), []string{"eng", "rum"})
 			if second != first {
 				t.Fatalf("merge created request %d instead of reusing %d", second, first)
 			}

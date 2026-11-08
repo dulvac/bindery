@@ -44,6 +44,9 @@ var (
 	// ErrRequestExists is a second request for the same kind and foreign id
 	// by the same owner.
 	ErrRequestExists = errors.New("request already exists")
+	// ErrRequestPairsExpand refuses a pending merge that would request a
+	// format/language pair present in neither submission.
+	ErrRequestPairsExpand = errors.New("pending request would add unrequested copies")
 	// ErrRequestNotPending is a state change on a request that is no longer
 	// pending: already approved, declined, or claimed by another approval.
 	ErrRequestNotPending = errors.New("request is not pending")
@@ -573,6 +576,13 @@ func (r *RequestRepo) MergePending(ctx context.Context, id, ownerID int64, media
 		if mediaType != "" && mergedMedia != mediaType {
 			mergedMedia = models.MediaTypeBoth
 		}
+		incomingMedia := mediaType
+		if incomingMedia == "" {
+			incomingMedia = effectiveCurrentMedia
+		}
+		if pendingMergeAddsPairs(effectiveCurrentMedia, current.Languages, incomingMedia, languages, mergedMedia, merged) {
+			return nil, ErrRequestPairsExpand
+		}
 		if slices.Equal(merged, current.Languages) && mergedMedia == effectiveCurrentMedia {
 			return nil, ErrRequestExists
 		}
@@ -600,6 +610,24 @@ func (r *RequestRepo) MergePending(ctx context.Context, id, ownerID int64, media
 		}
 		// Another merge or a claim won the race. Reload to decide which.
 	}
+}
+
+// pendingMergeAddsPairs checks the result against the two choices that were
+// actually submitted. A request row stores one format and one language set;
+// it cannot represent sparse pairs such as ebook/eng plus audiobook/rum.
+func pendingMergeAddsPairs(currentMedia string, currentLanguages []string, incomingMedia string, incomingLanguages []string, mergedMedia string, mergedLanguages []string) bool {
+	currentFormats := models.RequestedMediaTypes(currentMedia)
+	incomingFormats := models.RequestedMediaTypes(incomingMedia)
+	for _, format := range models.RequestedMediaTypes(mergedMedia) {
+		for _, language := range mergedLanguages {
+			inCurrent := slices.Contains(currentFormats, format) && slices.Contains(currentLanguages, language)
+			inIncoming := slices.Contains(incomingFormats, format) && slices.Contains(incomingLanguages, language)
+			if !inCurrent && !inIncoming {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Reopen puts ownerID's approved request back to pending, for when what it
