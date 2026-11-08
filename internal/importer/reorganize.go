@@ -140,23 +140,40 @@ func (s *Scanner) previewBook(ctx context.Context, book *models.Book) ([]Reorgan
 // path uses (DestPath for ebooks, AudiobookDestDir for audiobook folders), so a
 // reorganized library matches a freshly-imported one byte-for-byte.
 func (s *Scanner) proposedPathFor(ctx context.Context, book *models.Book, author *models.Author, seriesTitle, seriesNum string, f models.BookFile) (proposed, status, msg string) {
-	var dest string
+	var dest, root string
 	var err error
 	audiobook := f.Format == models.MediaTypeAudiobook
 	if audiobook {
-		root := s.effectiveAudiobookDir(ctx, author)
+		root = s.effectiveAudiobookDir(ctx, author)
 		dest, err = s.destRenamer(ctx).AudiobookDestDir(root, author, book, seriesTitle, seriesNum)
 	} else {
-		root := s.effectiveLibraryDir(ctx, author)
+		root = s.effectiveLibraryDir(ctx, author)
 		dest, err = s.destRenamer(ctx).DestPath(root, author, book, seriesTitle, seriesNum, s.ebookSourceName(ctx, book.ID, f.Path))
 	}
 	if err == nil && f.VariantID != nil {
 		if audiobook && isSingleFile(f.Path) {
 			return "", ReorgStatusError, "single-file variant audio cannot be renamed as a folder"
 		}
-		dest, err = VariantDestination(dest, f.Language, audiobook)
+		variants, loadErr := s.books.VariantRepo().ListByBook(ctx, book.ID)
+		if loadErr != nil {
+			return "", ReorgStatusError, loadErr.Error()
+		}
+		var slotLanguage string
+		for _, variant := range variants {
+			if variant.ID == *f.VariantID && variant.MediaType == f.Format {
+				slotLanguage = variant.Language
+				break
+			}
+		}
+		if slotLanguage == "" || f.Language != slotLanguage {
+			return "", ReorgStatusError, "variant slot and file language evidence disagree; review this file before renaming"
+		}
+		dest, err = VariantDestination(dest, slotLanguage, audiobook)
 		if err != nil {
 			return "", ReorgStatusError, err.Error()
+		}
+		if _, err := ensureContained(dest, root); err != nil || dest == root {
+			return "", ReorgStatusError, "variant destination escapes the library root"
 		}
 	}
 	// An ebook with no extension that cannot get one back is reported after the
