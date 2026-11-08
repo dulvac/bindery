@@ -150,6 +150,15 @@ func (s *Scanner) proposedPathFor(ctx context.Context, book *models.Book, author
 		root := s.effectiveLibraryDir(ctx, author)
 		dest, err = s.destRenamer(ctx).DestPath(root, author, book, seriesTitle, seriesNum, s.ebookSourceName(ctx, book.ID, f.Path))
 	}
+	if err == nil && f.VariantID != nil {
+		if audiobook && isSingleFile(f.Path) {
+			return "", ReorgStatusError, "single-file variant audio cannot be renamed as a folder"
+		}
+		dest, err = VariantDestination(dest, f.Language, audiobook)
+		if err != nil {
+			return "", ReorgStatusError, err.Error()
+		}
+	}
 	// An ebook with no extension that cannot get one back is reported after the
 	// on-disk check below, so one that is also gone from disk still reads as
 	// missing. dest stands in as the current path until then.
@@ -169,7 +178,7 @@ func (s *Scanner) proposedPathFor(ctx context.Context, book *models.Book, author
 	// available, so an already-correctly-placed audiobook reads as a noop rather
 	// than a false collision (or an endless (N)→(N+1) churn). Ebooks are single
 	// files and are not uniquified at import, so they skip this.
-	if audiobook {
+	if audiobook && f.VariantID == nil {
 		if isSingleFile(f.Path) {
 			if flattenedOntoFolderPath(f.Path, dest, s.windowsPaths) {
 				return dest, ReorgStatusError, flattenedOntoFolderMsg
@@ -447,33 +456,22 @@ func (s *Scanner) applyOne(ctx context.Context, fileID int64) ReorganizeMove {
 	return m
 }
 
-// moveTrackedFile moves an already-imported file (ebook) or folder (audiobook)
-// from its current path to dest, creating the parent directory. It reuses the
-// import machinery's move primitives: StagedImport for a single ebook file
-// (atomic commit + rollback across a same-fs rename or cross-fs copy), and
-// MoveDirCtx for an audiobook folder.
-func (s *Scanner) moveTrackedFile(ctx context.Context, file models.BookFile, dest string) error {
+// moveTrackedFile renames only the library link or folder, never a download
+// source. The atomic no-replace commit rejects a destination that appears
+// after preview. A cross-filesystem move fails instead of copying a hardlink.
+func (s *Scanner) moveTrackedFile(_ context.Context, file models.BookFile, dest string) error {
 	if err := os.MkdirAll(filepath.Dir(dest), dirperm.Library()); err != nil {
 		return fmt.Errorf("create destination directory: %w", err)
 	}
-
-	info, err := os.Stat(file.Path)
+	info, err := os.Lstat(file.Path)
 	if err != nil {
-		return fmt.Errorf("stat source: %w", err)
+		return fmt.Errorf("stat source without following symlinks: %w", err)
 	}
-	if info.IsDir() {
-		// Audiobook folder.
-		return MoveDirCtx(ctx, file.Path, dest)
+	if !info.IsDir() && !info.Mode().IsRegular() {
+		return fmt.Errorf("refuse to move non-regular tracked source %q", file.Path)
 	}
-
-	// Single ebook file: stage → commit for an atomic, rollback-safe move.
-	_, commit, rollback, err := StagedImport(ctx, "move", file.Path, dest)
-	if err != nil {
-		return err
-	}
-	if err := commit(); err != nil {
-		rollback()
-		return err
+	if err := reorganizeRenameNoReplace(file.Path, dest); err != nil {
+		return fmt.Errorf("move tracked library path without replacement: %w", err)
 	}
 	return nil
 }
