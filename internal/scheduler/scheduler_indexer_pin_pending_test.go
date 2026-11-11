@@ -101,6 +101,51 @@ func TestPending_SkipsAPinnedRowAndTriesTheNextApprovedRow(t *testing.T) {
 	}
 }
 
+// A release held before a relevance fix must not bypass that fix on its next
+// automatic sweep. A relevant candidate can still be grabbed instead.
+func TestPending_PreviousSameAuthorSequelCannotBypassRelevance(t *testing.T) {
+	f, pending, open := pendingPinFixture(t)
+	f.book.Title, f.book.SortTitle = "Dune", "Dune"
+	if err := f.s.books.Update(f.ctx, &f.book); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct{ guid, title string }{
+		{"g-novel", "Dune by Pin Author [ENG / EPUB]"},
+		{"g-sequel", "Dune Messiah by Pin Author [ENG / EPUB]"},
+	} {
+		res := newznab.SearchResult{
+			GUID: row.guid, Title: row.title, NZBURL: f.pub.srv.URL + "/" + row.guid + ".nzb",
+			Protocol: "usenet", IndexerID: open.ID, IndexerName: open.Name, Size: 2 << 20,
+		}
+		blob, err := json.Marshal(res)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := pending.Upsert(f.ctx, &models.PendingRelease{
+			BookID: f.book.ID, MediaType: models.MediaTypeEbook, Title: res.Title,
+			IndexerID: &open.ID, GUID: res.GUID, Protocol: res.Protocol, Reason: "delay", ReleaseJSON: string(blob),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.s.SearchAndGrabBook(f.ctx, f.book)
+	if f.pub.count() != 1 || f.priv.count() != 0 {
+		t.Fatalf("public=%d private=%d; only the novel may be grabbed", f.pub.count(), f.priv.count())
+	}
+	if grabbed, _ := f.downloads.GetByGUID(f.ctx, "g-sequel"); grabbed != nil {
+		t.Fatalf("old pending sequel was grabbed: %+v", grabbed)
+	}
+	if grabbed, _ := f.downloads.GetByGUID(f.ctx, "g-novel"); grabbed == nil {
+		t.Fatal("relevant pending novel was not grabbed")
+	}
+	// Legacy single-format books clear all pending rows after a successful
+	// grab. The sequel must never have reached the client before that cleanup.
+	rows, err := pending.ListByBookAndMediaType(f.ctx, f.book.ID, models.MediaTypeEbook)
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("legacy pending cleanup after novel grab: %+v, %v", rows, err)
+	}
+}
+
 // TestAutoGrab_PinnedFailureRecordCarriesCodeAndIndexerButNoClient: the History
 // event is machine readable for the dedupe, and neither it nor the notification
 // names the client or its id.

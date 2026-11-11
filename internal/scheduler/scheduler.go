@@ -1498,7 +1498,8 @@ func (s *Scheduler) searchAndGrabFormatForVariant(ctx context.Context, book mode
 		// Re-evaluate any existing pending releases for this book/format with the current age.
 		var pendErr error
 		best, bestClient, pendErr = s.pendingApproved(ctx, book, mediaType, dm, func(res *newznab.SearchResult) (*models.DownloadClient, bool, error) {
-			if len(indexer.ForRequestedLanguage([]newznab.SearchResult{*res}, requestedLanguage)) == 0 {
+			if !indexer.ReleaseRelevantForCriteria(*res, crit) ||
+				len(indexer.ForRequestedLanguage([]newznab.SearchResult{*res}, requestedLanguage)) == 0 {
 				return nil, true, nil
 			}
 			return s.checkPin(ctx, book, res, skippedPinned)

@@ -319,6 +319,18 @@ func TestVariantImport_AudioWorkEvidencePrecedesIdempotency(t *testing.T) {
 		{"biography", "Dreamer of Dune: The Biography of Frank Herbert by Brian Herbert [ENG / M4B]", "Dreamer of Dune: The Biography of Frank Herbert", "Brian Herbert", false, true},
 		{"biography with existing Dune audio", "Dreamer of Dune: The Biography of Frank Herbert by Brian Herbert [ENG / M4B]", "Dreamer of Dune: The Biography of Frank Herbert", "Brian Herbert", true, true},
 		{"actual novel remains eligible", "Dune by Frank Herbert [ENG / M4B]", "Dune", "Frank Herbert", false, false},
+		{"bracketed author narrator novel remains eligible", "Dune [Narrated by Frank Herbert] [ENG / M4B]", "Dune", "Frank Herbert", false, false},
+		{"bracketed performed by author novel remains eligible", "Dune [Performed by Frank Herbert] [ENG / M4B]", "Dune", "Frank Herbert", false, false},
+		{"sequel performed by author with separate author credit never links", "Dune Messiah [Performed by Frank Herbert] by Frank Herbert [ENG / M4B]", "", "", false, true},
+		{"same author sequel release and tags never link", "Dune Messiah by Frank Herbert [ENG / M4B]", "Dune Messiah", "Frank Herbert", false, true},
+		{"narrator cannot hide same author sequel without tags", "Dune Messiah by Frank Herbert - Narrated by Simon Vance [ENG / M4B]", "", "", false, true},
+		{"dotted byline edition cannot hide sequel without tags", "Dune.Messiah.[Unabridged].by.Frank.Herbert.[ENG / M4B]", "", "", false, true},
+		{"exact release cannot hide same author sequel album", "Dune by Frank Herbert [ENG / M4B]", "Dune Messiah", "Frank Herbert", false, true},
+		{"colon sequel album never links", "Dune by Frank Herbert [ENG / M4B]", "Dune: Messiah", "Frank Herbert", false, true},
+		{"sequel with novel suffix never links", "Dune Messiah: A Novel by Frank Herbert [ENG / M4B]", "Dune Messiah: A Novel", "Frank Herbert", false, true},
+		{"wrong bracketed sequel album never links", "Dune by Frank Herbert [ENG / M4B]", "Dune Messiah [Unabridged]", "Frank Herbert", false, true},
+		{"wrong parenthesized sequel album never links", "Dune by Frank Herbert [ENG / M4B]", "Dune Messiah (A Novel)", "Frank Herbert", false, true},
+		{"illustrated novel album may link", "Dune by Frank Herbert [ENG / M4B]", "Dune (Illustrated)", "Frank Herbert", false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newVariantReviewFixture(t, "Dune", "Frank Herbert", models.MediaTypeAudiobook, "eng")

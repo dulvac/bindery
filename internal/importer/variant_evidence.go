@@ -55,6 +55,11 @@ func (s *Scanner) AssessVariantEvidence(ctx context.Context, download *models.Do
 	// author-first convention; only flip that reading when the left side names
 	// a known author and the right side is the requested work.
 	names := s.authorNamesFor(ctx, author)
+	if variant.MediaType == models.MediaTypeAudiobook &&
+		indexer.ReleaseExplicitlyNamesLongerWork(book.Title, download.Title, names) {
+		e.WrongWork = true
+		e.Reason = "release names a longer work than the requested book"
+	}
 	parsed := ParseFilename(strings.ReplaceAll(download.Title, "/", " "))
 	if equivalentWorkTitle(book.Title, parsed.Author) {
 		if agrees, named := ebookAuthorAgreement(names, parsed.Title); agrees && named {
@@ -313,10 +318,28 @@ func (s *Scanner) assessAudiobookVariant(ctx context.Context, book *models.Book,
 	res := evaluateAudiobookContent(book.Title, tags)
 	if !bookIsCompilation(book.Title) && (res.flagged && (res.conflicts >= 2 || audioTagsIncludeDifferentWork(book.Title, names, tags)) ||
 		audioTagsNameAnotherWork(book.Title, names, tags) ||
+		audioTagsClearlyNameLongerWork(book.Title, tags) ||
 		(releaseTitleDiffers || releaseAuthorConflict) && audioTagAuthorsConfirmConflict(names, tags)) {
 		e.WrongWork = true
 		e.Reason = "audiobook work tags conflict with the requested book"
 	}
+}
+
+// All readable albums naming the same longer work are explicit conflict
+// evidence, even when the credited author also wrote the requested title.
+// A mixed, missing, or translated album is not confident evidence of this.
+func audioTagsClearlyNameLongerWork(wanted string, tags []AudioTags) bool {
+	if len(tags) == 0 {
+		return false
+	}
+	for _, tag := range tags {
+		album := strings.TrimSpace(tag.Album)
+		if !usableWorkTitle(album) || tagNamesNoWork(tag, album) ||
+			!indexer.ObviousLongerWorkTitle(wanted, album) {
+			return false
+		}
+	}
+	return true
 }
 
 // Mixed album titles need an independently conflicting author before they

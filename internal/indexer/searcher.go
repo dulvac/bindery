@@ -1117,6 +1117,13 @@ func filterRelevantDetailed(results []newznab.SearchResult, title, author string
 	return filterRelevantWithContext(results, title, author, aliases, bookContext{})
 }
 
+// ReleaseRelevantForCriteria rechecks a stored release against today's book
+// and library context. Pending releases must pass this before an automatic grab.
+func ReleaseRelevantForCriteria(r newznab.SearchResult, c MatchCriteria) bool {
+	kept, _ := filterRelevantWithContext([]newznab.SearchResult{r}, c.Title, c.Author, c.AuthorAliases, c.context())
+	return len(kept) == 1
+}
+
 // filterRelevantWithContext is filterRelevantDetailed given what the library
 // knows about the wanted book (see bookContext). A zero bookContext is
 // filterRelevantDetailed exactly.
@@ -1303,6 +1310,10 @@ func filterRelevantKeepDropped(results []newznab.SearchResult, title, author str
 	var dropped []DroppedRelease
 	for i, r := range results {
 		n := normTitles[i]
+		if releaseNamesLongerWork(r, title, author, aliases) {
+			dropped = append(dropped, drop(originalOf(i), "release names a longer work than the requested book"))
+			continue
+		}
 		if authorConflict(r) {
 			dropped = append(dropped, drop(originalOf(i), "release names a different author for this title"))
 			continue

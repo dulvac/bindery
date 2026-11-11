@@ -2,6 +2,7 @@ package importer
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -187,6 +188,31 @@ func TestAssessVariantEvidence_AudioIdentityAndUnknownLanguage(t *testing.T) {
 		{"authorless release names another work corroborated by tag author", "Dune", "Frank Herbert", "Dreamer of Dune [ENG / M4B]", "Dune", "Brian Herbert", true, true, false},
 		{"named release author and matching album outweigh bare narrator artist", "Dune", "Frank Herbert", "Dune Unabridged by Frank Herbert [ENG / M4B]", "Dune", "Simon Vance", false, false, false},
 		{"retitled release with matching author is not wrong work", "Dune", "Frank Herbert", "Duna [ENG / M4B]", "Dune", "Frank Herbert", false, false, false},
+		{"same author sequel release and album are another work", "Dune", "Frank Herbert", "Dune Messiah by Frank Herbert [ENG / M4B]", "Dune Messiah", "Frank Herbert", false, true, false},
+		{"explicit same author sequel release is another work even without tags", "Dune", "Frank Herbert", "Dune Messiah by Frank Herbert [ENG / M4B]", "", "", false, true, false},
+		{"narrator after same author cannot hide sequel without tags", "Dune", "Frank Herbert", "Dune Messiah by Frank Herbert - Narrated by Simon Vance [ENG / M4B]", "", "", false, true, false},
+		{"dotted author credit cannot hide sequel without tags", "Dune", "Frank Herbert", "Dune.Messiah.by.Frank.Herbert.[ENG / M4B]", "", "", false, true, false},
+		{"dotted author first cannot hide sequel without tags", "Dune", "Frank Herbert", "Frank.Herbert.-.Dune.Messiah.[ENG / M4B]", "", "", false, true, false},
+		{"dotted byline edition cannot hide sequel without tags", "Dune", "Frank Herbert", "Dune.Messiah.[Unabridged].by.Frank.Herbert.[ENG / M4B]", "", "", false, true, false},
+		{"narrator after same author leaves exact novel eligible", "Dune", "Frank Herbert", "Dune by Frank Herbert - Narrated by Simon Vance [ENG / M4B]", "Dune", "Simon Vance", false, false, false},
+		{"requested author may also narrate the novel", "Dune", "Frank Herbert", "Dune Narrated by Frank Herbert [ENG / M4B]", "Dune", "Frank Herbert", false, false, false},
+		{"bracketed author narrator is not a different work", "Dune", "Frank Herbert", "Dune [Narrated by Frank Herbert] [ENG / M4B]", "Dune", "Frank Herbert", false, false, false},
+		{"bracketed read by author is not a different work", "Dune", "Frank Herbert", "Dune [Read by Frank Herbert] [ENG / M4B]", "Dune", "Frank Herbert", false, false, false},
+		{"bracketed performed by author is not a different work", "Dune", "Frank Herbert", "Dune [Performed by Frank Herbert] [ENG / M4B]", "Dune", "Frank Herbert", false, false, false},
+		{"bracketed presented by author is not a different work", "Dune", "Frank Herbert", "Dune [Presented by Frank Herbert] [ENG / M4B]", "Dune", "Frank Herbert", false, false, false},
+		{"bracketed told by author is not a different work", "Dune", "Frank Herbert", "Dune [Told by Frank Herbert] [ENG / M4B]", "Dune", "Frank Herbert", false, false, false},
+		{"performed by label with distinct author credit stays wrong", "Dune", "Frank Herbert", "Dune Messiah [Performed by Frank Herbert] by Frank Herbert [ENG / M4B]", "", "", false, true, false},
+		{"exact release cannot hide consistent same author sequel album", "Dune", "Frank Herbert", "Dune by Frank Herbert [ENG / M4B]", "Dune Messiah", "Frank Herbert", false, true, false},
+		{"same author colon sequel album", "Dune", "Frank Herbert", "Dune: Messiah by Frank Herbert [ENG / M4B]", "Dune: Messiah", "Frank Herbert", false, true, false},
+		{"exact release cannot hide colon sequel album", "Dune", "Frank Herbert", "Dune by Frank Herbert [ENG / M4B]", "Dune: Messiah", "Frank Herbert", false, true, false},
+		{"same author sequel with novel suffix", "Dune", "Frank Herbert", "Dune Messiah: A Novel by Frank Herbert [ENG / M4B]", "Dune Messiah: A Novel", "Frank Herbert", false, true, false},
+		{"exact release cannot hide sequel bracketed unabridged album", "Dune", "Frank Herbert", "Dune by Frank Herbert [ENG / M4B]", "Dune Messiah [Unabridged]", "Frank Herbert", false, true, false},
+		{"exact release cannot hide sequel parenthesized novel album", "Dune", "Frank Herbert", "Dune by Frank Herbert [ENG / M4B]", "Dune Messiah (A Novel)", "Frank Herbert", false, true, false},
+		{"exact release cannot hide sequel narrator label", "Dune", "Frank Herbert", "Dune by Frank Herbert [ENG / M4B]", "Dune Messiah [Narrated by Simon Vance]", "Frank Herbert", false, true, false},
+		{"exact release cannot hide sequel unabridged format label", "Dune", "Frank Herbert", "Dune by Frank Herbert [ENG / M4B]", "Dune Messiah [Unabridged MP3]", "Frank Herbert", false, true, false},
+		{"illustrated novel album is not another work", "Dune", "Frank Herbert", "Dune by Frank Herbert [ENG / M4B]", "Dune (Illustrated)", "Frank Herbert", false, false, false},
+		{"dramatized novel album is not another work", "Dune", "Frank Herbert", "Dune by Frank Herbert [ENG / M4B]", "Dune (Dramatized)", "Frank Herbert", false, false, false},
+		{"same author edition qualifier stays eligible", "Dune", "Frank Herbert", "Dune (Unabridged) by Frank Herbert [ENG / M4B]", "Dune (Unabridged)", "Frank Herbert", false, false, false},
 		{"clean release cannot hide wrong tagged work", "Dune", "Frank Herbert", "Dune by Frank Herbert [ENG / M4B]", "Dreamer of Dune: The Biography of Frank Herbert", "Brian Herbert", false, true, false},
 		{"matching title but release and tags agree on wrong author", "Dune", "Frank Herbert", "Dune by Brian Herbert [ENG / M4B]", "Dune", "Brian Herbert", true, true, false},
 		{"legitimate translation with matching author", "The Garden of Stars", "Ada Vale", "The Garden of Stars [ENG / M4B]", "Le Jardin des Étoiles", "Ada Vale", false, false, false},
@@ -209,6 +235,29 @@ func TestAssessVariantEvidence_AudioIdentityAndUnknownLanguage(t *testing.T) {
 				t.Errorf("wrong work needs an explanation, got %q", got.Reason)
 			}
 		})
+	}
+}
+
+func TestAssessVariantEvidence_MP3AlbumsNameSameAuthorSequel(t *testing.T) {
+	dir := t.TempDir()
+	var files []string
+	for i := 1; i <= 18; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("%02d.mp3", i))
+		if err := os.WriteFile(path, buildID3v23Album(fmt.Sprintf("Chapter %d", i), "Dune Messiah"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, path)
+	}
+	book := &models.Book{ID: 11, Title: "Dune"}
+	got, err := (&Scanner{}).AssessVariantEvidence(context.Background(),
+		&models.Download{ID: 42, Title: "Dune by Frank Herbert [ENG / MP3]"}, book,
+		&models.Author{Name: "Frank Herbert"},
+		&models.BookVariant{BookID: book.ID, MediaType: models.MediaTypeAudiobook, Language: "eng"}, files, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.WrongWork || got.Verification != "unverified" || got.DetectedLanguage != "" {
+		t.Fatalf("18 MP3 albums explicitly name the sequel: %+v", got)
 	}
 }
 
